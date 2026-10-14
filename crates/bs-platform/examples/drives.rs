@@ -1,4 +1,4 @@
-//! Prints this machine's drives and appearance setting.
+//! Prints this machine's drives and its appearance settings.
 //!
 //! ```text
 //! cargo run -p bs-platform --example drives            # all listed drives
@@ -102,6 +102,14 @@ fn main() {
             "from the system"
         } else {
             "default"
+        }
+    );
+    println!(
+        "motion: {}",
+        if look.reduce_motion {
+            "reduced"
+        } else {
+            "as usual"
         }
     );
 }

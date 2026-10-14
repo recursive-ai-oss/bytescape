@@ -168,11 +168,56 @@ pub(crate) fn run_parallel<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // These tests never depend on how fast the machine is. A probe that must be
+    // "stuck" is held on a channel until the test lets it go, and a test waits
+    // for an outcome by polling for it with a generous limit, so a slow runner
+    // makes a test slower, never wrong.
 
     fn keyed<T: Send + 'static>(jobs: Vec<(&str, Job<T>)>) -> Vec<(Vec<u8>, Job<T>)> {
         jobs.into_iter()
             .map(|(k, j)| (k.as_bytes().to_vec(), j))
             .collect()
+    }
+
+    /// A job that returns `value` only after the returned sender is used or
+    /// dropped. Dropping it also lets the job go, so a failing test leaves no
+    /// thread waiting.
+    fn held<T: Send + 'static>(value: T) -> (Job<T>, mpsc::Sender<()>) {
+        let (release, wait) = mpsc::channel::<()>();
+        let job: Job<T> = Box::new(move || {
+            let _ = wait.recv();
+            value
+        });
+        (job, release)
+    }
+
+    /// Waits, at most a minute, for something that is certain to happen.
+    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let limit = Instant::now() + Duration::from_secs(60);
+        while !condition() {
+            assert!(Instant::now() < limit, "gave up waiting for {what}");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A probe that finishes at once and counts how often it was started.
+    fn quick(starts: &Arc<AtomicUsize>, value: u8) -> Job<u8> {
+        let starts = Arc::clone(starts);
+        Box::new(move || {
+            starts.fetch_add(1, Ordering::SeqCst);
+            value
+        })
+    }
+
+    /// An answer that comes at once, so it can only be missing if the probe was
+    /// not started.
+    const PLENTY: Duration = Duration::from_secs(300);
+
+    fn stuck_count(gate: &InFlight, key: &[u8]) -> Option<usize> {
+        gate.stuck().get(key).copied()
     }
 
     #[test]
@@ -189,201 +234,208 @@ mod tests {
                 )
             })
             .collect();
-        let out = run_parallel(&gate, jobs, Duration::from_secs(5));
+        let out = run_parallel(&gate, jobs, Duration::from_secs(60));
         assert_eq!(out, (0..8usize).map(|i| Some(i * 2)).collect::<Vec<_>>());
     }
 
     #[test]
     fn a_stuck_job_is_abandoned_without_holding_up_the_others() {
         let gate = Arc::default();
+        let (slow, release) = held("slow");
         let jobs: Vec<(&str, Job<&'static str>)> = vec![
             ("a", Box::new(|| "fast")),
-            (
-                "b",
-                Box::new(|| {
-                    thread::sleep(Duration::from_secs(30));
-                    "slow"
-                }),
-            ),
+            ("b", slow),
             ("c", Box::new(|| "also fast")),
         ];
-        let start = Instant::now();
-        let out = run_parallel(&gate, keyed(jobs), Duration::from_millis(150));
-        assert!(start.elapsed() < Duration::from_secs(5));
+        // The deadline is shared. It only has to be long enough for two
+        // instant jobs; the held one cannot finish before it.
+        let started = Instant::now();
+        let out = run_parallel(&gate, keyed(jobs), Duration::from_secs(2));
         assert_eq!(out, vec![Some("fast"), None, Some("also fast")]);
+        assert!(started.elapsed() < Duration::from_secs(60));
+        drop(release);
     }
 
     #[test]
     fn a_stuck_key_is_not_started_again_until_it_returns() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let gate = Arc::default();
+        let gate: Arc<InFlight> = Arc::default();
         let starts = Arc::new(AtomicUsize::new(0));
-        let job = |starts: &Arc<AtomicUsize>| -> Vec<(Vec<u8>, Job<u8>)> {
-            let starts = Arc::clone(starts);
-            vec![(
-                b"/mnt/dead".to_vec(),
-                Box::new(move || {
-                    starts.fetch_add(1, Ordering::SeqCst);
-                    thread::sleep(Duration::from_millis(600));
-                    1u8
-                }) as Job<u8>,
-            )]
-        };
+        let key = b"/mnt/dead".to_vec();
+        let (job, release) = held(1u8);
         assert_eq!(
-            run_parallel(&gate, job(&starts), Duration::from_millis(50)),
+            run_parallel(&gate, vec![(key.clone(), job)], Duration::from_millis(50)),
             vec![None]
         );
-        // Still stuck: no second thread.
+        assert_eq!(stuck_count(&gate, &key), Some(1));
+        // Still stuck: the probe is not started, so the answer is "none" at
+        // once even though this one would have finished instantly.
         assert_eq!(
-            run_parallel(&gate, job(&starts), Duration::from_millis(50)),
+            run_parallel(&gate, vec![(key.clone(), quick(&starts, 2))], PLENTY),
             vec![None]
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        // Once the call has returned the key can be probed again.
+        release.send(()).unwrap();
+        wait_until("the stuck probe to end", || gate.stuck().is_empty());
+        assert_eq!(
+            run_parallel(&gate, vec![(key, quick(&starts, 2))], PLENTY),
+            vec![Some(2)]
         );
         assert_eq!(starts.load(Ordering::SeqCst), 1);
-        // Once the call has returned the key can be probed again.
-        thread::sleep(Duration::from_millis(900));
-        assert_eq!(
-            run_parallel(&gate, job(&starts), Duration::from_secs(5)),
-            vec![Some(1)]
-        );
-        assert_eq!(starts.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn a_key_stays_stuck_until_every_abandoned_probe_of_it_has_returned() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let gate: Arc<InFlight> = Arc::default();
         let starts = Arc::new(AtomicUsize::new(0));
-        let probe = |sleep_ms: u64, starts: &Arc<AtomicUsize>| -> Vec<(Vec<u8>, Job<u8>)> {
-            let starts = Arc::clone(starts);
-            vec![(
-                b"/mnt/dead".to_vec(),
-                Box::new(move || {
-                    starts.fetch_add(1, Ordering::SeqCst);
-                    thread::sleep(Duration::from_millis(sleep_ms));
-                    1u8
-                }) as Job<u8>,
-            )]
-        };
-        // Two callers start at the same moment, so both get to spawn. One
-        // probe returns after 300 ms and the other after 1500 ms; both callers
-        // give up after 40 ms.
-        let callers: Vec<_> = [300u64, 1500]
-            .into_iter()
-            .map(|ms| {
-                let (gate, starts) = (Arc::clone(&gate), Arc::clone(&starts));
-                let jobs = probe(ms, &starts);
-                thread::spawn(move || run_parallel(&gate, jobs, Duration::from_millis(40)))
-            })
-            .collect();
-        for caller in callers {
-            assert_eq!(caller.join().unwrap(), vec![None]);
-        }
-        // Both probes ran if the callers really overlapped; otherwise the test
-        // has not exercised the case and says so instead of passing quietly.
-        assert_eq!(
-            starts.load(Ordering::SeqCst),
-            2,
-            "the two callers did not overlap"
+        let key = b"/mnt/dead".to_vec();
+        // Two probes of one key are both started before either is abandoned:
+        // all jobs of a call are started first, and only then waited for.
+        let (first, release_first) = held(1u8);
+        let (second, release_second) = held(2u8);
+        let out = run_parallel(
+            &gate,
+            vec![(key.clone(), first), (key.clone(), second)],
+            Duration::from_millis(50),
         );
+        assert_eq!(out, vec![None, None]);
+        assert_eq!(stuck_count(&gate, &key), Some(2));
 
-        // After the short probe has returned, the long one is still stuck.
-        thread::sleep(Duration::from_millis(500));
+        // After one returns, the other still holds the key.
+        release_first.send(()).unwrap();
+        wait_until("the first probe to end", || {
+            stuck_count(&gate, &key) == Some(1)
+        });
         assert_eq!(
-            run_parallel(&gate, probe(1, &starts), Duration::from_millis(40)),
+            run_parallel(&gate, vec![(key.clone(), quick(&starts, 3))], PLENTY),
             vec![None]
         );
-        assert_eq!(
-            starts.load(Ordering::SeqCst),
-            2,
-            "no third thread while one is stuck"
-        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0, "no third thread");
 
-        // After the long one returns too, the key is free.
-        thread::sleep(Duration::from_millis(1300));
+        // After the second returns too, the key is free.
+        release_second.send(()).unwrap();
+        wait_until("the second probe to end", || gate.stuck().is_empty());
         assert_eq!(
-            run_parallel(&gate, probe(1, &starts), Duration::from_secs(5)),
-            vec![Some(1)]
+            run_parallel(&gate, vec![(key, quick(&starts, 3))], PLENTY),
+            vec![Some(3)]
         );
-        assert_eq!(starts.load(Ordering::SeqCst), 3);
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn two_callers_may_ask_about_the_same_healthy_key_at_once() {
         let gate: Arc<InFlight> = Arc::default();
-        let ask = |gate: Arc<InFlight>| {
+        // Each probe waits for the other to be running, so the test passes only
+        // if both were allowed to run at the same time. If the second were
+        // refused, the first would wait for it until the deadline.
+        let meeting = Arc::new(Barrier::new(2));
+        let ask = |gate: Arc<InFlight>, meeting: Arc<Barrier>| {
             thread::spawn(move || {
-                let job: Job<u8> = Box::new(|| {
-                    thread::sleep(Duration::from_millis(200));
+                let job: Job<u8> = Box::new(move || {
+                    meeting.wait();
                     5
                 });
-                run_parallel(&gate, vec![(b"/".to_vec(), job)], Duration::from_secs(5))
+                run_parallel(&gate, vec![(b"/".to_vec(), job)], PLENTY)
             })
         };
-        let (first, second) = (ask(Arc::clone(&gate)), ask(Arc::clone(&gate)));
+        let first = ask(Arc::clone(&gate), Arc::clone(&meeting));
+        let second = ask(Arc::clone(&gate), meeting);
         assert_eq!(first.join().unwrap(), vec![Some(5)]);
         assert_eq!(second.join().unwrap(), vec![Some(5)]);
+        assert!(gate.stuck().is_empty());
     }
 
     #[test]
     fn a_probe_that_finishes_just_after_the_deadline_leaves_nothing_stuck() {
+        // The two orders in which "the caller gives up" and "the probe ends"
+        // can meet, each made to happen exactly.
         let gate: Arc<InFlight> = Arc::default();
-        for _ in 0..20 {
-            let job: Job<u8> = Box::new(|| {
-                thread::sleep(Duration::from_millis(5));
-                1
-            });
-            let _ = run_parallel(
-                &gate,
-                vec![(b"edge".to_vec(), job)],
-                Duration::from_millis(5),
-            );
-            thread::sleep(Duration::from_millis(50));
-            assert!(
-                gate.stuck().is_empty(),
-                "a finished probe must not stay recorded"
-            );
-        }
+
+        // The probe ended first and the caller gives up a moment later: there
+        // is nothing to record.
+        let marker = gate.begin(b"edge".to_vec()).expect("not stuck");
+        let slot = Arc::clone(&marker.slot);
+        drop(marker);
+        Marker::abandon(&gate, b"edge", &slot);
+        assert!(gate.stuck().is_empty(), "a finished probe was recorded");
+
+        // The caller gave up first and the probe ends a moment later: the key
+        // is recorded, then cleared.
+        let marker = gate.begin(b"edge".to_vec()).expect("not stuck");
+        let slot = Arc::clone(&marker.slot);
+        Marker::abandon(&gate, b"edge", &slot);
+        assert_eq!(stuck_count(&gate, b"edge"), Some(1));
+        drop(marker);
+        assert!(gate.stuck().is_empty(), "the ended probe stayed recorded");
+
+        // The same through real threads: the probe is held past a short
+        // deadline, then let go.
+        let (job, release) = held(1u8);
+        let out = run_parallel(
+            &gate,
+            vec![(b"edge".to_vec(), job)],
+            Duration::from_millis(20),
+        );
+        assert_eq!(out, vec![None]);
+        assert_eq!(stuck_count(&gate, b"edge"), Some(1));
+        release.send(()).unwrap();
+        wait_until("the probe to end", || gate.stuck().is_empty());
     }
 
     #[test]
     fn different_keys_do_not_block_each_other() {
         let gate = Arc::default();
-        let slow: Vec<(&str, Job<u8>)> = vec![(
-            "slow",
-            Box::new(|| {
-                thread::sleep(Duration::from_millis(500));
-                1
-            }),
-        )];
+        let (slow, release) = held(1u8);
+        let slow: Vec<(&str, Job<u8>)> = vec![("slow", slow)];
         assert_eq!(
             run_parallel(&gate, keyed(slow), Duration::from_millis(20)),
             vec![None]
         );
         let other: Vec<(&str, Job<u8>)> = vec![("other", Box::new(|| 2))];
-        assert_eq!(
-            run_parallel(&gate, keyed(other), Duration::from_secs(5)),
-            vec![Some(2)]
-        );
+        assert_eq!(run_parallel(&gate, keyed(other), PLENTY), vec![Some(2)]);
+        drop(release);
+    }
+
+    /// Ends the thread the way a panic does, but without the panic message and
+    /// backtrace, which can take seconds to print on a loaded machine.
+    fn unwind() -> ! {
+        std::panic::resume_unwind(Box::new("probe failed"))
     }
 
     #[test]
     fn a_panicking_job_yields_none_and_frees_its_key() {
-        let gate = Arc::default();
-        let boom: Vec<(&str, Job<u8>)> = vec![
-            ("k", Box::new(|| panic!("probe failed"))),
-            ("j", Box::new(|| 7)),
-        ];
+        let gate: Arc<InFlight> = Arc::default();
+        // A job that panics yields nothing and does not disturb the others.
+        let boom: Vec<(&str, Job<u8>)> = vec![("k", Box::new(|| unwind())), ("j", Box::new(|| 7))];
         assert_eq!(
-            run_parallel(&gate, keyed(boom), Duration::from_secs(5)),
+            run_parallel(&gate, keyed(boom), PLENTY),
             vec![None, Some(7)]
         );
-        // The panicked job released its key.
-        thread::sleep(Duration::from_millis(100));
-        let again: Vec<(&str, Job<u8>)> = vec![("k", Box::new(|| 3))];
-        assert_eq!(
-            run_parallel(&gate, keyed(again), Duration::from_secs(5)),
-            vec![Some(3)]
+        assert!(gate.stuck().is_empty());
+
+        // One that panics while its caller has already given up still frees
+        // the key when its thread ends.
+        let (release_job, release) = {
+            let (release, wait) = mpsc::channel::<()>();
+            let job: Job<u8> = Box::new(move || {
+                let _ = wait.recv();
+                unwind()
+            });
+            (job, release)
+        };
+        let out = run_parallel(
+            &gate,
+            vec![(b"k".to_vec(), release_job)],
+            Duration::from_millis(20),
         );
+        assert_eq!(out, vec![None]);
+        assert_eq!(stuck_count(&gate, b"k"), Some(1));
+        release.send(()).unwrap();
+        wait_until("the panicked probe to free its key", || {
+            gate.stuck().is_empty()
+        });
+        let again: Vec<(&str, Job<u8>)> = vec![("k", Box::new(|| 3))];
+        assert_eq!(run_parallel(&gate, keyed(again), PLENTY), vec![Some(3)]);
     }
 
     #[test]

@@ -1,7 +1,8 @@
-//! Light/dark and accent on Windows, from the registry.
+//! Light/dark, accent and reduced motion on Windows, from the registry and the
+//! system parameters.
 //!
 //! The decoding is plain arithmetic and is tested on every platform. Only the
-//! registry reads are Windows-specific.
+//! system reads are Windows-specific.
 
 #[cfg(windows)]
 use super::Appearance;
@@ -45,8 +46,17 @@ pub(crate) fn accent_from(
         .or_else(|| colorization_color.map(accent_from_argb))
 }
 
+/// `SPI_GETCLIENTAREAANIMATION` says whether the system plays animations in
+/// windows. Off means the user wants less motion. If the question cannot be
+/// asked, motion is left alone.
+pub(crate) fn reduce_motion_from(client_area_animation: Option<bool>) -> bool {
+    client_area_animation == Some(false)
+}
+
 #[cfg(windows)]
 pub(crate) fn read_system() -> Appearance {
+    use crate::winreg::read_dword;
+
     let apps_use_light_theme = read_dword(
         r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
         "AppsUseLightTheme",
@@ -56,37 +66,30 @@ pub(crate) fn read_system() -> Appearance {
     Appearance {
         scheme: scheme_from(apps_use_light_theme),
         accent: accent_from(accent_color, colorization),
+        reduce_motion: reduce_motion_from(client_area_animation()),
     }
 }
 
-/// Reads a `REG_DWORD` under `HKEY_CURRENT_USER`. `None` if it is missing or
-/// of another type.
+/// Whether the system plays animations in windows, or `None` if the call
+/// fails.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn read_dword(subkey: &str, value: &str) -> Option<u32> {
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
-
-    let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() };
-    let subkey = wide(subkey);
-    let value = wide(value);
-    let mut data: u32 = 0;
-    let mut size = std::mem::size_of::<u32>() as u32;
-    // SAFETY: `subkey` and `value` are NUL-terminated UTF-16 strings that
-    // outlive the call; `data` is a writable `u32` and `size` holds its size in
-    // bytes; the type pointer may be null.
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            value.as_ptr(),
-            RRF_RT_REG_DWORD,
-            std::ptr::null_mut(),
-            std::ptr::addr_of_mut!(data).cast(),
-            &mut size,
+fn client_area_animation() -> Option<bool> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SPI_GETCLIENTAREAANIMATION, SystemParametersInfoW,
+    };
+    let mut enabled: i32 = 0;
+    // SAFETY: for this action `pvParam` points to a writable `BOOL` (an `i32`),
+    // which `enabled` is; `uiParam` must be 0 and `fWinIni` is unused for a get.
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            std::ptr::addr_of_mut!(enabled).cast(),
+            0,
         )
     };
-    (status == ERROR_SUCCESS).then_some(data)
+    (ok != 0).then_some(enabled != 0)
 }
 
 #[cfg(test)]
@@ -137,9 +140,19 @@ mod tests {
         assert_eq!(accent_from(None, None), None);
     }
 
+    #[test]
+    fn reduced_motion_means_animations_are_off() {
+        assert!(reduce_motion_from(Some(false)));
+        assert!(!reduce_motion_from(Some(true)));
+        // An unanswered question leaves the animations on.
+        assert!(!reduce_motion_from(None));
+    }
+
     #[cfg(windows)]
     #[test]
     fn the_real_registry_answers_or_falls_back() {
+        use crate::winreg::read_dword;
+
         // The result only has to be well formed; accounts differ in what they set.
         let appearance = read_system();
         assert!(matches!(
@@ -150,5 +163,7 @@ mod tests {
             read_dword(r"Software\Microsoft\Windows\NoSuchKeyBytescape", "Nothing"),
             None
         );
+        // Asking the system about animations never fails the read.
+        let _ = client_area_animation();
     }
 }

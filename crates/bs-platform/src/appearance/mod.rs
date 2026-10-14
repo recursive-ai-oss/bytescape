@@ -1,4 +1,5 @@
-//! The operating system's light or dark setting and its accent color.
+//! The operating system's light or dark setting, its accent color and its
+//! reduced-motion setting.
 //!
 //! The setting is read from the system every time [`current`] is called and is
 //! never stored in Bytescape's own configuration.
@@ -8,8 +9,9 @@
 //! There is none. Call [`current`] when the window gains focus and compare the
 //! result with the previous one; that picks up a change made in the system
 //! settings the next time the user looks at Bytescape, with no listener thread
-//! or message loop hook. A call is cheap on Windows (three registry reads). On
-//! Linux it may start `gdbus` and `gsettings`, which takes tens of milliseconds
+//! or message loop hook. A call is cheap on Windows (a few registry reads and
+//! one system-parameter query). On Linux it may start `gdbus` and `gsettings`
+//! several times, which takes tens of milliseconds each
 //! when the desktop answers and at most 1.5 seconds in total when it does not,
 //! so call it on focus, not on every frame, and not on the interface thread if
 //! a stall of that length would matter.
@@ -19,12 +21,21 @@
 //! - **Windows:** the `AppsUseLightTheme` registry value for light or dark, and
 //!   the DWM `AccentColor` value (falling back to `ColorizationColor`) for the
 //!   accent. The registry is used because the alternative, the WinRT
-//!   `UISettings` class, needs a WinRT runtime crate.
+//!   `UISettings` class, needs a WinRT runtime crate. Reduced motion is the
+//!   system's client-area animation switch (`SPI_GETCLIENTAREAANIMATION`).
 //! - **Linux:** the desktop portal's `org.freedesktop.appearance` settings
-//!   `color-scheme` and `accent-color`, read by running `gdbus call`, so no
-//!   D-Bus library is linked. If the portal gives no answer the GNOME
-//!   `color-scheme` setting is read with `gsettings`; if that fails too the
-//!   result is light.
+//!   `color-scheme`, `accent-color` and `reduced-motion`, read by running
+//!   `gdbus call`, so no D-Bus library is linked. When the portal does not
+//!   answer:
+//!   - light or dark comes from GNOME's `color-scheme` setting (`gsettings`),
+//!     and is light if that fails too;
+//!   - the accent comes from the `AccentColor` entry of KDE's `kdeglobals`
+//!     file, then from GNOME's `accent-color` setting, and is `None` if both
+//!     fail;
+//!   - motion is reduced if GNOME's `enable-animations` is off or KDE's
+//!     `AnimationDurationFactor` in `kdeglobals` is 0. Any one source asking
+//!     for less motion is enough, because wrongly dropping an animation costs
+//!     little and wrongly playing one can make a person ill.
 //!
 //! # When the Linux programs are not started
 //!
@@ -33,8 +44,9 @@
 //! bus is a local Unix socket: `DBUS_SESSION_BUS_ADDRESS` must hold only
 //! `unix:` addresses, or be unset with a `bus` socket in `$XDG_RUNTIME_DIR`
 //! (the programs are then told that socket's address). In every other case
-//! no program is started and the result is [`Appearance::default`]: light,
-//! with no system accent.
+//! no program is started and the result comes from the `kdeglobals` file alone
+//! (the file is read, not run), which is [`Appearance::default`] if there is
+//! none: light, with no system accent, and motion as usual.
 
 /// Whether the system asks for light or dark applications.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +95,9 @@ pub struct Appearance {
     pub scheme: ColorScheme,
     /// The system accent color, or `None` when the system does not provide one.
     pub accent: Option<Rgb>,
+    /// The user asks for less motion: animations should be replaced by
+    /// instant changes. `false` when the system says nothing.
+    pub reduce_motion: bool,
 }
 
 impl Appearance {
@@ -97,13 +112,15 @@ impl Default for Appearance {
         Self {
             scheme: ColorScheme::Light,
             accent: None,
+            reduce_motion: false,
         }
     }
 }
 
 /// Reads the current setting from the system.
 ///
-/// Never fails: anything unreadable falls back to light and no system accent.
+/// Never fails: anything unreadable falls back to light, no system accent and
+/// normal motion.
 pub fn current() -> Appearance {
     #[cfg(target_os = "linux")]
     {
@@ -159,8 +176,17 @@ mod tests {
         let some = Appearance {
             scheme: ColorScheme::Dark,
             accent: Some(Rgb { r: 1, g: 2, b: 3 }),
+            reduce_motion: true,
         };
         assert_eq!(some.accent_or_default(), Rgb { r: 1, g: 2, b: 3 });
+    }
+
+    #[test]
+    fn the_default_asks_for_nothing_special() {
+        let none = Appearance::default();
+        assert_eq!(none.scheme, ColorScheme::Light);
+        assert_eq!(none.accent, None);
+        assert!(!none.reduce_motion);
     }
 
     #[test]
