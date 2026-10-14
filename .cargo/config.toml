@@ -1,0 +1,7 @@
+[alias]
+xtask = "run --quiet --package xtask --"
+
+# Link the C runtime statically on MSVC, so neither the installer nor the
+# portable build needs a redistributable package on the user's machine.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

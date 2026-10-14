@@ -1,0 +1,157 @@
+# cargo-deny configuration: licenses, advisories, bans and sources.
+
+[graph]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+# Bytescape never opens a network connection. This list repeats the one in
+# `cargo xtask net-ban` on purpose: two independent checks, so one mistake in
+# either cannot let a networking crate in. The DNS stacks are banned as whole
+# families by prefix in `net-ban`; here their known members are listed. The
+# crates after `muda` are ruled out for other reasons (a D-Bus crate brings
+# sockets; the native-menu crate needs GTK).
+#
+# An exception to a crate ban is a `wrappers` entry naming the only crates
+# allowed to depend on it, with a comment giving the reason, and needs the
+# same explicit review as an entry in xtask/net-ban.allow. The async I/O
+# crate `async-io` never gets one.
+deny = [
+    { crate = "reqwest" },
+    { crate = "hyper" },
+    { crate = "hyper-util" },
+    { crate = "hyper-tls" },
+    { crate = "hyper-rustls" },
+    { crate = "ureq" },
+    { crate = "curl" },
+    { crate = "curl-sys" },
+    { crate = "isahc" },
+    { crate = "surf" },
+    { crate = "native-tls" },
+    { crate = "rustls" },
+    { crate = "tokio-rustls" },
+    { crate = "tokio-native-tls" },
+    { crate = "openssl" },
+    { crate = "openssl-sys" },
+    { crate = "socket2" },
+    { crate = "async-std" },
+    { crate = "async-net" },
+    { crate = "async-io" },
+    { crate = "smol" },
+    { crate = "attohttpc" },
+    { crate = "minreq" },
+    { crate = "h2" },
+    { crate = "quinn" },
+    { crate = "tungstenite" },
+    { crate = "tokio-tungstenite" },
+    { crate = "async-tungstenite" },
+    { crate = "axum" },
+    { crate = "warp" },
+    { crate = "actix-web" },
+    { crate = "tiny_http" },
+    { crate = "tiny-http" },
+    { crate = "zbus" },
+    { crate = "dbus" },
+    { crate = "muda" },
+    { crate = "hickory-resolver" },
+    { crate = "hickory-proto" },
+    { crate = "hickory-client" },
+    { crate = "hickory-server" },
+    { crate = "hickory-net" },
+    { crate = "hickory-dns" },
+    { crate = "hickory-recursor" },
+    { crate = "trust-dns-resolver" },
+    { crate = "trust-dns-proto" },
+    { crate = "trust-dns-client" },
+    { crate = "trust-dns-server" },
+]
+
+# Features that open sockets or reach the network. The Windows API crates gate
+# their networking functions behind the `Win32_Networking*` features and the
+# URL download functions behind `Win32_System_Com_Urlmon`. A feature cannot
+# be limited to certain parent crates here, so an exception means removing the
+# one feature from its list below, with a comment, after the same review as
+# an entry in xtask/net-ban.allow.
+[[bans.features]]
+crate = "windows"
+deny = [
+    "Win32_Networking",
+    "Win32_Networking_ActiveDirectory",
+    "Win32_Networking_BackgroundIntelligentTransferService",
+    "Win32_Networking_Clustering",
+    "Win32_Networking_HttpServer",
+    "Win32_Networking_Ldap",
+    "Win32_Networking_NetworkListManager",
+    "Win32_Networking_RemoteDifferentialCompression",
+    "Win32_Networking_WebSocket",
+    "Win32_Networking_WinHttp",
+    "Win32_Networking_WinInet",
+    "Win32_Networking_WinSock",
+    "Win32_Networking_WindowsWebServices",
+    "Win32_System_Com_Urlmon",
+]
+
+[[bans.features]]
+crate = "windows-sys"
+deny = [
+    "Win32_Networking",
+    "Win32_Networking_ActiveDirectory",
+    "Win32_Networking_BackgroundIntelligentTransferService",
+    "Win32_Networking_Clustering",
+    "Win32_Networking_HttpServer",
+    "Win32_Networking_Ldap",
+    "Win32_Networking_NetworkListManager",
+    "Win32_Networking_RemoteDifferentialCompression",
+    "Win32_Networking_WebSocket",
+    "Win32_Networking_WinHttp",
+    "Win32_Networking_WinInet",
+    "Win32_Networking_WinSock",
+    "Win32_Networking_WindowsWebServices",
+    "Win32_System_Com_Urlmon",
+]
+
+[[bans.features]]
+crate = "tokio"
+deny = ["net"]
+
+[[bans.features]]
+crate = "mio"
+deny = ["net"]
+
+[[bans.features]]
+crate = "nix"
+deny = ["net", "socket"]
+
+[[bans.features]]
+crate = "winapi"
+deny = ["winsock2", "ws2def", "ws2ipdef", "ws2tcpip", "winhttp", "wininet", "urlmon", "mswsock"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

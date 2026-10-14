@@ -1,0 +1,6 @@
+# An exact release, so every release build uses the same compiler. Bump it
+# on purpose, together with `rust-version` in Cargo.toml.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

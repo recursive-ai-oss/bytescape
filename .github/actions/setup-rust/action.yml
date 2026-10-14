@@ -1,0 +1,16 @@
+name: Set up Rust
+description: Installs the Rust release pinned in rust-toolchain.toml, with the components listed there. Run after checkout.
+
+runs:
+  using: composite
+  steps:
+    # The pin lives in one place, rust-toolchain.toml. Reading it here (instead
+    # of repeating the version in this workflow) keeps every job, the lints
+    # included, on the same compiler, and works with any rustup version.
+    - name: Install the pinned toolchain
+      shell: bash
+      run: |
+        channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+        test -n "$channel" || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+        rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy --no-self-update
+        rustup default "$channel"

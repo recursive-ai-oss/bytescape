@@ -1,0 +1,13 @@
+[package]
+name = "bytescape-helper"
+description = "Bytescape elevated helper: short-lived, reads disks, deletes only what the interface lists."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true

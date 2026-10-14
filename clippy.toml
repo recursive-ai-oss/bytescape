@@ -1,0 +1,9 @@
+msrv = "1.99"
+
+# Bytescape never opens an internet connection. These types are the second
+# layer behind `cargo xtask net-ban`, which also scans the sources.
+disallowed-types = [
+    { path = "std::net::TcpStream", reason = "Bytescape never connects to the internet" },
+    { path = "std::net::TcpListener", reason = "Bytescape never connects to the internet" },
+    { path = "std::net::UdpSocket", reason = "Bytescape never connects to the internet" },
+]

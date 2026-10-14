@@ -1,0 +1,88 @@
+name: Bug report
+description: Bytescape shows something wrong, misbehaves, or crashes.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. **A security problem** (anything involving the elevated helper, or a crash on a damaged disk image) goes through [private reporting](https://github.com/recursive-ai-oss/bytescape/security/advisories/new), not here; see [SECURITY.md](https://github.com/recursive-ai-oss/bytescape/blob/main/SECURITY.md).
+
+        Bytescape never sends anything. Everything in this form is typed by you, so leave out file names or paths you'd rather keep private.
+  - type: input
+    id: version
+    attributes:
+      label: Bytescape version and build date
+      description: Shown in the About box.
+      placeholder: "0.1.0, built 2026-11-02"
+    validations:
+      required: true
+  - type: dropdown
+    id: system
+    attributes:
+      label: Operating system and architecture
+      options:
+        - Windows 11 x64
+        - Windows 11 ARM64
+        - Windows 10 x64
+        - Linux x64
+        - Linux ARM64
+        - Something else
+    validations:
+      required: true
+  - type: dropdown
+    id: channel
+    attributes:
+      label: How you installed it
+      options:
+        - Windows installer
+        - Windows portable zip
+        - winget
+        - Chocolatey
+        - Microsoft Store
+        - .deb package
+        - AppImage
+        - Snap
+        - Built from source
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Scanning (wrong or missing sizes, slow scan)
+        - Map and navigation
+        - Delete, Recycle Bin or Trash
+        - Full scan (elevated helper)
+        - Drive picker and capacity bar
+        - Crash
+        - Installer or package
+        - Documentation
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did, in order. The file system type (NTFS, ext4, btrfs, XFS) matters for scan problems.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Crash report
+      description: For a crash, paste the report from the "View report" button. Paths are hidden unless you chose to show them.
+      render: text

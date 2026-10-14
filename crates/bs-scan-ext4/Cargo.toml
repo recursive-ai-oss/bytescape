@@ -1,0 +1,13 @@
+[package]
+name = "bs-scan-ext4"
+description = "Bytescape ext4 reader (Linux)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true

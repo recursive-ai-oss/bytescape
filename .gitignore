@@ -1,0 +1,40 @@
+# Public repository: allowlist.
+#
+# Everything at the top level is ignored unless it is listed below, so a new
+# file is private until someone deliberately adds it here.
+/*
+!/.gitignore
+!/.github/
+!/.cargo/
+!/Cargo.toml
+!/Cargo.lock
+!/rust-toolchain.toml
+!/rustfmt.toml
+!/clippy.toml
+!/deny.toml
+!/README.md
+!/CHANGELOG.md
+!/CONTRIBUTING.md
+!/CODE_OF_CONDUCT.md
+!/SECURITY.md
+!/LICENSE-APACHE
+!/LICENSE-MIT
+!/crates/
+!/xtask/
+!/packaging/
+!/docs/
+
+# Never commit these anywhere in the tree.
+target/
+core.[0-9]*
+*.core
+*.profraw
+*.dmp
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,13 @@
+[package]
+name = "bs-tree"
+description = "Bytescape size tree: arena storage, string pool and aggregation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true

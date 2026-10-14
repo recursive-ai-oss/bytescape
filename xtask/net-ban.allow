@@ -1,0 +1,25 @@
+# Reviewed exceptions to `cargo xtask net-ban`. No exception is expected for
+# Bytescape's own code: it never opens a network connection.
+#
+# The one anticipated kind is the local connection to the display server
+# (Wayland or X11) that the windowing libraries make. It is allowed in the
+# interface only, and every entry names the windowing crate or crates that
+# pull the item in. An entry holds only while EVERY path to the item in the
+# dependency graph goes through one of those crates. It never applies to
+# anything in the dependency closure of `bytescape-helper`, and the async I/O
+# crate `async-io` can never be allowed.
+#
+# Entry formats, one per line, with the reason after `#`:
+#
+#   crate NAME via CRATE[,CRATE...]
+#   feature CRATE/FEATURE via CRATE[,CRATE...]
+#   source PATH
+#
+# `source PATH` allows one Rust source file (path relative to the repository
+# root) to mention a networking API; it needs a reason like the others.
+#
+# Example (not active):
+#
+#   feature rustix/net via winit,softbuffer  # Wayland and X11 socket to the local display server
+#
+# Every added line also needs a maintainer's explicit approval.

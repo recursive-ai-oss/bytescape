@@ -1,0 +1,204 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, so advisories published against the dependencies are noticed
+    # even when nothing is merged.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+# Read-only token for every job. No job here needs to write, and pull
+# requests from forks run exactly like branches of this repository. There are
+# no secrets in CI.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUST_BACKTRACE: "1"
+  # Every job, formatting and lints included, uses the one release pinned in
+  # rust-toolchain.toml, so a new compiler's lints arrive in a deliberate
+  # change instead of failing unrelated pull requests.
+
+# Every step runs in bash, on Windows too, so the commands are the same on
+# every leg and match what CONTRIBUTING.md tells you to run.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      # The cache key already includes the operating system and CPU, so a
+      # Linux cache is never restored on Windows.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    env:
+      # These runners are throwaway machines, so tests that change operating
+      # system state (Recycle Bin, Trash, deletes) may run here. Never set
+      # this on a machine you care about.
+      BYTESCAPE_DISPOSABLE_HOST: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The build date comes from the commit time, so rebuilding one commit
+      # gives the same date.
+      - name: Set the build date
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - run: cargo test --locked --workspace
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-deny@0.20.2
+      # Licenses, advisories, banned crates and allowed sources (crates.io
+      # only), as configured in deny.toml.
+      - run: cargo deny check
+
+  # The project's own checks. Each one is a `cargo xtask` command, so you can
+  # run the same thing locally. Every step runs even when an earlier one fails,
+  # so a single run shows all the problems.
+  guards:
+    name: guards (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: No networking crates or code
+        run: cargo xtask net-ban
+      - name: Helper dependency allowlist
+        if: ${{ !cancelled() }}
+        run: cargo xtask helper-deps
+      - name: No private references in public text
+        if: ${{ !cancelled() }}
+        run: cargo xtask public-text
+      - name: Unsafe code only where it is allowed
+        if: ${{ !cancelled() }}
+        run: cargo xtask unsafe-allow
+
+  wording:
+    name: wording (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The notes shipped inside the program are checked by their own tests.
+      # The wording lint for them arrives with the tables; until then this
+      # only builds and runs the crate's placeholder test.
+      - name: Knowledge tables wording
+        run: cargo test --locked -p bs-knowledge
+      # The shipped prose: README, changelog, docs, issue forms and package
+      # listings.
+      - name: Prose wording
+        if: ${{ !cancelled() }}
+        run: cargo xtask wording
+
+  # ARM64 legs. GitHub provides these runners free of charge to public
+  # repositories only, so the job runs only when the repository is public,
+  # instead of waiting forever for a runner that does not exist. The test
+  # reads the runner's own `repository_visibility` value, which every event
+  # type (pushes, schedules and manual runs included) carries; if it were
+  # ever missing the job would be skipped, never queued. It is a separate
+  # job, so it can be left out of the required checks until it has proven
+  # stable.
+  arm64:
+    name: arm64 (${{ matrix.os }})
+    if: ${{ github.repository_visibility == 'public' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, windows-11-arm]
+    env:
+      BYTESCAPE_DISPOSABLE_HOST: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Tests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --workspace
+      - name: Project checks
+        if: ${{ !cancelled() }}
+        run: cargo xtask guards

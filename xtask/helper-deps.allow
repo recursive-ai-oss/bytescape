@@ -1,0 +1,16 @@
+# Crates the elevated helper may depend on (normal dependencies, all four
+# release targets, direct and indirect). `cargo xtask helper-deps` fails when
+# the helper's dependency closure contains anything not listed here.
+#
+# The helper runs with administrator rights and reads untrusted disk data, so
+# every new entry needs a maintainer's explicit approval. One crate name per
+# line; text after `#` is a comment.
+
+# Workspace crates the helper is designed to use.
+bs-tree
+bs-scan
+bs-scan-ntfs
+bs-scan-ext4
+bs-scan-btrfs
+bs-scan-xfs
+bs-ipc

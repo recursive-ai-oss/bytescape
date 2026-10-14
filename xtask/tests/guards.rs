@@ -1,0 +1,987 @@
+//! Negative and positive tests for the guards. Every check must fail on
+//! a planted violation and pass on clean input.
+//!
+//! The planted violations are assembled at run time from fragments, so this
+//! file itself stays clean for `cargo xtask public-text`.
+
+use serde_json::{Value, json};
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use xtask::public_text::Extra;
+use xtask::{helper_deps, net_ban, public_text, unsafe_allow, wording};
+
+#[allow(dead_code)]
+mod build_metadata {
+    include!("../../packaging/build-metadata.rs");
+}
+
+fn join(parts: &[&str]) -> String {
+    parts.concat()
+}
+
+/// A scratch directory below the system temporary directory, removed on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> Self {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let number = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("xtask-test-{}-{number}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch directory");
+        Self(dir)
+    }
+
+    fn write(&self, relative: &str, text: &str) {
+        let path = self.0.join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(path, text).expect("write file");
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A dependency edge: the dependency's name and its kind (`None` is normal).
+type Edge<'a> = (&'a str, Option<&'a str>);
+
+/// A package: its name, resolved features and dependency edges.
+type Package<'a> = (&'a str, &'a [&'a str], &'a [Edge<'a>]);
+
+/// A `cargo metadata` document with the given packages.
+fn metadata(packages: &[Package<'_>]) -> Value {
+    let id = |name: &str| format!("registry+test#{name}@1.0.0");
+    let package_list: Vec<Value> = packages
+        .iter()
+        .map(|(name, _, _)| json!({ "name": name, "version": "1.0.0", "id": id(name) }))
+        .collect();
+    let nodes: Vec<Value> = packages
+        .iter()
+        .map(|(name, features, deps)| {
+            let deps: Vec<Value> = deps
+                .iter()
+                .map(|(dep, kind)| {
+                    json!({ "name": dep, "pkg": id(dep), "dep_kinds": [{ "kind": kind, "target": null }] })
+                })
+                .collect();
+            json!({ "id": id(name), "features": features, "deps": deps })
+        })
+        .collect();
+    json!({ "packages": package_list, "resolve": { "nodes": nodes } })
+}
+
+/// Like [`metadata`], with the workspace members named (so a package that
+/// nothing depends on can still be a non-member).
+fn metadata_with_members(packages: &[Package<'_>], members: &[&str]) -> Value {
+    let mut doc = metadata(packages);
+    let ids: Vec<String> = members
+        .iter()
+        .map(|name| format!("registry+test#{name}@1.0.0"))
+        .collect();
+    doc["workspace_members"] = json!(ids);
+    doc
+}
+
+fn no_allow() -> net_ban::Allow {
+    net_ban::Allow::default()
+}
+
+fn flagged(doc: &Value) -> usize {
+    net_ban::check_metadata(doc, "t", &no_allow()).len()
+}
+
+// ---- net-ban: crates ----
+
+#[test]
+fn net_ban_flags_every_banned_crate() {
+    for name in net_ban::BANNED_CRATES {
+        let doc = metadata(&[("bytescape", &[], &[(name, None)]), (name, &[], &[])]);
+        assert_eq!(flagged(&doc), 1, "{name} should be flagged");
+    }
+}
+
+#[test]
+fn net_ban_flags_each_added_family() {
+    let families: [(&str, &[&str]); 6] = [
+        (
+            "DNS stacks",
+            &[
+                "hickory-resolver",
+                "hickory-proto",
+                "hickory-client",
+                "hickory-anything",
+                "trust-dns-resolver",
+                "trust-dns-server",
+                "trust-dns-whatever",
+            ],
+        ),
+        (
+            "websockets",
+            &["tungstenite", "tokio-tungstenite", "async-tungstenite"],
+        ),
+        ("async networking", &["async-net", "async-io", "smol"]),
+        (
+            "servers",
+            &["axum", "warp", "actix-web", "tiny_http", "tiny-http"],
+        ),
+        (
+            "http clients",
+            &["reqwest", "ureq", "isahc", "surf", "attohttpc", "minreq"],
+        ),
+        (
+            "tls and sockets",
+            &["rustls", "native-tls", "openssl", "socket2", "quinn", "h2"],
+        ),
+    ];
+    for (family, names) in families {
+        for name in names {
+            let doc = metadata(&[("bytescape", &[], &[(name, None)]), (name, &[], &[])]);
+            assert_eq!(flagged(&doc), 1, "{family}: {name} should be flagged");
+        }
+    }
+}
+
+#[test]
+fn net_ban_flags_the_reqwest_crate_by_name() {
+    let doc = metadata(&[("reqwest", &[], &[])]);
+    let findings = net_ban::check_metadata(&doc, "t", &no_allow());
+    assert_eq!(findings[0].subject, "reqwest");
+}
+
+#[test]
+fn net_ban_treats_underscores_like_dashes() {
+    let doc = metadata(&[("native_tls", &[], &[])]);
+    assert_eq!(flagged(&doc), 1);
+}
+
+#[test]
+fn net_ban_passes_a_clean_graph() {
+    let clean = metadata(&[("bytescape", &[], &[("serde", None)]), ("serde", &[], &[])]);
+    assert_eq!(flagged(&clean), 0);
+}
+
+// ---- net-ban: features ----
+
+#[test]
+fn net_ban_flags_socket_features_only_when_enabled() {
+    for (name, feature) in net_ban::BANNED_FEATURES {
+        let on = metadata(&[(name, &["std", feature], &[])]);
+        assert_eq!(flagged(&on), 1, "{name}/{feature}");
+        let off = metadata(&[(name, &["std"], &[])]);
+        assert_eq!(flagged(&off), 0, "{name} without {feature}");
+    }
+}
+
+#[test]
+fn net_ban_flags_the_windows_networking_features() {
+    let features = [
+        "Win32_Networking",
+        "Win32_Networking_WinSock",
+        "Win32_Networking_WinHttp",
+        "Win32_Networking_WinInet",
+        "Win32_Networking_Ldap",
+        "Win32_System_Com_Urlmon",
+    ];
+    for crate_name in ["windows", "windows-sys", "windows_sys"] {
+        for feature in features {
+            let doc = metadata(&[(crate_name, &["Win32_Foundation", feature], &[])]);
+            assert_eq!(flagged(&doc), 1, "{crate_name}/{feature}");
+        }
+        let fine = metadata(&[(
+            crate_name,
+            &[
+                "Win32_Foundation",
+                "Win32_Storage_FileSystem",
+                "Win32_System_Pipes",
+            ],
+            &[],
+        )]);
+        assert_eq!(
+            flagged(&fine),
+            0,
+            "{crate_name} file and pipe features are fine"
+        );
+    }
+}
+
+#[test]
+fn refine_features_uses_the_exact_features_for_the_target() {
+    // The metadata says the Windows API crate has a networking feature (some
+    // other platform's dependency turns it on); the tree for this target says
+    // it does not.
+    let mut doc = metadata(&[
+        ("bytescape", &[], &[("windows-sys", None), ("rustix", None)]),
+        ("windows-sys", &["Win32_Networking_WinSock"], &[]),
+        ("rustix", &["std"], &[]),
+        ("unbuilt", &["net"], &[]),
+    ]);
+    assert_eq!(flagged(&doc), 1);
+    let tree = "bytescape v0.1.0 (/some/path)|\n\
+        windows-sys v1.0.0|Win32_Foundation,default\n\
+        rustix v1.0.0|net,std\n\
+        rustix v1.0.0|std\n";
+    net_ban::refine_features(&mut doc, tree);
+    // The windows-sys networking feature is gone; rustix gains its exact net feature.
+    let findings = net_ban::check_metadata(&doc, "t", &no_allow());
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].subject, "rustix/net");
+}
+
+// ---- net-ban: the allowlist ----
+
+fn windowing_graph(extra_edge: &[Edge<'_>]) -> Value {
+    metadata_with_members(
+        &[
+            ("bytescape", &[], &[("winit", None), ("bs-ui", None)]),
+            ("bs-ui", &[], extra_edge),
+            ("winit", &[], &[("rustix", None)]),
+            ("rustix", &["std", "net"], &[]),
+        ],
+        &["bytescape", "bs-ui"],
+    )
+}
+
+#[test]
+fn allow_entries_need_a_via_and_reject_the_never_allowed() {
+    let allow = net_ban::Allow::parse(
+        "feature rustix/net\n\
+         crate async-io via winit\n\
+         feature rustix via winit\n\
+         crate x11rb via\n\
+         source some/file.rs\n\
+         feature rustix/net via winit,softbuffer  # ok\n",
+    );
+    assert_eq!(allow.errors.len(), 4, "{:?}", allow.errors);
+    assert_eq!(allow.entries.len(), 1);
+    assert_eq!(allow.entries[0].via, vec!["winit", "softbuffer"]);
+    assert!(allow.sources.contains("some/file.rs"));
+}
+
+#[test]
+fn a_via_entry_admits_an_item_reached_only_through_that_crate() {
+    let allow = net_ban::Allow::parse("feature rustix/net via winit  # display server socket\n");
+    assert_eq!(flagged(&windowing_graph(&[])), 1, "banned without an entry");
+    assert!(net_ban::check_metadata(&windowing_graph(&[]), "t", &allow).is_empty());
+}
+
+#[test]
+fn a_via_entry_does_not_admit_another_path_to_the_item() {
+    let allow = net_ban::Allow::parse("feature rustix/net via winit\n");
+    let other_path = windowing_graph(&[("rustix", None)]);
+    let findings = net_ban::check_metadata(&other_path, "t", &allow);
+    assert_eq!(findings.len(), 1);
+    assert!(
+        findings[0].message.contains("another way"),
+        "{}",
+        findings[0]
+    );
+    // A second windowing crate listed in the entry admits its path too.
+    let two = metadata_with_members(
+        &[
+            ("bytescape", &[], &[("winit", None), ("softbuffer", None)]),
+            ("winit", &[], &[("rustix", None)]),
+            ("softbuffer", &[], &[("rustix", None)]),
+            ("rustix", &["net"], &[]),
+        ],
+        &["bytescape"],
+    );
+    let both = net_ban::Allow::parse("feature rustix/net via winit,softbuffer\n");
+    assert!(net_ban::check_metadata(&two, "t", &both).is_empty());
+    assert_eq!(net_ban::check_metadata(&two, "t", &allow).len(), 1);
+}
+
+#[test]
+fn an_entry_never_applies_inside_the_helper_closure() {
+    let allow = net_ban::Allow::parse("feature rustix/net via winit\n");
+    let doc = metadata_with_members(
+        &[
+            ("bytescape", &[], &[("winit", None)]),
+            ("bytescape-helper", &[], &[("winit", None)]),
+            ("winit", &[], &[("rustix", None)]),
+            ("rustix", &["net"], &[]),
+        ],
+        &["bytescape", "bytescape-helper"],
+    );
+    let findings = net_ban::check_metadata(&doc, "t", &allow);
+    assert_eq!(findings.len(), 1);
+    assert!(
+        findings[0].message.contains("bytescape-helper"),
+        "{}",
+        findings[0]
+    );
+}
+
+#[test]
+fn crate_entries_work_the_same_way() {
+    let doc = metadata_with_members(
+        &[
+            ("bytescape", &[], &[("winit", None)]),
+            ("winit", &[], &[("zbus", None)]),
+            ("zbus", &[], &[]),
+        ],
+        &["bytescape"],
+    );
+    assert_eq!(flagged(&doc), 1);
+    let allow = net_ban::Allow::parse("crate zbus via winit\n");
+    assert!(net_ban::check_metadata(&doc, "t", &allow).is_empty());
+}
+
+// ---- net-ban: sources ----
+
+fn write_and_scan(source: &str) -> usize {
+    let scratch = Scratch::new();
+    scratch.write("crates/bs-scan/src/lib.rs", source);
+    net_ban::scan_sources(&scratch.0, &no_allow()).len()
+}
+
+#[test]
+fn net_ban_finds_the_standard_network_module_in_sources() {
+    let direct = join(&["use std", "::", "net::TcpStream;\n"]);
+    let group = join(&["use std::{fmt, ", "net::UdpSocket};\n"]);
+    let nested = join(&[
+        "use std::{\n    fmt,\n    ",
+        "net::{self, TcpListener},\n};\n",
+    ]);
+    let core_path = join(&["let _ = core", "::", "net::IpAddr::from([0u8; 4]);\n"]);
+    for (case, source) in [
+        ("direct", direct),
+        ("group", group),
+        ("nested", nested),
+        ("core", core_path),
+    ] {
+        assert_eq!(write_and_scan(&source), 1, "{case}: {source}");
+    }
+}
+
+#[test]
+fn net_ban_finds_each_networking_system_api() {
+    let samples = [
+        ("inet constant", join(&["let f = AF_", "INET;\n"])),
+        ("inet6 constant", join(&["let f = AF_", "INET6;\n"])),
+        (
+            "libc socket path",
+            join(&["let s = libc", "::", "socket(2, 1, 0);\n"]),
+        ),
+        (
+            "libc socket group",
+            join(&["use libc::{c_int, ", "socket};\n"]),
+        ),
+        ("name lookup", join(&["extern { fn get", "addrinfo(); }\n"])),
+        ("old name lookup", join(&["let _ = gethost", "byname;\n"])),
+        ("winsock start", join(&["WSA", "Startup(0, p);\n"])),
+        (
+            "winsock socket",
+            join(&["WSA", "SocketW(2, 1, 6, p, 0, 0);\n"]),
+        ),
+        ("winhttp", join(&["Win", "HttpOpen(p, 0, p, p, 0);\n"])),
+        (
+            "wininet open",
+            join(&["Internet", "OpenW(p, 0, p, p, 0);\n"]),
+        ),
+        (
+            "wininet connect",
+            join(&["Internet", "ConnectA(h, p, 80);\n"]),
+        ),
+        (
+            "url download",
+            join(&["URLDownload", "ToFileW(p, u, f, 0, p);\n"]),
+        ),
+        ("url stream", join(&["URL", "OpenStreamW(p, u, 0, p);\n"])),
+        (
+            "windows networking path",
+            join(&[
+                "use windows_sys::Win32",
+                "::",
+                "Networking::WinSock::SOCKET;\n",
+            ]),
+        ),
+        (
+            "windows networking group",
+            join(&[
+                "use windows_sys::Win32::{Foundation, ",
+                "Networking::WinSock};\n",
+            ]),
+        ),
+        (
+            "urlmon module",
+            join(&["use windows::Win32::System::Com::Url", "mon::Foo;\n"]),
+        ),
+        ("address info", join(&["Get", "AddrInfoW(a, b, c, d);\n"])),
+        ("address info ex", join(&["Get", "AddrInfoExW(a, b, c);\n"])),
+    ];
+    for (case, source) in &samples {
+        assert!(write_and_scan(source) >= 1, "{case}: {source}");
+    }
+}
+
+#[test]
+fn net_ban_ignores_lookalikes_and_allowed_sources() {
+    let scratch = Scratch::new();
+    scratch.write(
+        "crates/bs-platform/src/lib.rs",
+        "use std::os::unix::net::UnixStream;\nuse std::{fmt, netlike};\nlet internet = 1;\n\
+         let AF_INETISH = 2;\nlet socket = 3;\nuse libc::{c_int, close};\nuse windows_sys::Win32::Storage::FileSystem::CreateFileW;\n\
+         let networking = 5;\n",
+    );
+    assert!(net_ban::scan_sources(&scratch.0, &no_allow()).is_empty());
+
+    let planted = join(&["use std", "::", "net::TcpStream;\n"]);
+    scratch.write("crates/bs-platform/src/other.rs", &planted);
+    let allow = net_ban::Allow::parse("source crates/bs-platform/src/other.rs # reviewed\n");
+    assert!(net_ban::scan_sources(&scratch.0, &allow).is_empty());
+}
+
+// ---- net-ban: the two layers agree ----
+
+fn deny_toml() -> String {
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../deny.toml"))
+        .expect("deny.toml")
+}
+
+#[test]
+fn deny_toml_repeats_the_crate_list() {
+    let deny = deny_toml();
+    for name in net_ban::BANNED_CRATES {
+        let spelled = [
+            format!("crate = \"{name}\""),
+            format!("crate = \"{}\"", name.replace('-', "_")),
+        ];
+        assert!(
+            spelled.iter().any(|s| deny.contains(s.as_str())),
+            "deny.toml lacks {name}"
+        );
+    }
+    for prefix in net_ban::BANNED_CRATE_PREFIXES {
+        assert!(
+            deny.contains(&format!("crate = \"{prefix}")),
+            "deny.toml lacks the {prefix} family"
+        );
+    }
+}
+
+#[test]
+fn deny_toml_repeats_the_feature_list() {
+    let deny = deny_toml();
+    // Every banned feature the dependency graph can carry, except the socket
+    // feature of the display-server transport crate: `deny.toml` cannot limit
+    // a feature to certain parent crates, so only `net-ban` covers it.
+    for (name, feature) in net_ban::BANNED_FEATURES {
+        if name == "rustix" {
+            continue;
+        }
+        let section = deny
+            .split("[[bans.features]]")
+            .find(|part| part.contains(&format!("crate = \"{name}\"")))
+            .unwrap_or_else(|| panic!("deny.toml has no feature ban for {name}"));
+        assert!(
+            section.contains(&format!("\"{feature}\"")),
+            "deny.toml lacks {name}/{feature}"
+        );
+    }
+    for (name, prefix) in net_ban::BANNED_FEATURE_PREFIXES {
+        let section = deny
+            .split("[[bans.features]]")
+            .find(|part| part.contains(&format!("crate = \"{name}\"")))
+            .unwrap_or_else(|| panic!("deny.toml has no feature ban for {name}"));
+        assert!(
+            section.contains(&format!("\"{prefix}")),
+            "deny.toml lacks the {name}/{prefix} family"
+        );
+    }
+    for feature in [
+        "Win32_Networking_WinSock",
+        "Win32_Networking_WinHttp",
+        "Win32_Networking_WinInet",
+        "Win32_System_Com_Urlmon",
+    ] {
+        assert!(
+            deny.contains(&format!("\"{feature}\"")),
+            "deny.toml lacks {feature}"
+        );
+    }
+}
+
+#[test]
+fn the_rust_version_matches_the_pinned_toolchain() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let toolchain =
+        std::fs::read_to_string(format!("{root}/rust-toolchain.toml")).expect("toolchain file");
+    let manifest = std::fs::read_to_string(format!("{root}/Cargo.toml")).expect("manifest");
+    let value = |text: &str, key: &str| {
+        text.lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix(key)?
+                    .trim()
+                    .strip_prefix('=')
+                    .map(|v| v.trim().trim_matches('"').to_string())
+            })
+            .unwrap_or_default()
+    };
+    let channel = value(&toolchain, "channel");
+    let rust_version = value(&manifest, "rust-version");
+    assert!(!rust_version.is_empty());
+    assert!(
+        channel == rust_version || channel.starts_with(&format!("{rust_version}.")),
+        "rust-version {rust_version} does not match the pinned toolchain {channel}"
+    );
+}
+
+// ---- helper-deps ----
+
+fn allow(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|name| (*name).to_string()).collect()
+}
+
+#[test]
+fn helper_deps_flags_a_dependency_that_is_not_listed() {
+    let doc = metadata(&[
+        ("bytescape-helper", &[], &[("bs-ipc", None), ("libc", None)]),
+        ("bs-ipc", &[], &[]),
+        ("libc", &[], &[]),
+    ]);
+    let findings = helper_deps::check_metadata(&doc, "t", &allow(&["bs-ipc"]));
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].subject, "libc");
+}
+
+#[test]
+fn helper_deps_follows_indirect_dependencies() {
+    let doc = metadata(&[
+        ("bytescape-helper", &[], &[("bs-ipc", None)]),
+        ("bs-ipc", &[], &[("itoa", None)]),
+        ("itoa", &[], &[]),
+    ]);
+    let findings = helper_deps::check_metadata(&doc, "t", &allow(&["bs-ipc"]));
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].subject, "itoa");
+}
+
+#[test]
+fn helper_deps_ignores_build_and_dev_dependencies_and_other_packages() {
+    let doc = metadata(&[
+        (
+            "bytescape-helper",
+            &[],
+            &[
+                ("bs-ipc", None),
+                ("cc", Some("build")),
+                ("tester", Some("dev")),
+            ],
+        ),
+        ("bs-ipc", &[], &[]),
+        ("cc", &[], &[]),
+        ("tester", &[], &[]),
+        ("bytescape", &[], &[("winit", None)]),
+        ("winit", &[], &[]),
+    ]);
+    assert!(helper_deps::check_metadata(&doc, "t", &allow(&["bs-ipc"])).is_empty());
+}
+
+#[test]
+fn helper_deps_fails_when_the_helper_is_missing() {
+    let doc = metadata(&[("bytescape", &[], &[])]);
+    assert_eq!(helper_deps::check_metadata(&doc, "t", &allow(&[])).len(), 1);
+}
+
+#[test]
+fn helper_deps_allow_file_ignores_comments() {
+    let parsed = helper_deps::parse_allow("# note\nbs_tree  # why\n\nbs-ipc\n");
+    assert_eq!(parsed, allow(&["bs-tree", "bs-ipc"]));
+}
+
+// ---- wording ----
+
+#[test]
+fn wording_flags_each_banned_word() {
+    for text in [
+        "This is safe to delete.",
+        "Remove the JUNK first.",
+        "Space was freed.",
+        "Reclaim space now.",
+        "Reclaimable: 4 GB",
+        "reclaimed",
+        "Time to clean up the disk.",
+        "Time to clean\nup the disk.",
+        "Time to Clean   Up.",
+    ] {
+        assert!(!wording::scan_text(text).is_empty(), "should flag: {text}");
+    }
+}
+
+#[test]
+fn wording_accepts_lookalikes() {
+    for text in [
+        "unsafe code is denied; safety comments are required",
+        "A cleanup advisor is exactly what this is not.",
+        "Free space and a clean install are fine.",
+        "Moved to Recycle Bin, and the bin can be emptied.",
+        "Look up the path, then clean the lens.",
+        "safeguard, junkyard, reclamation",
+    ] {
+        assert!(wording::scan_text(text).is_empty(), "should pass: {text}");
+    }
+}
+
+#[test]
+fn wording_reports_line_numbers() {
+    assert_eq!(wording::scan_text("fine\nfine\nsafe\n"), vec![(3, "safe")]);
+}
+
+#[test]
+fn wording_passes_clean_files_in_every_covered_place() {
+    let scratch = Scratch::new();
+    scratch.write("README.md", "# Bytescape\n\nA visualizer.\n");
+    scratch.write("CHANGELOG.md", "## Unreleased\n\n- Added things.\n");
+    scratch.write("docs/building.md", "Build it.\n");
+    scratch.write(".github/ISSUE_TEMPLATE/bug_report.yml", "name: Bug\n");
+    scratch.write(
+        "packaging/linux/app.metainfo.xml",
+        "<description>ok</description>\n",
+    );
+    assert!(wording::run(&scratch.0, &[]).expect("runs").is_empty());
+}
+
+#[test]
+fn wording_scans_every_covered_place() {
+    let places = [
+        "README.md",
+        "CHANGELOG.md",
+        "docs/building.md",
+        "docs/deep/nested/page.md",
+        ".github/ISSUE_TEMPLATE/bug_report.yml",
+        ".github/ISSUE_TEMPLATE/extra.yml",
+        "packaging/linux/app.metainfo.xml",
+        "packaging/linux/bytescape.desktop",
+        "extra/store.txt",
+    ];
+    for file in places {
+        let scratch = Scratch::new();
+        scratch.write("README.md", "# Bytescape\n");
+        scratch.write(file, "12.3 GB freed. Safe to delete junk.\n");
+        let extra = if file.starts_with("extra/") {
+            vec![scratch.0.join("extra")]
+        } else {
+            Vec::new()
+        };
+        let findings = wording::run(&scratch.0, &extra).expect("runs");
+        assert_eq!(findings.len(), 3, "{file}: {findings:?}");
+    }
+}
+
+#[test]
+fn wording_leaves_the_files_that_explain_the_rule_alone() {
+    let scratch = Scratch::new();
+    scratch.write("README.md", "# Bytescape\n");
+    for file in [
+        "CONTRIBUTING.md",
+        "SECURITY.md",
+        ".github/PULL_REQUEST_TEMPLATE.md",
+    ] {
+        scratch.write(file, "Never say safe, junk or freed.\n");
+    }
+    assert!(wording::run(&scratch.0, &[]).expect("runs").is_empty());
+}
+
+#[test]
+fn wording_fails_on_text_files_it_cannot_read_as_utf8() {
+    // UTF-16 with a byte order mark, as some editors save it.
+    let utf16: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain("safe junk".encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    for file in [
+        "docs/page.md",
+        "CHANGELOG.md",
+        ".github/ISSUE_TEMPLATE/form.yml",
+        "packaging/a.xml",
+    ] {
+        let scratch = Scratch::new();
+        scratch.write("README.md", "# Bytescape\n");
+        let path = scratch.0.join(file);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, &utf16).expect("write");
+        let findings = wording::run(&scratch.0, &[]).expect("runs");
+        assert_eq!(findings.len(), 1, "{file}: {findings:?}");
+        assert!(findings[0].message.contains("UTF-8"), "{}", findings[0]);
+    }
+}
+
+#[test]
+fn wording_skips_images_in_the_prose_folders() {
+    let scratch = Scratch::new();
+    scratch.write("README.md", "# Bytescape\n");
+    let path = scratch.0.join("docs/screenshot.png");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+    std::fs::write(path, [0x89, b'P', b'N', b'G', 0xFF, 0xFE, 0x00]).expect("write");
+    assert!(wording::run(&scratch.0, &[]).expect("runs").is_empty());
+}
+
+#[test]
+fn wording_refuses_to_pass_without_a_readme() {
+    let scratch = Scratch::new();
+    assert!(wording::run(&scratch.0, &[]).is_err());
+}
+
+// ---- public-text ----
+
+fn scan(text: &str) -> Vec<(usize, String)> {
+    public_text::scan_text(text, &Extra::default())
+}
+
+#[test]
+fn public_text_flags_internal_ids_and_names() {
+    let planted = [
+        join(&["see ", "Q", "15"]),
+        join(&["rule ", "NN", "-", "3"]),
+        join(&["rule ", "NN", "\u{2011}", "3"]),
+        join(&["rule ", "NN", "\u{2013}", "3"]),
+        join(&["gate ", "G", "2"]),
+        join(&["phase ", "P", "0"]),
+        join(&["unit ", "p2", "-example"]),
+        join(&["unit ", "p2", "\u{2011}example"]),
+        join(&["unit ", "12"]),
+        join(&["read ", "PL", "AN.md"]),
+        join(&["read ", "DES", "IGN.md"]),
+        join(&["read ", "RU", "LES.md"]),
+        join(&["read ", "REQUIRE", "MENTS.md"]),
+        join(&["an ", "orches", "trator"]),
+        join(&["a ", "special", "ist"]),
+        join(&["an ", "ag", "ent"]),
+        join(&["our ", "ag", "ents"]),
+        join(&["the ", "review", "er"]),
+        join(&["the ", "archi", "tect"]),
+        join(&["per the ", "rul", "ing"]),
+        join(&["two ", "rul", "ings"]),
+        join(&["we ", "wai", "ve it"]),
+        join(&["it was ", "wai", "ved"]),
+        join(&["see \u{a7}", "2.10"]),
+        join(&["commit ", "3d3c42", "e5aac5", "ba8"]),
+    ];
+    for text in &planted {
+        assert!(!scan(text).is_empty(), "should flag: {text}");
+    }
+}
+
+#[test]
+fn public_text_accepts_ordinary_text() {
+    for text in [
+        "Q is a letter and so is P.",
+        "A polkit authentication agent shows the prompt.",
+        "The user agent string is never sent.",
+        "Pinned: uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        "AppId={{A1B2C3D4-0000-4000-8000-0123456789AB}",
+        "Colors #F7F7F8 and #1B1B1E; 1700000000; version 1.99.0",
+        "Windows 11, x64 and arm64; G is for gigabytes",
+        "plan the release; design notes; the rules of the road",
+        "The CPU architecture and the architectural style.",
+        "A rule of thumb; ruled out; a ruler.",
+        "Maintainers review the change.",
+    ] {
+        assert!(scan(text).is_empty(), "should pass: {text}");
+    }
+}
+
+#[test]
+fn public_text_keeps_names_specific_to_the_private_material_out_of_the_built_in_patterns() {
+    let private_repo = join(&["bytescape-", "internal"]);
+    let host_path = join(&["/x/", "al", "era/projects"]);
+    let team_word = join(&["the ", "sw", "arm"]);
+    let release_path = join(&["see release/", "human-", "steps/x"]);
+    for text in [&private_repo, &host_path, &team_word, &release_path] {
+        assert!(
+            scan(text).is_empty(),
+            "built in patterns should not name: {text}"
+        );
+    }
+}
+
+#[test]
+fn public_text_extra_patterns_catch_the_private_names() {
+    let extra = Extra::parse(&format!(
+        "# comment\nword {}\nword {}\nsubstring {}\nsubstring {}\nsubstring {}\n",
+        join(&["al", "era"]),
+        join(&["sw", "arm"]),
+        join(&["bytescape-", "internal"]),
+        join(&["human-", "steps"]),
+        join(&["release/", "store"]),
+    ))
+    .expect("parses");
+    for text in [
+        join(&["the ", "Al", "era server"]),
+        join(&["the ", "sw", "arm folder"]),
+        join(&["repo ", "bytescape-", "internal"]),
+        join(&["/x/", "al", "era/foo"]),
+        join(&["release/", "human-", "steps/x.md"]),
+        join(&["release/", "store/listing"]),
+    ] {
+        assert!(
+            !public_text::scan_text(&text, &extra).is_empty(),
+            "should flag: {text}"
+        );
+    }
+    assert!(public_text::scan_text("ordinary text", &extra).is_empty());
+}
+
+#[test]
+fn public_text_extra_pattern_files_must_be_well_formed() {
+    assert!(Extra::parse("word one\nsubstring two words\n").is_ok());
+    assert!(Extra::parse("nonsense line\n").is_err());
+    assert!(Extra::parse("word\n").is_err());
+}
+
+#[test]
+fn public_text_scans_every_file_but_the_pattern_list() {
+    let scratch = Scratch::new();
+    scratch.write("README.md", "clean\n");
+    scratch.write(".github/workflows/ci.yml", "# a comment\n");
+    scratch.write("crates/bs-tree/src/lib.rs", "//! docs\n");
+    assert!(
+        public_text::run(&scratch.0, &Extra::default())
+            .expect("runs")
+            .is_empty()
+    );
+
+    let planted = join(&["// ", "Q", "7 says so\n"]);
+    for file in [
+        ".github/workflows/ci.yml",
+        "crates/bs-tree/src/lib.rs",
+        "docs/a.md",
+        "Cargo.toml",
+    ] {
+        let scratch = Scratch::new();
+        scratch.write("README.md", "clean\n");
+        scratch.write(file, &planted);
+        assert_eq!(
+            public_text::run(&scratch.0, &Extra::default())
+                .expect("runs")
+                .len(),
+            1,
+            "{file}"
+        );
+    }
+}
+
+// ---- unsafe-allow ----
+
+fn allow_attr(lint: &str) -> String {
+    join(&["#![al", "low(", lint, ")]\n"])
+}
+
+#[test]
+fn unsafe_allow_flags_the_lint_outside_the_listed_crates() {
+    let unsafe_lint = join(&["unsafe", "_code"]);
+    let attr = allow_attr(&unsafe_lint);
+    for rel in [
+        "crates/bs-ui/src/lib.rs",
+        "crates/bs-tree/src/lib.rs",
+        "crates/bs-layout/src/module/deep.rs",
+        "crates/bs-ipc/src/lib.rs",
+        "crates/bytescape/src/main.rs",
+        "xtask/src/lib.rs",
+        "packaging/build-metadata.rs",
+    ] {
+        assert_eq!(unsafe_allow::check_source(rel, &attr).len(), 1, "{rel}");
+    }
+    let in_list = join(&["#[cfg_attr(test, al", "low(unsafe", "_code, dead_code))]\n"]);
+    assert_eq!(
+        unsafe_allow::check_source("crates/bs-ui/src/lib.rs", &in_list).len(),
+        1
+    );
+    let expect_form = join(&["#![ex", "pect(unsafe", "_code)]\n"]);
+    assert_eq!(
+        unsafe_allow::check_source("crates/bs-ui/src/lib.rs", &expect_form).len(),
+        1
+    );
+}
+
+#[test]
+fn unsafe_allow_admits_the_listed_crates() {
+    let attr = allow_attr(&join(&["unsafe", "_code"]));
+    for (name, _) in unsafe_allow::MAY_ALLOW_UNSAFE {
+        let rel = format!("crates/{name}/src/platform/linux.rs");
+        assert!(unsafe_allow::check_source(&rel, &attr).is_empty(), "{name}");
+    }
+    assert_eq!(unsafe_allow::MAY_ALLOW_UNSAFE.len(), 8);
+}
+
+#[test]
+fn unsafe_allow_never_admits_switching_off_the_safety_comment_lints() {
+    for lint in [
+        join(&["clippy::undocumented", "_unsafe_blocks"]),
+        join(&["unsafe_op_in", "_unsafe_fn"]),
+    ] {
+        for rel in ["crates/bs-platform/src/lib.rs", "crates/bs-ui/src/lib.rs"] {
+            assert_eq!(
+                unsafe_allow::check_source(rel, &allow_attr(&lint)).len(),
+                1,
+                "{rel} {lint}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unsafe_allow_ignores_other_lints_and_plain_words() {
+    let other = allow_attr("dead_code");
+    assert!(unsafe_allow::check_source("crates/bs-ui/src/lib.rs", &other).is_empty());
+    let text = "// the crate does not use unsafe code\nfn may_allow(x: u8) -> u8 { x }\n";
+    assert!(unsafe_allow::check_source("crates/bs-ui/src/lib.rs", text).is_empty());
+}
+
+#[test]
+fn unsafe_allow_checks_manifests() {
+    let setting = join(&["unsafe", "_code = \"allow\"\n"]);
+    let manifest = format!("[lints.rust]\n{setting}");
+    assert_eq!(
+        unsafe_allow::check_manifest("crates/bs-ui/Cargo.toml", &manifest).len(),
+        1
+    );
+    assert!(unsafe_allow::check_manifest("crates/bs-platform/Cargo.toml", &manifest).is_empty());
+    let commented = format!("# {setting}");
+    assert!(unsafe_allow::check_manifest("crates/bs-ui/Cargo.toml", &commented).is_empty());
+
+    let denying = join(&["[workspace.lints.rust]\nunsafe", "_code = \"deny\"\n"]);
+    assert!(unsafe_allow::check_manifest("Cargo.toml", &denying).is_empty());
+    let relaxed = join(&["[workspace.lints.rust]\nunsafe", "_code = \"warn\"\n"]);
+    assert_eq!(
+        unsafe_allow::check_manifest("Cargo.toml", &relaxed).len(),
+        1
+    );
+}
+
+#[test]
+fn unsafe_allow_runs_over_a_tree() {
+    let scratch = Scratch::new();
+    let denying = join(&["unsafe", "_code = \"deny\"\n"]);
+    scratch.write("Cargo.toml", &denying);
+    scratch.write(
+        "crates/bs-platform/src/lib.rs",
+        &allow_attr(&join(&["unsafe", "_code"])),
+    );
+    assert!(unsafe_allow::run(&scratch.0).expect("runs").is_empty());
+    scratch.write(
+        "crates/bs-ui/src/lib.rs",
+        &allow_attr(&join(&["unsafe", "_code"])),
+    );
+    assert_eq!(unsafe_allow::run(&scratch.0).expect("runs").len(), 1);
+}
+
+// ---- build metadata ----
+
+#[test]
+fn build_dates_are_utc_calendar_dates() {
+    use build_metadata::{build_date, utc_date_from_epoch};
+    assert_eq!(utc_date_from_epoch(0), "1970-01-01");
+    assert_eq!(utc_date_from_epoch(951_782_400), "2000-02-29");
+    assert_eq!(utc_date_from_epoch(1_700_000_000), "2023-11-14");
+    assert_eq!(utc_date_from_epoch(1_699_920_000), "2023-11-14");
+    assert_eq!(utc_date_from_epoch(1_699_920_000 - 1), "2023-11-13");
+    assert_eq!(utc_date_from_epoch(1_699_920_000 + 86_399), "2023-11-14");
+    assert_eq!(build_date(Some(" 1700000000\n")), "2023-11-14");
+    assert_eq!(build_date(Some("not a number")), "unknown");
+    assert_eq!(build_date(None), "unknown");
+}

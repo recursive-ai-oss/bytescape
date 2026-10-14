@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Matches the toolchain pinned in rust-toolchain.toml. Raise both together.
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/recursive-ai-oss/bytescape"
+authors = ["Recursive AI, LLC"]
+
+# Deny, not forbid: the platform bindings and the raw disk readers allow
+# unsafe code locally, in small modules, each block with a SAFETY comment.
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# Symbol names stay in the binaries so a local crash report shows a readable
+# backtrace. Windows debug symbols ship as a separate download, never inside
+# the installer.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
