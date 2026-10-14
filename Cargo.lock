@@ -180,6 +180,7 @@ dependencies = [
 name = "bs-ui"
 version = "0.1.0"
 dependencies = [
+ "bs-knowledge",
  "bs-layout",
  "bs-platform",
  "bs-render",

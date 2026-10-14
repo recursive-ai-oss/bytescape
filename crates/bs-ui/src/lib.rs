@@ -6,17 +6,25 @@
 //! benchmark harness feed the same events in directly, so a scripted zoom takes
 //! exactly the path a user's wheel takes.
 
+pub mod action;
 pub mod capacity;
+pub mod card;
 pub mod chrome;
 pub mod info;
 pub mod shell;
+pub mod spatial;
 pub mod tree;
+pub mod wheel;
 
 use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bs_render::{Item, Rect, ZoomDirection};
+
+pub use card::CardData;
+pub use spatial::Direction;
+use wheel::{PINCH_PER_LEVEL, Source, WheelGate};
 
 /// Identifies a folder view. Opaque to the UI; the [`ViewSource`] defines it.
 pub type ViewId = u64;
@@ -70,6 +78,24 @@ pub trait ViewSource {
     fn breadcrumb(&self, _view: ViewId) -> String {
         String::new()
     }
+    /// The folders from the top down to `view`, one name each, for a
+    /// clickable breadcrumb. Empty when the source has no such trail.
+    fn trail(&self, _view: ViewId) -> Vec<String> {
+        Vec::new()
+    }
+    /// The view of the folder at position `index` of [`ViewSource::trail`],
+    /// making it available if need be.
+    fn open_trail_segment(&mut self, _view: ViewId, _index: usize) -> Option<ViewId> {
+        None
+    }
+    /// The full path of box `id` of `view`, converted for display.
+    fn path(&self, _view: ViewId, _id: u32) -> Option<String> {
+        None
+    }
+    /// Everything the hover card says about box `id` of `view`.
+    fn card(&self, _view: ViewId, _id: u32) -> Option<CardData> {
+        None
+    }
     /// What to tell about box `id` of `view`.
     fn describe(&self, _view: ViewId, _id: u32) -> Option<ItemInfo> {
         None
@@ -108,6 +134,20 @@ pub enum Key {
     AltLeft,
     AltRight,
     AltUp,
+    /// An arrow: moves the selection to the nearest box that way.
+    Arrow(Direction),
+    /// Delete: move the selection to the Recycle Bin or Trash.
+    Delete,
+    /// Shift+Delete: delete the selection for good.
+    DeletePermanently,
+    /// Ctrl+Z: put the last deleted item back.
+    Undo,
+    /// Ctrl+C: copy the selection's path.
+    CopyPath,
+    /// Shift+F5: scan the selected folder again.
+    Rescan,
+    /// Shift+F10 or the menu key.
+    ContextMenu,
 }
 
 /// An input event, already translated from the windowing system.
@@ -118,11 +158,30 @@ pub enum InputEvent {
         y: f32,
     },
     PointerLeft,
-    /// Positive `steps` is wheel up (deeper), negative is wheel down (up).
+    /// A wheel notch. Positive `steps` is wheel up (deeper), negative is
+    /// wheel down (up).
     Wheel {
         x: f32,
         y: f32,
         steps: f32,
+    },
+    /// A touchpad scroll delta, in steps (see [`wheel`]): many small events
+    /// per gesture.
+    Touchpad {
+        x: f32,
+        y: f32,
+        steps: f32,
+    },
+    /// A pinch gesture. Positive `delta` is pinching out (deeper), negative is
+    /// pinching in (up); a delta of [`wheel::PINCH_PER_LEVEL`] is one level.
+    Pinch {
+        x: f32,
+        y: f32,
+        delta: f32,
+    },
+    /// A segment of the breadcrumb was clicked.
+    CrumbClick {
+        index: usize,
     },
     Click {
         x: f32,
@@ -210,6 +269,13 @@ pub struct FinishedRelayout {
 /// History keeps this many entries on each side.
 const HISTORY_LIMIT: usize = 256;
 
+/// Where the user was, and what was selected there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryEntry {
+    view: ViewId,
+    selected: Vec<u32>,
+}
+
 /// The state of the map window.
 pub struct App<S: ViewSource> {
     source: S,
@@ -227,8 +293,14 @@ pub struct App<S: ViewSource> {
     /// Whether the renderer is still running a zoom. The renderer owns the
     /// animation clock; the host copies its answer here before each event.
     animating: bool,
-    history_back: Vec<ViewId>,
-    history_forward: Vec<ViewId>,
+    history_back: Vec<HistoryEntry>,
+    history_forward: Vec<HistoryEntry>,
+    gate: WheelGate,
+    /// Changes whenever the layout on screen is replaced.
+    generation: u64,
+    /// A box whose card should show at once (a double click or Enter on a
+    /// file), until the window takes it.
+    card_request: Option<u32>,
 }
 
 impl<S: ViewSource> App<S> {
@@ -250,7 +322,41 @@ impl<S: ViewSource> App<S> {
             animating: false,
             history_back: Vec::new(),
             history_forward: Vec::new(),
+            gate: WheelGate::default(),
+            generation: 0,
+            card_request: None,
         }
+    }
+
+    /// A number that changes every time the layout on screen is replaced
+    /// (navigation, refresh, resize, new data).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The box whose card should show right now, if a double click or Enter
+    /// asked for it. Asking clears the request.
+    pub fn take_card_request(&mut self) -> Option<u32> {
+        self.card_request.take()
+    }
+
+    /// The box with this id in the view on screen.
+    pub fn item(&self, id: u32) -> Option<&Item> {
+        self.top()?.layout.items.iter().find(|i| i.id == id)
+    }
+
+    /// Opens box `id` as Enter does: a folder is entered, anything else asks
+    /// for its card.
+    pub fn open(&mut self, id: u32) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        self.skip_running_animation(&mut fx);
+        self.open_item(id, &mut fx);
+        fx
+    }
+
+    /// The views behind the back button, oldest first.
+    pub fn history(&self) -> Vec<ViewId> {
+        self.history_back.iter().map(|e| e.view).collect()
     }
 
     /// Tells the app whether the renderer is still animating a zoom. Call this
@@ -370,10 +476,10 @@ impl<S: ViewSource> App<S> {
         Some((it.id, view, it.rect))
     }
 
-    /// Handles one event. `_now` is the time since the app started; nothing
-    /// uses it yet, and it is reserved for time-based input handling such as
-    /// coalescing wheel events.
-    pub fn update(&mut self, event: InputEvent, _now: Duration) -> Vec<Effect> {
+    /// Handles one event. `now` is the time since the app started; wheel,
+    /// touchpad and pinch input is coalesced and rate-limited by it (see
+    /// [`wheel`]).
+    pub fn update(&mut self, event: InputEvent, now: Duration) -> Vec<Effect> {
         let mut fx = Vec::new();
         match event {
             InputEvent::PointerMoved { x, y } => {
@@ -391,33 +497,43 @@ impl<S: ViewSource> App<S> {
             InputEvent::Click { x, y } => self.click(x, y, Modifiers::default(), &mut fx),
             InputEvent::ClickWith { x, y, mods } => self.click(x, y, mods, &mut fx),
             InputEvent::Wheel { x, y, steps } => {
-                self.skip_running_animation(&mut fx);
-                if steps > 0.0 {
-                    self.zoom_in_at(x, y, &mut fx);
-                } else if steps < 0.0 {
-                    self.zoom_out(&mut fx);
-                }
+                self.scroll(x, y, steps, Source::Notch, now, &mut fx);
+            }
+            InputEvent::Touchpad { x, y, steps } => {
+                self.scroll(x, y, steps, Source::Precise, now, &mut fx);
+            }
+            InputEvent::Pinch { x, y, delta } => {
+                self.scroll(x, y, delta / PINCH_PER_LEVEL, Source::Precise, now, &mut fx);
             }
             InputEvent::DoubleClick { x, y } => {
                 self.skip_running_animation(&mut fx);
-                self.zoom_in_at(x, y, &mut fx);
+                self.double_click(x, y, &mut fx);
             }
             InputEvent::Key(Key::Enter) => {
                 self.skip_running_animation(&mut fx);
                 if let Some(sel) = self.selected() {
-                    let target = self.top().and_then(|l| {
-                        let it = l.layout.items.iter().find(|i| i.id == sel)?;
-                        let view = l.layout.folders.iter().find(|(id, _)| *id == sel)?.1;
-                        Some((view, it.rect))
-                    });
-                    if let Some((view, rect)) = target {
-                        self.enter(view, rect, &mut fx);
-                    }
+                    self.open_item(sel, &mut fx);
                 }
             }
             InputEvent::Key(Key::Backspace | Key::AltUp) => {
                 self.skip_running_animation(&mut fx);
                 self.zoom_out(&mut fx);
+            }
+            InputEvent::Key(Key::Arrow(dir)) => self.arrow(dir, &mut fx),
+            InputEvent::Key(
+                Key::Delete
+                | Key::DeletePermanently
+                | Key::Undo
+                | Key::CopyPath
+                | Key::Rescan
+                | Key::ContextMenu,
+            ) => {}
+            InputEvent::CrumbClick { index } => {
+                self.skip_running_animation(&mut fx);
+                let view = self.current_view();
+                if let Some(target) = self.source.open_trail_segment(view, index) {
+                    self.navigate_to(target, &mut fx);
+                }
             }
             InputEvent::Key(Key::Home) => {
                 self.skip_running_animation(&mut fx);
@@ -440,6 +556,7 @@ impl<S: ViewSource> App<S> {
             }
             InputEvent::Key(Key::Refresh) => {
                 self.nav_token += 1;
+                self.generation += 1;
                 let top = self.stack.len().saturating_sub(1);
                 for (i, level) in self.stack.iter_mut().enumerate() {
                     level.stale = i != top;
@@ -449,21 +566,24 @@ impl<S: ViewSource> App<S> {
             }
             InputEvent::Key(Key::AltLeft) => {
                 self.skip_running_animation(&mut fx);
-                if let Some(view) = self.history_back.pop() {
-                    let here = self.current_view();
+                if let Some(entry) = self.history_back.pop() {
+                    let here = self.here();
                     self.history_forward.push(here);
-                    self.jump_to(view, &mut fx);
+                    self.jump_to(entry.view, &mut fx);
+                    self.restore_selection(&entry.selected, &mut fx);
                 }
             }
             InputEvent::Key(Key::AltRight) => {
                 self.skip_running_animation(&mut fx);
-                if let Some(view) = self.history_forward.pop() {
-                    let here = self.current_view();
+                if let Some(entry) = self.history_forward.pop() {
+                    let here = self.here();
                     self.history_back.push(here);
-                    self.jump_to(view, &mut fx);
+                    self.jump_to(entry.view, &mut fx);
+                    self.restore_selection(&entry.selected, &mut fx);
                 }
             }
             InputEvent::DataChanged => {
+                self.generation += 1;
                 let top = self.stack.len().saturating_sub(1);
                 for (i, level) in self.stack.iter_mut().enumerate() {
                     level.stale = i != top;
@@ -474,13 +594,7 @@ impl<S: ViewSource> App<S> {
             InputEvent::Resized { map } => {
                 self.map = map;
                 let view = self.current_view();
-                let mut views = Vec::new();
-                let mut v = Some(view);
-                while let Some(id) = v {
-                    views.push(id);
-                    v = self.source.parent(id);
-                }
-                views.reverse();
+                let views = self.chain_to(view);
                 self.stack = views
                     .into_iter()
                     .map(|view| Level {
@@ -493,7 +607,9 @@ impl<S: ViewSource> App<S> {
                 self.selected.clear();
                 self.anchor = None;
                 self.nav_token += 1;
+                self.generation += 1;
                 self.animating = false;
+                self.gate.reset();
                 fx.push(Effect::SetView(self.items()));
             }
         }
@@ -502,6 +618,7 @@ impl<S: ViewSource> App<S> {
 
     /// Lays the top of the stack out again, here and now.
     fn refresh_top_now(&mut self) {
+        self.generation += 1;
         let map = self.map;
         if let Some(level) = self.stack.last_mut() {
             level.layout = self.source.layout(level.view, map);
@@ -636,6 +753,7 @@ impl<S: ViewSource> App<S> {
             level.layout = layout;
             level.stale = false;
         }
+        self.generation += 1;
         self.restore_after_relayout(&mut fx);
         fx
     }
@@ -647,9 +765,92 @@ impl<S: ViewSource> App<S> {
         }
     }
 
+    /// One scroll delta: after coalescing and rate limiting, at most one
+    /// level in or out.
+    fn scroll(
+        &mut self,
+        x: f32,
+        y: f32,
+        steps: f32,
+        source: Source,
+        now: Duration,
+        fx: &mut Vec<Effect>,
+    ) {
+        match self.gate.feed(steps, source, now) {
+            1 => {
+                self.skip_running_animation(fx);
+                self.zoom_in_at(x, y, fx);
+            }
+            -1 => {
+                self.skip_running_animation(fx);
+                self.zoom_out(fx);
+            }
+            _ => {}
+        }
+    }
+
     fn zoom_in_at(&mut self, x: f32, y: f32, fx: &mut Vec<Effect>) {
         if let Some((_, view, rect)) = self.child_under(x, y) {
             self.enter(view, rect, fx);
+        }
+    }
+
+    /// The view a folder box opens, if it can be entered.
+    fn view_of(&self, id: u32) -> Option<ViewId> {
+        self.top()?
+            .layout
+            .folders
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, v)| *v)
+    }
+
+    /// Enter on a box: go into a folder; show the card of anything else.
+    fn open_item(&mut self, id: u32, fx: &mut Vec<Effect>) {
+        let target = self.view_of(id).zip(self.item(id).map(|i| i.rect));
+        match target {
+            Some((view, rect)) => self.enter(view, rect, fx),
+            None => self.card_request = Some(id),
+        }
+    }
+
+    /// A double click jumps straight into the folder under the pointer, at
+    /// any depth. On a file it selects the file and asks for its card; it
+    /// never opens anything.
+    fn double_click(&mut self, x: f32, y: f32, fx: &mut Vec<Effect>) {
+        let Some(id) = self.hit(x, y).map(|i| i.id) else {
+            return;
+        };
+        if self.view_of(id).is_some() {
+            self.open_item(id, fx);
+            return;
+        }
+        if self.selected != [id] {
+            self.selected = vec![id];
+            self.anchor = Some(id);
+            fx.push(self.selection_effect());
+        }
+        self.card_request = Some(id);
+    }
+
+    fn arrow(&mut self, dir: Direction, fx: &mut Vec<Effect>) {
+        let Some(level) = self.top() else {
+            return;
+        };
+        let items = &level.layout.items;
+        let next = match self.selected() {
+            Some(sel) => items
+                .iter()
+                .find(|i| i.id == sel)
+                .and_then(|from| spatial::neighbor(items, from, dir)),
+            None => spatial::first(items),
+        };
+        if let Some(id) = next
+            && self.selected != [id]
+        {
+            self.selected = vec![id];
+            self.anchor = Some(id);
+            fx.push(self.selection_effect());
         }
     }
 
@@ -669,6 +870,7 @@ impl<S: ViewSource> App<S> {
         self.selected.clear();
         self.anchor = None;
         self.nav_token += 1;
+        self.generation += 1;
         fx.push(Effect::Zoom {
             direction: ZoomDirection::In,
             items,
@@ -678,48 +880,94 @@ impl<S: ViewSource> App<S> {
     }
 
     fn zoom_out(&mut self, fx: &mut Vec<Effect>) {
-        if self.stack.len() < 2 {
+        if let Some(len) = self.stack.len().checked_sub(1)
+            && len >= 1
+        {
+            self.zoom_out_to(len, fx);
+        }
+    }
+
+    /// Goes up until `len` levels remain, in one animated zoom. The folder
+    /// the user came out of is selected, so Enter goes straight back in.
+    fn zoom_out_to(&mut self, len: usize, fx: &mut Vec<Effect>) {
+        if len == 0 || len >= self.stack.len() {
             return;
         }
-        let Some(gone) = self.stack.pop() else {
-            return;
-        };
-        self.push_history(gone.view);
+        let came_from = self.stack[len].view;
+        self.push_history(self.current_view());
         self.history_forward.clear();
+        self.stack.truncate(len);
         self.refresh_top();
         self.prune_views();
         let Some(parent) = self.stack.last() else {
             return;
         };
-        let child = parent
+        let folder = parent
             .layout
             .folders
             .iter()
-            .find(|(_, v)| *v == gone.view)
-            .and_then(|(id, _)| parent.layout.items.iter().find(|i| i.id == *id))
+            .find(|(_, v)| *v == came_from)
+            .map(|(id, _)| *id);
+        let child = folder
+            .and_then(|id| parent.layout.items.iter().find(|i| i.id == id))
             .map(|i| i.rect)
             .unwrap_or(self.map);
+        let (items, view) = (Arc::clone(&parent.layout.items), parent.view);
         self.hover = None;
-        self.selected.clear();
-        self.anchor = None;
+        self.selected = folder.into_iter().collect();
+        self.anchor = folder;
         self.nav_token += 1;
+        self.generation += 1;
         fx.push(Effect::Zoom {
             direction: ZoomDirection::Out,
-            items: Arc::clone(&parent.layout.items),
+            items,
             child,
         });
-        fx.push(Effect::ViewChanged(parent.view));
+        fx.push(Effect::ViewChanged(view));
+        if folder.is_some() {
+            fx.push(self.selection_effect());
+        }
     }
 
-    fn jump_to(&mut self, view: ViewId, fx: &mut Vec<Effect>) {
+    /// Shows `view`: a step up the stack when it is on it, otherwise a jump.
+    fn navigate_to(&mut self, view: ViewId, fx: &mut Vec<Effect>) {
+        if view == self.current_view() {
+            return;
+        }
+        match self.stack.iter().position(|l| l.view == view) {
+            Some(at) => self.zoom_out_to(at + 1, fx),
+            None => {
+                self.push_history(self.current_view());
+                self.history_forward.clear();
+                self.jump_to(view, fx);
+            }
+        }
+    }
+
+    /// The views from the top of the navigation down to `view`. A view the
+    /// source cannot place under another hangs directly below the top.
+    fn chain_to(&self, view: ViewId) -> Vec<ViewId> {
+        let root = self.source.root();
         let mut chain = vec![view];
         let mut v = self.source.parent(view);
         while let Some(id) = v {
+            // A source that loops would otherwise never end.
+            if chain.contains(&id) || chain.len() > 4096 {
+                break;
+            }
             chain.push(id);
             v = self.source.parent(id);
         }
         chain.reverse();
-        self.stack = chain
+        if chain.first() != Some(&root) {
+            chain.insert(0, root);
+        }
+        chain
+    }
+
+    fn jump_to(&mut self, view: ViewId, fx: &mut Vec<Effect>) {
+        let chain = self.chain_to(view);
+        let levels: Vec<Level> = chain
             .into_iter()
             .map(|view| Level {
                 view,
@@ -727,6 +975,16 @@ impl<S: ViewSource> App<S> {
                 stale: false,
             })
             .collect();
+        // A view the source no longer knows lays out empty: stay at the top
+        // rather than showing nothing.
+        let empty = levels
+            .last()
+            .is_some_and(|l| l.layout.items.is_empty() && l.view != self.source.root());
+        self.stack = if empty {
+            levels.into_iter().take(1).collect()
+        } else {
+            levels
+        };
         self.after_set_view(fx);
     }
 
@@ -741,11 +999,43 @@ impl<S: ViewSource> App<S> {
         }
     }
 
+    /// The view on screen with its selection, as a history entry.
+    fn here(&self) -> HistoryEntry {
+        HistoryEntry {
+            view: self.current_view(),
+            selected: self.selected.clone(),
+        }
+    }
+
+    /// Remembers `view`, which the user is leaving, with what is selected.
     fn push_history(&mut self, view: ViewId) {
-        self.history_back.push(view);
+        self.history_back.push(HistoryEntry {
+            view,
+            selected: self.selected.clone(),
+        });
         if self.history_back.len() > HISTORY_LIMIT {
             self.history_back.remove(0);
         }
+    }
+
+    /// Selects again what was selected when the user left a view, as far as
+    /// those boxes are still there.
+    fn restore_selection(&mut self, ids: &[u32], fx: &mut Vec<Effect>) {
+        let Some(level) = self.top() else {
+            return;
+        };
+        let items = &level.layout.items;
+        let kept: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| items.iter().any(|i| i.id == *id))
+            .collect();
+        if kept.is_empty() {
+            return;
+        }
+        self.anchor = kept.last().copied();
+        self.selected = kept;
+        fx.push(self.selection_effect());
     }
 
     /// Tells the source which views history can still reach.
@@ -754,8 +1044,8 @@ impl<S: ViewSource> App<S> {
             .stack
             .iter()
             .map(|l| l.view)
-            .chain(self.history_back.iter().copied())
-            .chain(self.history_forward.iter().copied())
+            .chain(self.history_back.iter().map(|e| e.view))
+            .chain(self.history_forward.iter().map(|e| e.view))
             .collect();
         self.source.prune(&keep);
     }
@@ -767,6 +1057,8 @@ impl<S: ViewSource> App<S> {
         self.selected.clear();
         self.anchor = None;
         self.nav_token += 1;
+        self.generation += 1;
+        self.gate.reset();
         fx.push(Effect::SetView(self.items()));
         fx.push(Effect::ViewChanged(self.current_view()));
     }

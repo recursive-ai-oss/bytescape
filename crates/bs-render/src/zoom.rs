@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use crate::geom::Rect;
+use crate::geom::{IRect, Rect};
 
 /// Runs `work(first_row, band)` over disjoint horizontal bands of `data`
 /// (rows of `row_len` elements) on up to `threads` threads. Bands are handed
@@ -87,12 +87,16 @@ pub fn zoom_geometry(width: f32, height: f32, child: Rect, p: f32) -> ZoomFrame 
 }
 
 /// Composes one zoom frame into `out` (`width × height` native pixel words).
+///
+/// Only `region` zooms: it is the map. Everything outside it (the bars above
+/// and below) is copied unchanged from the large image, so the controls stay
+/// put while the folders move. `frame` is in the region's own coordinates.
 /// Images are sampled with nearest-neighbour steps: the frame lasts a
 /// fraction of a second, and the full-quality view replaces it at the end.
 pub fn compose_zoom(
     out: &mut [u32],
-    width: usize,
-    height: usize,
+    (width, height): (usize, usize),
+    region: IRect,
     big: &[u8],
     small: &[u8],
     frame: &ZoomFrame,
@@ -101,21 +105,29 @@ pub fn compose_zoom(
     if width == 0 || height == 0 || out.len() < width * height {
         return;
     }
-    let xmap: Vec<u32> = (0..width)
+    let Some(region) = region.intersect(&IRect::new(0, 0, width as i32, height as i32)) else {
+        return;
+    };
+    let (rx, ry) = (region.x as usize, region.y as usize);
+    let (rw, rh) = (region.w as usize, region.h as usize);
+    if rw == 0 || rh == 0 {
+        return;
+    }
+    let xmap: Vec<u32> = (0..rw)
         .map(|x| {
-            let sx = frame.big_src.x + (x as f32 + 0.5) * frame.big_src.w / width as f32;
-            (sx.max(0.0) as usize).min(width - 1) as u32
+            let sx = frame.big_src.x + (x as f32 + 0.5) * frame.big_src.w / rw as f32;
+            (rx + (sx.max(0.0) as usize).min(rw - 1)) as u32
         })
         .collect();
     let dst = frame.small_dst;
-    let dx0 = (dst.x.round().max(0.0) as usize).min(width);
-    let dx1 = (dst.right().round().max(0.0) as usize).min(width);
-    let dy0 = (dst.y.round().max(0.0) as usize).min(height);
-    let dy1 = (dst.bottom().round().max(0.0) as usize).min(height);
+    let dx0 = (dst.x.round().max(0.0) as usize).min(rw);
+    let dx1 = (dst.right().round().max(0.0) as usize).min(rw);
+    let dy0 = (dst.y.round().max(0.0) as usize).min(rh);
+    let dy1 = (dst.bottom().round().max(0.0) as usize).min(rh);
     let smap: Vec<u32> = (dx0..dx1)
         .map(|x| {
-            let sx = (x as f32 + 0.5 - dst.x) / dst.w * width as f32;
-            (sx.max(0.0) as usize).min(width - 1) as u32
+            let sx = (x as f32 + 0.5 - dst.x) / dst.w * rw as f32;
+            (rx + (sx.max(0.0) as usize).min(rw - 1)) as u32
         })
         .collect();
     let a = ((frame.small_alpha.clamp(0.0, 1.0)) * 256.0).round() as u32;
@@ -128,19 +140,35 @@ pub fn compose_zoom(
         |row0, band| {
             for (i, line) in band.chunks_exact_mut(width).enumerate() {
                 let y = row0 + i;
-                let sy = frame.big_src.y + (y as f32 + 0.5) * frame.big_src.h / height as f32;
-                let big_row =
-                    &big[(sy.max(0.0) as usize).min(height - 1) * width * 4..][..width * 4];
-                for (px, &m) in line.iter_mut().zip(&xmap) {
-                    *px = word_at(big_row, m as usize);
-                }
-                if a == 0 || y < dy0 || y >= dy1 || dx0 >= dx1 {
+                if y < ry || y >= ry + rh {
+                    // The bars keep their place.
+                    let row = &big[y * width * 4..][..width * 4];
+                    for (x, px) in line.iter_mut().enumerate() {
+                        *px = word_at(row, x);
+                    }
                     continue;
                 }
-                let sy = (y as f32 + 0.5 - dst.y) / dst.h * height as f32;
+                let yr = y - ry;
+                let sy = frame.big_src.y + (yr as f32 + 0.5) * frame.big_src.h / rh as f32;
+                let big_row =
+                    &big[(ry + (sy.max(0.0) as usize).min(rh - 1)) * width * 4..][..width * 4];
+                let flat_row = &big[y * width * 4..][..width * 4];
+                for (x, px) in line.iter_mut().enumerate().take(rx) {
+                    *px = word_at(flat_row, x);
+                }
+                for (x, px) in line.iter_mut().enumerate().skip(rx + rw) {
+                    *px = word_at(flat_row, x);
+                }
+                for (px, &m) in line[rx..rx + rw].iter_mut().zip(&xmap) {
+                    *px = word_at(big_row, m as usize);
+                }
+                if a == 0 || yr < dy0 || yr >= dy1 || dx0 >= dx1 {
+                    continue;
+                }
+                let sy = (yr as f32 + 0.5 - dst.y) / dst.h * rh as f32;
                 let small_row =
-                    &small[(sy.max(0.0) as usize).min(height - 1) * width * 4..][..width * 4];
-                for (px, &m) in line[dx0..dx1].iter_mut().zip(&smap) {
+                    &small[(ry + (sy.max(0.0) as usize).min(rh - 1)) * width * 4..][..width * 4];
+                for (px, &m) in line[rx + dx0..rx + dx1].iter_mut().zip(&smap) {
                     *px = blend(*px, word_at(small_row, m as usize), a);
                 }
             }
@@ -206,8 +234,8 @@ mod tests {
         let mut out = vec![0u32; w * h];
         compose_zoom(
             &mut out,
-            w,
-            h,
+            (w, h),
+            IRect::new(0, 0, w as i32, h as i32),
             &big,
             &small,
             &zoom_geometry(w as f32, h as f32, child, 0.0),
@@ -216,8 +244,8 @@ mod tests {
         assert!(out.iter().all(|&p| p == 0xFF11_2233));
         compose_zoom(
             &mut out,
-            w,
-            h,
+            (w, h),
+            IRect::new(0, 0, w as i32, h as i32),
             &big,
             &small,
             &zoom_geometry(w as f32, h as f32, child, 1.0),
@@ -226,8 +254,8 @@ mod tests {
         assert!(out.iter().all(|&p| p == 0xFF44_5566));
         compose_zoom(
             &mut out,
-            w,
-            h,
+            (w, h),
+            IRect::new(0, 0, w as i32, h as i32),
             &big,
             &small,
             &zoom_geometry(w as f32, h as f32, child, 0.5),
@@ -235,6 +263,67 @@ mod tests {
         );
         let mid = out[(h / 2) * w + w / 2];
         assert!(mid != 0xFF11_2233 && mid != 0xFF44_5566, "{mid:08x}");
+    }
+
+    #[test]
+    fn bars_outside_the_region_stay_as_they_are() {
+        // A 64 × 32 window with a 4-row bar on top and bottom: the map is the
+        // 24 rows between them.
+        let (w, h) = (64usize, 32usize);
+        let region = IRect::new(0, 4, w as i32, 24);
+        let mut big = vec![0u8; w * h * 4];
+        let mut small = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let (b, s) = if (4..28).contains(&y) {
+                (0xFF11_2233u32, 0xFF44_5566u32)
+            } else {
+                (0xFFAA_AAAAu32, 0xFF55_5555u32)
+            };
+            for x in 0..w {
+                big[(y * w + x) * 4..][..4].copy_from_slice(&b.to_le_bytes());
+                small[(y * w + x) * 4..][..4].copy_from_slice(&s.to_le_bytes());
+            }
+        }
+        let child = Rect::new(16.0, 6.0, 32.0, 12.0);
+        for p in [0.0, 0.3, 0.7, 1.0] {
+            let mut out = vec![0u32; w * h];
+            let frame = zoom_geometry(w as f32, region.h as f32, child, p);
+            compose_zoom(&mut out, (w, h), region, &big, &small, &frame, 3);
+            for y in (0..4).chain(28..32) {
+                assert!(
+                    out[y * w..(y + 1) * w].iter().all(|&px| px == 0xFFAA_AAAA),
+                    "bar row {y} moved at p={p}"
+                );
+            }
+            // The map rows only ever show map pixels of the two images.
+            for y in 4..28 {
+                assert!(
+                    out[y * w..(y + 1) * w]
+                        .iter()
+                        .all(|&px| px != 0xFFAA_AAAA && px != 0xFF55_5555),
+                    "bar pixels leaked into the map at row {y}, p={p}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_region_that_is_empty_or_outside_does_nothing() {
+        let mut out = vec![7u32; 16];
+        let img = vec![0u8; 64];
+        let f = zoom_geometry(4.0, 4.0, Rect::new(0.0, 0.0, 2.0, 2.0), 0.5);
+        compose_zoom(&mut out, (4, 4), IRect::new(0, 0, 0, 0), &img, &img, &f, 1);
+        compose_zoom(&mut out, (4, 4), IRect::new(9, 9, 4, 4), &img, &img, &f, 1);
+        compose_zoom(
+            &mut out,
+            (4, 4),
+            IRect::new(-5, -5, 3, 3),
+            &img,
+            &img,
+            &f,
+            1,
+        );
+        assert!(out.iter().all(|&p| p == 7));
     }
 
     #[test]

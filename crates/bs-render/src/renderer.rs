@@ -9,7 +9,8 @@ use std::time::Duration;
 use tiny_skia::{Pixmap, PixmapMut};
 
 use crate::canvas::Canvas;
-use crate::chrome::{Chrome, draw_chrome};
+use crate::card::{Card, draw_card};
+use crate::chrome::{Chrome, Widget, draw_chrome};
 use crate::geom::{IRect, Rect};
 use crate::pixel;
 use crate::scene::{
@@ -38,6 +39,8 @@ struct Anim {
     big: Pixmap,
     small: Pixmap,
     child: Rect,
+    /// The part of the window that zooms: the map. The bars stay put.
+    region: IRect,
     start: Duration,
 }
 
@@ -65,6 +68,7 @@ pub struct Renderer {
     threads: usize,
     items: Arc<Vec<Item>>,
     chrome: Chrome,
+    card: Option<Card>,
     index: HashMap<u32, usize>,
     front: Pixmap,
     stub: Pixmap,
@@ -116,6 +120,7 @@ impl Renderer {
             threads,
             items: Arc::new(Vec::new()),
             chrome: Chrome::default(),
+            card: None,
             index: HashMap::new(),
             front,
             stub: Pixmap::new(1, 1)?,
@@ -246,8 +251,28 @@ impl Renderer {
             return false;
         }
         let regions = self.chrome.changed_regions(&chrome);
+        if self.anim.is_some() {
+            // The bars do not zoom, so a change meant for them lands in both
+            // images of the animation, and the frame being composed shows it.
+            let mut rects: Vec<Rect> = regions.clone().unwrap_or_else(|| {
+                let all = |c: &Chrome| {
+                    c.bars
+                        .iter()
+                        .map(|b| b.rect)
+                        .chain(c.widgets.iter().map(Widget::rect))
+                        .collect::<Vec<_>>()
+                };
+                let mut v = all(&self.chrome);
+                v.extend(all(&chrome));
+                v
+            });
+            self.chrome = chrome;
+            rects.retain(|r| r.w > 0.0 && r.h > 0.0);
+            self.repaint_bars_in_animation(&rects);
+            return true;
+        }
         self.chrome = chrome;
-        let partial = regions.filter(|_| !self.full_dirty && self.anim.is_none());
+        let partial = regions.filter(|_| !self.full_dirty);
         match partial {
             Some(regions) => {
                 for r in regions {
@@ -257,6 +282,58 @@ impl Renderer {
             None => self.invalidate(),
         }
         true
+    }
+
+    /// Shows the hover card, moves it, or removes it with `None`. Only the
+    /// rectangles of the old and new card repaint. Returns whether anything
+    /// changed.
+    pub fn set_card(&mut self, card: Option<Card>) -> bool {
+        if self.card == card {
+            return false;
+        }
+        let scale = self.scale;
+        let region = [&self.card, &card]
+            .into_iter()
+            .flatten()
+            .map(|c| c.dirty_rect(scale))
+            .reduce(|a, b| a.union(&b));
+        self.card = card;
+        if self.anim.is_none()
+            && !self.full_dirty
+            && let Some(region) = region
+        {
+            self.repaint_region(region);
+        }
+        true
+    }
+
+    /// The hover card on screen.
+    pub fn card(&self) -> Option<&Card> {
+        self.card.as_ref()
+    }
+
+    /// Draws the bars again in `rects` in both images of the running zoom.
+    fn repaint_bars_in_animation(&mut self, rects: &[Rect]) {
+        let Some(mut anim) = self.anim.take() else {
+            return;
+        };
+        let style = self.style(self.text.is_ready());
+        for pm in [&mut anim.big, &mut anim.small] {
+            let mut canvas = SkiaCanvas::new(pm.as_mut(), self.text.clone(), self.hatches.clone());
+            for &r in rects {
+                let Some(r) =
+                    r.intersect(&Rect::new(0.0, 0.0, self.width as f32, self.height as f32))
+                else {
+                    continue;
+                };
+                let r = r.outer_pixels().to_rect();
+                canvas.push_clip(r);
+                canvas_fill_bg(&mut canvas, r, &self.palette);
+                draw_chrome(&mut canvas, &self.chrome, &self.palette, &style, Some(r));
+                canvas.pop_clip();
+            }
+        }
+        self.anim = Some(anim);
     }
 
     /// The chrome on screen.
@@ -382,6 +459,7 @@ impl Renderer {
         let overlays = self.overlay_rects();
         let pal = self.palette.clone();
         let scale = self.scale;
+        let style = self.style(self.labels_drawn);
         let mut canvas =
             SkiaCanvas::new(self.front.as_mut(), self.text.clone(), self.hatches.clone());
         if let Some(r) = region {
@@ -391,6 +469,9 @@ impl Renderer {
             if region.is_none_or(|r| r.intersects(&rect.inflate(2.0 * scale))) {
                 draw_overlay(&mut canvas, rect, &pal, hover, selected, scale);
             }
+        }
+        if let Some(card) = &self.card {
+            draw_card(&mut canvas, card, &pal, &style, region);
         }
     }
 
@@ -543,6 +624,7 @@ impl Renderer {
             ZoomDirection::In => (current, target),
             ZoomDirection::Out => (target, current),
         };
+        let region = zoom_region(&items, self.width, self.height);
         self.set_view(items);
         self.prewarm_labels();
         self.anim = Some(Anim {
@@ -550,6 +632,7 @@ impl Renderer {
             big,
             small,
             child,
+            region,
             start: now,
         });
     }
@@ -648,12 +731,20 @@ impl Renderer {
             ZoomDirection::In => eased,
             ZoomDirection::Out => 1.0 - eased,
         };
-        let frame: ZoomFrame = zoom_geometry(self.width as f32, self.height as f32, a.child, p);
+        // The folder's box is in window coordinates; the zoom works in the
+        // map's own.
+        let child = Rect::new(
+            a.child.x - a.region.x as f32,
+            a.child.y - a.region.y as f32,
+            a.child.w,
+            a.child.h,
+        );
+        let frame: ZoomFrame = zoom_geometry(a.region.w as f32, a.region.h as f32, child, p);
         let (w, h) = (self.width as usize, self.height as usize);
         compose_zoom(
             target,
-            w,
-            h,
+            (w, h),
+            a.region,
             a.big.data(),
             a.small.data(),
             &frame,
@@ -739,6 +830,18 @@ impl Renderer {
     pub fn item_at(&self, x: f32, y: f32) -> Option<&Item> {
         self.items.iter().rev().find(|it| it.rect.contains(x, y))
     }
+}
+
+/// The part of the window that zooms: the root box of the view (the map),
+/// or the whole window when the view has no such box.
+fn zoom_region(items: &[Item], width: u32, height: u32) -> IRect {
+    let full = IRect::new(0, 0, width as i32, height as i32);
+    items
+        .first()
+        .filter(|i| i.depth == 0)
+        .and_then(|i| i.rect.outer_pixels().intersect(&full))
+        .filter(|r| r.w > 0 && r.h > 0)
+        .unwrap_or(full)
 }
 
 fn canvas_fill_bg(canvas: &mut SkiaCanvas<'_>, region: Rect, pal: &Palette) {

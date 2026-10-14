@@ -327,7 +327,7 @@ fn disabled_buttons_say_why_and_do_nothing() {
     assert_eq!(shell.info_line().name, "Up — already at the top");
     // Go into a folder: Back and Up come alive.
     let folder = folder_item(&shell, 0);
-    let p = center(folder.rect);
+    let p = title_point(folder.rect);
     shell.update(InputEvent::DoubleClick { x: p.0, y: p.1 }, t(3));
     move_to(&mut shell, center(g.back), 4);
     assert_eq!(shell.info_line().name, "Back (Alt+Left)");
@@ -488,7 +488,7 @@ fn layout_prepared_on_a_worker_replaces_the_old_one_only_when_it_is_still_curren
     app.update(
         InputEvent::DoubleClick {
             x: folder.x + folder.w / 2.0,
-            y: folder.y + folder.h / 2.0,
+            y: folder.y + 3.0,
         },
         t(10),
     );

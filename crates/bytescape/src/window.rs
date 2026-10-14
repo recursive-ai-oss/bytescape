@@ -18,7 +18,9 @@ use bs_tree::Snapshot;
 use bs_ui::capacity::{Breakdown, FakeRecycleBin, RecycleBinSource};
 use bs_ui::shell::{Look, Shell, ShellEffect};
 use bs_ui::tree::{TreeSource, scan_status};
-use bs_ui::{App, Effect, FinishedRelayout, InputEvent, Key, Modifiers, PendingRelayout, chrome};
+use bs_ui::{
+    App, Direction, Effect, FinishedRelayout, InputEvent, Key, Modifiers, PendingRelayout, chrome,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -27,6 +29,7 @@ use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 use crate::bench::{self, FrameSink, Offscreen, Script};
+use crate::clipboard;
 use crate::live::{ScanDriver, Tick};
 use crate::open;
 use crate::synth::{LayoutParams, SynthSource, format_size};
@@ -103,9 +106,7 @@ pub(crate) fn make_renderer(
 ) -> Result<Renderer, String> {
     let mut r = Renderer::new(size.0, size.1, scale, font_px(), palette_for(dark), text)
         .ok_or("window has no area")?;
-    if std::env::var_os("BYTESCAPE_REDUCED_MOTION").is_some() {
-        r.set_reduced_motion(true);
-    }
+    r.set_reduced_motion(reduced_motion_override());
     Ok(r)
 }
 
@@ -439,11 +440,16 @@ fn screenshots(opts: &ShotOptions) -> Result<(), String> {
         (true, None) => vec!["map20k".into(), "showcase".into(), "swatch".into()],
         (false, _) => opts.states.clone(),
     };
+    let (nav_states, states): (Vec<String>, Vec<String>) =
+        states.into_iter().partition(|s| real::is_nav_state(s));
     let (real_states, states): (Vec<String>, Vec<String>) = states
         .into_iter()
         .partition(|s| s == "midscan" || s == "complete");
     if !real_states.is_empty() {
         real::screenshots(opts, &real_states, &text)?;
+    }
+    if !nav_states.is_empty() {
+        real::nav_screenshots(opts, &nav_states, &text)?;
     }
     let scale = opts.scale;
     let scale_name = if scale.fract() == 0.0 {
@@ -640,7 +646,7 @@ fn run_window(mode: Mode, t0: Instant) -> Result<(), String> {
 
 /// Applies the app's effects to the renderer. Returns whether the view
 /// changed, so the breadcrumb needs rebuilding.
-fn apply(renderer: &mut Renderer, fx: Vec<Effect>, now: Duration) -> bool {
+pub(crate) fn apply(renderer: &mut Renderer, fx: Vec<Effect>, now: Duration) -> bool {
     let mut view_changed = false;
     for e in fx {
         match e {
@@ -660,18 +666,32 @@ fn apply(renderer: &mut Renderer, fx: Vec<Effect>, now: Duration) -> bool {
     view_changed
 }
 
-/// Applies the shell's effects: the map's, the legend dimming and the link.
-fn apply_shell(renderer: &mut Renderer, fx: Vec<ShellEffect>, now: Duration) {
+/// Applies the shell's effects: the map's, the legend dimming, the link, the
+/// clipboard and stopping the scan.
+fn apply_shell(live: &mut Live, fx: Vec<ShellEffect>, now: Duration) {
     for e in fx {
         match e {
             ShellEffect::Map(e) => {
-                apply(renderer, vec![e], now);
+                apply(&mut live.renderer, vec![e], now);
             }
-            ShellEffect::Dim(category) => renderer.set_dim(category),
+            ShellEffect::Dim(category) => live.renderer.set_dim(category),
             ShellEffect::OpenLink(url) => {
                 // Nothing to do if the system has no opener.
                 let _ = open::open_url(url);
             }
+            ShellEffect::CopyText(text) => {
+                if let Err(message) = clipboard::copy_text(&text) {
+                    live.shell.notify(message, now);
+                }
+            }
+            ShellEffect::CancelScan => {
+                if let Some(scan) = &live.scan {
+                    scan.cancel();
+                }
+            }
+            // Deleting, opening and the rest belong to layers that do not
+            // exist yet; the shell has already said so where it matters.
+            ShellEffect::Action { .. } => {}
         }
     }
 }
@@ -679,7 +699,8 @@ fn apply_shell(renderer: &mut Renderer, fx: Vec<ShellEffect>, now: Duration) {
 /// Hands the renderer the chrome for `now`. Returns whether it changed.
 fn refresh_chrome(live: &mut Live, now: Duration) -> bool {
     let chrome = live.shell.chrome(now);
-    live.renderer.set_chrome(chrome)
+    let card = live.renderer.set_card(live.shell.card().cloned());
+    live.renderer.set_chrome(chrome) | card
 }
 
 /// The look from the system, with `BYTESCAPE_THEME` as an override for
@@ -825,7 +846,7 @@ impl WinApp {
             self.text.clone(),
             Look { dark, accent: None },
         );
-        shell.set_reduced_motion(reduced_motion());
+        shell.set_reduced_motion(reduced_motion_override());
         shell.set_crumb(crumb);
         shell.set_status(status, self.scan_path.is_some());
         let map = shell.map_rect();
@@ -928,6 +949,7 @@ impl WinApp {
             // nothing it does can delay that frame.
             if let Some(path) = &self.scan_path {
                 live.scan = Some(ScanDriver::start(path.clone()));
+                live.shell.begin_scan(t0.elapsed());
                 query_drive(live, path.clone());
             }
             poll_appearance(live);
@@ -1169,6 +1191,11 @@ impl WinApp {
             && let Ok(appearance) = rx.try_recv()
         {
             live.appearance_rx = None;
+            // The system's reduced-motion setting applies to the map's zoom
+            // and to the bar and pulse alike.
+            let reduce = appearance.reduce_motion || reduced_motion_override();
+            live.shell.set_reduced_motion(reduce);
+            live.renderer.set_reduced_motion(reduce);
             if live.shell.set_look(look_from(&appearance)) {
                 live.renderer.set_palette(live.shell.palette());
                 redraw = true;
@@ -1199,6 +1226,15 @@ impl WinApp {
         } else {
             live.renderer.set_pulse(1.0);
         }
+        // Texts that expire and the hover card that shows once the pointer
+        // has rested.
+        if live.shell.tick(now) {
+            refresh_chrome(live, now);
+            redraw = true;
+        }
+        if let Some(d) = live.shell.next_deadline(now) {
+            soonest(d.max(Duration::from_millis(1)));
+        }
         if live.relayout.is_some() {
             soonest(Duration::from_millis(4));
         }
@@ -1218,7 +1254,7 @@ impl WinApp {
         }
         let fx = live.shell.update(event, now);
         let changed = !fx.is_empty();
-        apply_shell(&mut live.renderer, fx, now);
+        apply_shell(live, fx, now);
         let chrome_changed = refresh_chrome(live, now);
         if matches!(event, InputEvent::PointerMoved { .. }) {
             live.window
@@ -1255,7 +1291,7 @@ impl WinApp {
         }
         let fx = live.shell.resize((size.width, size.height), scale, now);
         let had_app = live.shell.app().is_some();
-        apply_shell(&mut live.renderer, fx, now);
+        apply_shell(live, fx, now);
         let map = live.shell.map_rect();
         if !had_app {
             if self.scan_path.is_some() {
@@ -1270,7 +1306,9 @@ impl WinApp {
     }
 }
 
-fn reduced_motion() -> bool {
+/// `BYTESCAPE_REDUCED_MOTION` forces reduced motion on, for tests and
+/// pictures. The system's own setting arrives later from the platform.
+fn reduced_motion_override() -> bool {
     std::env::var_os("BYTESCAPE_REDUCED_MOTION").is_some()
 }
 
@@ -1317,6 +1355,34 @@ fn placeholders(map: Rect, scale: f32) -> Vec<Item> {
             (h * 0.5).floor(),
         ),
     ]
+}
+
+/// The key the map reacts to, from a pressed key and the held modifiers.
+fn translate_key(key: &WKey, mods: ModifiersState) -> Option<Key> {
+    let (alt, ctrl, shift) = (mods.alt_key(), mods.control_key(), mods.shift_key());
+    Some(match key {
+        WKey::Named(NamedKey::Enter) => Key::Enter,
+        WKey::Named(NamedKey::Backspace) => Key::Backspace,
+        WKey::Named(NamedKey::Home) => Key::Home,
+        WKey::Named(NamedKey::Escape) => Key::Escape,
+        WKey::Named(NamedKey::F5) if shift => Key::Rescan,
+        WKey::Named(NamedKey::F5) => Key::Refresh,
+        WKey::Named(NamedKey::F10) if shift => Key::ContextMenu,
+        WKey::Named(NamedKey::ContextMenu) => Key::ContextMenu,
+        WKey::Named(NamedKey::Delete) if shift => Key::DeletePermanently,
+        WKey::Named(NamedKey::Delete) => Key::Delete,
+        WKey::Character(c) if ctrl && c.eq_ignore_ascii_case("r") => Key::Refresh,
+        WKey::Character(c) if ctrl && c.eq_ignore_ascii_case("z") => Key::Undo,
+        WKey::Character(c) if ctrl && c.eq_ignore_ascii_case("c") => Key::CopyPath,
+        WKey::Named(NamedKey::ArrowLeft) if alt => Key::AltLeft,
+        WKey::Named(NamedKey::ArrowRight) if alt => Key::AltRight,
+        WKey::Named(NamedKey::ArrowUp) if alt => Key::AltUp,
+        WKey::Named(NamedKey::ArrowLeft) => Key::Arrow(Direction::Left),
+        WKey::Named(NamedKey::ArrowRight) => Key::Arrow(Direction::Right),
+        WKey::Named(NamedKey::ArrowUp) => Key::Arrow(Direction::Up),
+        WKey::Named(NamedKey::ArrowDown) => Key::Arrow(Direction::Down),
+        _ => return None,
+    })
 }
 
 impl ApplicationHandler for WinApp {
@@ -1366,12 +1432,25 @@ impl ApplicationHandler for WinApp {
             }
             WindowEvent::CursorLeft { .. } => self.feed(InputEvent::PointerLeft),
             WindowEvent::MouseWheel { delta, .. } => {
-                let steps = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => (p.y / 40.0) as f32,
-                };
                 let (x, y) = self.cursor;
-                self.feed(InputEvent::Wheel { x, y, steps });
+                // A wheel notch is one deliberate step. A touchpad sends many
+                // small pixel deltas, which the app adds up (40 px is a step).
+                self.feed(match delta {
+                    MouseScrollDelta::LineDelta(_, steps) => InputEvent::Wheel { x, y, steps },
+                    MouseScrollDelta::PixelDelta(p) => InputEvent::Touchpad {
+                        x,
+                        y,
+                        steps: (p.y / 40.0) as f32,
+                    },
+                });
+            }
+            WindowEvent::PinchGesture { delta, .. } => {
+                let (x, y) = self.cursor;
+                self.feed(InputEvent::Pinch {
+                    x,
+                    y,
+                    delta: delta as f32,
+                });
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -1406,23 +1485,7 @@ impl ApplicationHandler for WinApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let alt = self.modifiers.alt_key();
-                let ctrl = self.modifiers.control_key();
-                let key = match event.logical_key {
-                    WKey::Named(NamedKey::Enter) => Some(Key::Enter),
-                    WKey::Named(NamedKey::Backspace) => Some(Key::Backspace),
-                    WKey::Named(NamedKey::Home) => Some(Key::Home),
-                    WKey::Named(NamedKey::Escape) => Some(Key::Escape),
-                    WKey::Named(NamedKey::F5) => Some(Key::Refresh),
-                    WKey::Character(ref c) if ctrl && c.eq_ignore_ascii_case("r") => {
-                        Some(Key::Refresh)
-                    }
-                    WKey::Named(NamedKey::ArrowLeft) if alt => Some(Key::AltLeft),
-                    WKey::Named(NamedKey::ArrowRight) if alt => Some(Key::AltRight),
-                    WKey::Named(NamedKey::ArrowUp) if alt => Some(Key::AltUp),
-                    _ => None,
-                };
-                if let Some(key) = key {
+                if let Some(key) = translate_key(&event.logical_key, self.modifiers) {
                     self.feed(InputEvent::Key(key));
                 }
             }

@@ -4,14 +4,17 @@
 use std::path::Path;
 use std::time::Instant;
 
+use std::time::Duration;
+
 use bs_layout::Metrics;
 use bs_render::{ItemKind, Rect, Renderer, TextEngine};
+use bs_ui::shell::{Look, Shell, ShellEffect};
 use bs_ui::tree::{TreeSource, scan_status};
-use bs_ui::{App, ViewId, ViewSource};
+use bs_ui::{App, Direction, InputEvent, Key, ViewId, ViewSource};
 
 use crate::bench::Script;
 use crate::live::{scan_to_end, scan_until};
-use crate::window::{ChromeSpec, drive_breakdown, make_renderer, static_chrome};
+use crate::window::{ChromeSpec, apply, drive_breakdown, make_renderer, static_chrome};
 use crate::{ShotOptions, ZoomOptions, font_px};
 
 /// How many of the biggest folders are laid out to find the busiest view.
@@ -177,6 +180,157 @@ pub fn screenshots(opts: &ShotOptions, states: &[String], text: &TextEngine) -> 
         }
         if let Some(d) = driver {
             d.cancel();
+        }
+    }
+    Ok(())
+}
+
+/// The navigation pictures: the hover card in the middle and at each edge, a
+/// frame in the middle of a zoom, a keyboard selection and a deep breadcrumb.
+pub fn is_nav_state(state: &str) -> bool {
+    state.starts_with("card") || matches!(state, "midzoom" | "keysel" | "crumb")
+}
+
+fn apply_shell_effects(renderer: &mut Renderer, fx: Vec<ShellEffect>, now: Duration) {
+    for e in fx {
+        match e {
+            ShellEffect::Map(e) => {
+                apply(renderer, vec![e], now);
+            }
+            ShellEffect::Dim(c) => renderer.set_dim(c),
+            _ => {}
+        }
+    }
+}
+
+/// Where the pointer goes for a `card*` picture, as a fraction of the map.
+fn card_point(state: &str) -> (f32, f32) {
+    match state {
+        "card-left" => (0.016, 0.5),
+        "card-right" => (0.988, 0.55),
+        "card-top" => (0.5, 0.045),
+        "card-bottom" => (0.5, 0.985),
+        "card-corner" => (0.985, 0.985),
+        _ => (0.5, 0.5),
+    }
+}
+
+/// Renders the navigation states of a real scan through the shell, the same
+/// way the window drives it.
+pub fn nav_screenshots(
+    opts: &ShotOptions,
+    states: &[String],
+    text: &TextEngine,
+) -> Result<(), String> {
+    let Some(path) = opts.path.clone() else {
+        return Err("the navigation states need a folder to scan".into());
+    };
+    let scale = opts.scale;
+    let scale_name = if scale.fract() == 0.0 {
+        format!("{}", scale as u32)
+    } else {
+        format!("{scale}")
+    };
+    let metrics = Metrics::from_logical(font_px(), scale);
+    let (snapshot, _) = scan_to_end(path.clone())?;
+    let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+    let ms = Duration::from_millis;
+    for state in states {
+        for dark in [false, true] {
+            let mut shell: Shell<TreeSource> = Shell::new(
+                opts.size,
+                scale,
+                font_px(),
+                text.clone(),
+                Look { dark, accent: None },
+            );
+            shell.set_crumb(abs.to_string_lossy().into_owned());
+            shell.set_status(scan_status(&snapshot), false);
+            if let Some(b) = drive_breakdown(&path, &snapshot) {
+                shell.set_capacity(b, Duration::ZERO);
+            }
+            let map = shell.map_rect();
+            let source =
+                TreeSource::new(snapshot.clone(), metrics).ok_or("the scan found nothing")?;
+            shell.set_app(App::new(source, map));
+            let mut renderer = make_renderer(opts.size, scale, dark, text.clone())?;
+            renderer.set_items(shell.app().map(App::items).unwrap_or_default());
+            let mut clock = Duration::ZERO;
+            let mut mid_zoom = false;
+            match state.as_str() {
+                "keysel" => {
+                    for dir in [
+                        Direction::Right,
+                        Direction::Right,
+                        Direction::Down,
+                        Direction::Left,
+                    ] {
+                        clock += ms(50);
+                        let fx = shell.update(InputEvent::Key(Key::Arrow(dir)), clock);
+                        apply_shell_effects(&mut renderer, fx, clock);
+                    }
+                }
+                "midzoom" | "crumb" => {
+                    // Into the biggest nested folder; "crumb" goes two deep
+                    // and rests on the first segment.
+                    let depth = if state == "crumb" { 2 } else { 1 };
+                    for _ in 0..depth {
+                        let Some(app) = shell.app() else { break };
+                        let Some(folder) = app
+                            .items()
+                            .iter()
+                            .find(|i| i.depth == 1 && i.kind == ItemKind::FolderTitled)
+                            .cloned()
+                        else {
+                            break;
+                        };
+                        clock += ms(400);
+                        let (x, y) = (folder.rect.x + folder.rect.w / 2.0, folder.rect.y + 3.0);
+                        shell.update(InputEvent::PointerMoved { x, y }, clock);
+                        let fx = shell.update(InputEvent::DoubleClick { x, y }, clock);
+                        apply_shell_effects(&mut renderer, fx, clock);
+                        if state == "crumb" {
+                            renderer.finish_animation();
+                        } else {
+                            mid_zoom = true;
+                        }
+                    }
+                    if state == "crumb" {
+                        let g = shell.geometry().clone();
+                        let (x, y) = (g.crumb.x + 6.0 * scale, g.crumb.y + g.crumb.h / 2.0);
+                        clock += ms(100);
+                        let fx = shell.update(InputEvent::PointerMoved { x, y }, clock);
+                        apply_shell_effects(&mut renderer, fx, clock);
+                    }
+                }
+                s => {
+                    let (fx, fy) = card_point(s);
+                    let (x, y) = (map.x + map.w * fx, map.y + map.h * fy);
+                    let fx = shell.update(InputEvent::PointerMoved { x, y }, ms(10));
+                    apply_shell_effects(&mut renderer, fx, ms(10));
+                    shell.tick(ms(600));
+                    clock = ms(600);
+                }
+            }
+            renderer.set_chrome(shell.chrome(clock));
+            renderer.set_card(shell.card().cloned());
+            let name = format!(
+                "{state}-{}-{scale_name}x.png",
+                if dark { "dark" } else { "light" }
+            );
+            let file = Path::new(&opts.dir).join(&name);
+            if mid_zoom {
+                // A frame in the middle of the animation, as the window would
+                // present it.
+                let (w, h) = renderer.size();
+                let mut words = vec![0u32; (w * h) as usize];
+                renderer.paint(&mut words, clock, true);
+                renderer.paint(&mut words, clock + ms(55), true);
+                bs_render::pixel::save_words_png(&words, w, h, &file)?;
+            } else {
+                renderer.save_png(&file)?;
+            }
+            println!("{state}: wrote {}", file.display());
         }
     }
     Ok(())

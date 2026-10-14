@@ -6,15 +6,17 @@
 //! title bar of a folder that is still being counted, next to the "≥" the
 //! layout already puts in front of its size.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use bs_knowledge::{Environment, Knowledge, Level};
 use bs_layout::{
     DrawItem, ItemKind as LayoutKind, ItemRef, Metrics, ViewId, ViewTable, ViewTarget,
 };
 use bs_render::{Flags, Item, ItemKind, ItemLabel, Rect};
-use bs_tree::{NodeId, NodeKind, Progress, Snapshot};
+use bs_tree::{DeleteState, NodeId, NodeKind, Progress, Snapshot};
 
+use crate::card::{CardData, DeleteMark};
 use crate::{ItemInfo, Layout, Prepared, RelayoutJob, ViewSource};
 
 /// How many recent layouts are kept so the info bar can describe their boxes.
@@ -38,6 +40,9 @@ pub struct TreeSource {
     last: LayoutStats,
     /// The latest layouts, newest last. Hover asks them what a box is.
     laid: Vec<(ViewId, Arc<bs_layout::Layout>)>,
+    /// The knowledge tables resolved for this user's folders, built when the
+    /// first hover card asks.
+    knowledge: OnceLock<Box<Knowledge>>,
 }
 
 /// A layout made on a worker thread, waiting to be adopted.
@@ -60,6 +65,7 @@ impl TreeSource {
             metrics,
             last: LayoutStats::default(),
             laid: Vec::new(),
+            knowledge: OnceLock::new(),
         })
     }
 
@@ -101,8 +107,14 @@ impl TreeSource {
     /// The breadcrumb text of a view: the scanned root, then each folder
     /// down to the view, joined with " › ". Names are shown lossily.
     pub fn breadcrumb(&self, view: ViewId) -> String {
+        self.trail(view).join("  ›  ")
+    }
+
+    /// The folders from the scanned root down to the view, one name each,
+    /// and a last entry for a group of small items.
+    pub fn trail(&self, view: ViewId) -> Vec<String> {
         let Some(target) = self.table.target(view) else {
-            return String::new();
+            return Vec::new();
         };
         let mut parts: Vec<String> = Vec::new();
         if let ViewTarget::Group(spec) = target {
@@ -117,7 +129,32 @@ impl TreeSource {
             at = node.parent();
         }
         parts.reverse();
-        parts.join("  ›  ")
+        parts
+    }
+
+    /// The folders of the trail from the scanned root, as node ids.
+    fn folder_chain(&self, folder: NodeId) -> Vec<NodeId> {
+        let mut chain = Vec::new();
+        let mut at = self.snapshot.node(folder);
+        while let Some(node) = at {
+            chain.push(node.id());
+            at = node.parent();
+        }
+        chain.reverse();
+        chain
+    }
+
+    fn knowledge(&self) -> &Knowledge {
+        self.knowledge.get_or_init(|| {
+            Box::new(Knowledge::new(&Environment::from_lookup(|n| {
+                std::env::var_os(n)
+            })))
+        })
+    }
+
+    fn node_path(&self, node: NodeId) -> Option<Vec<u8>> {
+        let sep = if cfg!(windows) { b'\\' } else { b'/' };
+        self.snapshot.path(node, sep)
     }
 }
 
@@ -166,6 +203,105 @@ impl ViewSource for TreeSource {
 
     fn breadcrumb(&self, view: ViewId) -> String {
         TreeSource::breadcrumb(self, view)
+    }
+
+    fn trail(&self, view: ViewId) -> Vec<String> {
+        TreeSource::trail(self, view)
+    }
+
+    fn open_trail_segment(&mut self, view: ViewId, index: usize) -> Option<ViewId> {
+        let target = self.table.target(view)?.clone();
+        let chain = self.folder_chain(target.folder());
+        let node = *chain.get(index)?;
+        if index == 0 {
+            return Some(self.root);
+        }
+        if matches!(target, ViewTarget::Folder(f) if f == node) {
+            return Some(view);
+        }
+        // Views for the folders between the top and this one, made as
+        // needed; a folder that already has a view keeps it.
+        let mut at = self.root;
+        for &n in chain.iter().take(index + 1).skip(1) {
+            at = self.table.child(at, ViewTarget::Folder(n));
+        }
+        Some(at)
+    }
+
+    fn path(&self, view: ViewId, id: u32) -> Option<String> {
+        let laid = &self.laid.iter().find(|(v, _)| *v == view)?.1;
+        let node = match laid.item_ref(id)? {
+            ItemRef::Node(n) => n,
+            ItemRef::Group(spec) => spec.folder,
+        };
+        let bytes = self.node_path(node)?;
+        Some(bs_layout::display_name(&bytes).into_string())
+    }
+
+    fn card(&self, view: ViewId, id: u32) -> Option<CardData> {
+        let laid = &self.laid.iter().find(|(v, _)| *v == view)?.1;
+        let bytes = laid.item(id)?.bytes;
+        let (node_id, group) = match laid.item_ref(id)? {
+            ItemRef::Node(n) => (n, None),
+            ItemRef::Group(spec) => (spec.folder, Some(spec.members.len() as u64)),
+        };
+        let node = self.snapshot.node(node_id)?;
+        let raw = self.node_path(node_id)?;
+        let path = bs_layout::display_name(&raw).into_string();
+        if let Some(count) = group {
+            // A group is not a place on disk: no note, no actions on it.
+            return Some(CardData {
+                name: format!("{} small items", bs_layout::format_count(count)),
+                path,
+                bytes,
+                logical: None,
+                parent_bytes: Some(node.allocated()),
+                files: count,
+                in_progress: node.is_in_progress(),
+                estimated: false,
+                is_folder: false,
+                modified: None,
+                category: None,
+                note: None,
+                handoff: None,
+                hard_link: false,
+                delete_state: DeleteMark::None,
+                complete: node.is_complete(),
+                blocked: false,
+            });
+        }
+        let is_folder = node.kind() == NodeKind::Dir;
+        let knowledge = self.knowledge();
+        let entry = knowledge.recognize_bytes(&raw);
+        let category = bs_knowledge::Category::from_number(node.category().0)
+            .map(bs_knowledge::Category::label);
+        Some(CardData {
+            name: bs_layout::display_name(node.name()).into_string(),
+            path,
+            bytes,
+            logical: Some(node.logical()),
+            parent_bytes: node.parent().map(|p| p.allocated()),
+            files: if is_folder {
+                u64::from(node.file_count())
+            } else {
+                1
+            },
+            in_progress: node.is_in_progress(),
+            estimated: node.size_is_estimated(),
+            is_folder,
+            modified: Some(node.mtime()).filter(|&t| t != 0),
+            category,
+            note: entry.map(|e| e.note),
+            handoff: entry.and_then(|e| e.handoff),
+            hard_link: node.is_hard_link(),
+            delete_state: match node.effective_delete_state() {
+                DeleteState::None => DeleteMark::None,
+                DeleteState::InBin => DeleteMark::InBin,
+                DeleteState::Deleted => DeleteMark::Deleted,
+            },
+            complete: node.is_complete(),
+            blocked: knowledge.protection_bytes(&raw).level == Level::Blocked,
+        })
     }
 
     fn describe(&self, view: ViewId, id: u32) -> Option<ItemInfo> {

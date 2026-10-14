@@ -94,6 +94,17 @@ fn folder_center(app: &App<TreeSource>) -> (f32, f32) {
     (it.rect.x + it.rect.w / 2.0, it.rect.y + it.rect.h / 2.0)
 }
 
+/// A point on the title bar of the first nested folder: the folder itself is
+/// under the pointer there, not a file inside it.
+fn folder_title(app: &App<TreeSource>) -> (f32, f32) {
+    let items = app.items();
+    let it = items
+        .iter()
+        .find(|i| i.depth == 1 && i.kind == ItemKind::FolderTitled)
+        .expect("a nested folder");
+    (it.rect.x + it.rect.w / 2.0, it.rect.y + 3.0)
+}
+
 #[test]
 fn an_empty_snapshot_has_no_source_yet() {
     let agg = Aggregator::new();
@@ -152,7 +163,7 @@ fn history_survives_pruning_and_returns_to_the_same_views() {
     let mut b = Builder::new(3, 20);
     b.dir_batch(None, true);
     let mut app = app_for(b.snapshot());
-    let (x, y) = folder_center(&app);
+    let (x, y) = folder_title(&app);
     app.update(InputEvent::DoubleClick { x, y }, t(0));
     let inside = app.current_view();
     app.update(InputEvent::Key(Key::Home), t(100));
@@ -208,7 +219,7 @@ fn a_view_left_behind_by_new_data_is_refreshed_when_it_comes_back() {
     let mut b = Builder::new(2, 40);
     b.dir_batch(None, false);
     let mut app = app_for(b.snapshot());
-    let (x, y) = folder_center(&app);
+    let (x, y) = folder_title(&app);
     app.update(InputEvent::DoubleClick { x, y }, t(0));
     assert_eq!(app.depth(), 2);
     // The scan finishes while the user is inside the folder.
@@ -253,7 +264,7 @@ fn hostile_names_never_break_layout_or_the_breadcrumb() {
     batch.listing_done(DirKey(0));
     b.agg.apply(&batch);
     let mut app = app_for(b.snapshot());
-    let (x, y) = folder_center(&app);
+    let (x, y) = folder_title(&app);
     app.update(InputEvent::DoubleClick { x, y }, t(0));
     let view = app.current_view();
     let crumb = app.source_mut().breadcrumb(view);

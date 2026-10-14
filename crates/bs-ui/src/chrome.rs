@@ -55,6 +55,8 @@ pub enum Hit {
     Up,
     Refresh,
     Crumb,
+    /// A clickable segment of the breadcrumb, by position.
+    CrumbSeg(usize),
     Capacity,
     Info,
     /// A legend swatch, by palette index.
@@ -238,6 +240,79 @@ pub fn geometry(
         link,
         link_text,
     }
+}
+
+/// One piece of the breadcrumb: a folder name, a separator or the ellipsis
+/// that stands for folders that did not fit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CrumbPart {
+    pub rect: Rect,
+    pub text: String,
+    /// The segment this part navigates to when clicked, if it is a folder
+    /// above the current one.
+    pub target: Option<usize>,
+    /// The folder the view shows (the last segment).
+    pub current: bool,
+}
+
+/// Separator between breadcrumb segments.
+pub const CRUMB_SEPARATOR: &str = "›";
+
+/// Lays the breadcrumb out in `area`. When it is too long the first folders
+/// give way to an ellipsis; the folder being shown always stays.
+pub fn layout_crumbs(area: Rect, em: f32, segs: &[String], m: &dyn TextMeasure) -> Vec<CrumbPart> {
+    let Some(last) = segs.len().checked_sub(1) else {
+        return Vec::new();
+    };
+    let width = |s: &str| text_width(m, s, em).ceil() + 2.0;
+    let gap = (em * 0.5).round();
+    let sep_w = width(CRUMB_SEPARATOR) + 2.0 * gap;
+    let ellipsis_w = width("…");
+    let widths: Vec<f32> = segs.iter().map(|s| width(s)).collect();
+    // The first segment to show: all of them if they fit, else drop from the
+    // front until the rest fits beside the ellipsis.
+    let total = |from: usize| -> f32 {
+        let body: f32 = widths[from..].iter().sum::<f32>() + sep_w * (last - from) as f32;
+        if from > 0 {
+            body + ellipsis_w + sep_w
+        } else {
+            body
+        }
+    };
+    let mut start = 0;
+    while start < last && total(start) > area.w {
+        start += 1;
+    }
+    let mut parts = Vec::new();
+    let mut x = area.x;
+    let push = |parts: &mut Vec<CrumbPart>, x: &mut f32, w: f32, text: &str, target, current| {
+        let w = w.min((area.right() - *x).max(0.0));
+        parts.push(CrumbPart {
+            rect: Rect::new(*x, area.y, w, area.h),
+            text: text.to_string(),
+            target,
+            current,
+        });
+        *x += w;
+    };
+    if start > 0 {
+        push(&mut parts, &mut x, ellipsis_w, "…", None, false);
+        push(&mut parts, &mut x, sep_w, CRUMB_SEPARATOR, None, false);
+    }
+    for i in start..=last {
+        push(
+            &mut parts,
+            &mut x,
+            widths[i],
+            &segs[i],
+            (i != last).then_some(i),
+            i == last,
+        );
+        if i != last {
+            push(&mut parts, &mut x, sep_w, CRUMB_SEPARATOR, None, false);
+        }
+    }
+    parts
 }
 
 impl Geometry {
@@ -456,6 +531,54 @@ mod tests {
         let (x, y) = c(g.map);
         assert_eq!(g.hit(x, y), None);
         assert!(!g.in_chrome(x, y));
+    }
+
+    fn crumbs(segs: &[&str], width: f32) -> Vec<CrumbPart> {
+        let segs: Vec<String> = segs.iter().map(|s| s.to_string()).collect();
+        layout_crumbs(Rect::new(0.0, 0.0, width, 30.0), 13.0, &segs, &Fixed(7.0))
+    }
+
+    fn folders(parts: &[CrumbPart]) -> Vec<&str> {
+        parts
+            .iter()
+            .filter(|p| p.text != CRUMB_SEPARATOR && p.text != "…")
+            .map(|p| p.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_short_breadcrumb_shows_every_folder_and_only_the_last_is_current() {
+        let parts = crumbs(&["C:", "Users", "alex"], 600.0);
+        assert_eq!(folders(&parts), ["C:", "Users", "alex"]);
+        let targets: Vec<_> = parts.iter().filter_map(|p| p.target).collect();
+        assert_eq!(targets, [0, 1]);
+        assert_eq!(parts.iter().filter(|p| p.current).count(), 1);
+        assert!(parts.last().is_some_and(|p| p.current));
+        // Parts follow each other without overlap.
+        for w in parts.windows(2) {
+            assert!(w[0].rect.right() <= w[1].rect.x + 0.01);
+        }
+    }
+
+    #[test]
+    fn a_long_breadcrumb_drops_the_first_folders_and_keeps_the_current_one() {
+        let parts = crumbs(&["C:", "Users", "alex", "Videos", "Holiday 2024"], 150.0);
+        assert_eq!(parts[0].text, "…");
+        assert!(parts[0].target.is_none());
+        assert_eq!(folders(&parts).last(), Some(&"Holiday 2024"));
+        assert!(!folders(&parts).contains(&"C:"));
+        for p in &parts {
+            assert!(p.rect.right() <= 150.5, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn one_enormous_segment_is_clipped_to_the_area() {
+        let long = "x".repeat(500);
+        let parts = crumbs(&[long.as_str()], 200.0);
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].rect.w <= 200.0);
+        assert!(crumbs(&[], 200.0).is_empty());
     }
 
     #[test]

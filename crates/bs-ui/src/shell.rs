@@ -6,12 +6,14 @@
 use std::time::Duration;
 
 use bs_render::scene::{CATEGORY_COUNT, CATEGORY_NAMES};
-use bs_render::{Bar, Chrome, Color, Glyph, Palette, Rect, TextEngine, TextRole, Widget};
+use bs_render::{Bar, Card, Chrome, Color, Glyph, Palette, Rect, TextEngine, TextRole, Widget};
 
+use crate::action::{Action, reason};
 use crate::capacity::{Breakdown, CapacityModel};
-use crate::chrome::{self, Geometry, Hit, LegendMode, TextMeasure};
+use crate::card::{self, CardData, CardHit, CardState};
+use crate::chrome::{self, CrumbPart, Geometry, Hit, LegendMode, TextMeasure};
 use crate::info::{self, InfoLine};
-use crate::{App, Effect, InputEvent, Key, ViewSource};
+use crate::{App, Effect, InputEvent, Key, ViewId, ViewSource};
 
 /// What the host should do after an event.
 #[derive(Clone, Debug)]
@@ -22,6 +24,55 @@ pub enum ShellEffect {
     Dim(Option<u8>),
     /// Open this address in the user's browser.
     OpenLink(&'static str),
+    /// Put this text on the clipboard.
+    CopyText(String),
+    /// The user asked for an action on boxes of a view. Actions the
+    /// interface does not carry out itself are handled by whoever owns them.
+    Action {
+        action: Action,
+        view: ViewId,
+        items: Vec<u32>,
+    },
+    /// Stop the running scan.
+    CancelScan,
+}
+
+/// How long the pointer rests on a box before its card shows.
+pub const CARD_REST: Duration = Duration::from_millis(450);
+/// How long the card says "Copied".
+const COPIED_FOR: Duration = Duration::from_millis(1500);
+/// How long a message stays in the info bar.
+const NOTICE_FOR: Duration = Duration::from_secs(3);
+/// A scan that has run this long is stopped only after a second Esc.
+pub const CANCEL_CONFIRM_AFTER: Duration = Duration::from_secs(5);
+/// How long the second Esc is waited for.
+const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+
+/// The box the pointer rests on, and since when.
+#[derive(Clone, Copy, Debug)]
+struct Rest {
+    view: ViewId,
+    id: u32,
+    since: Duration,
+    at: (f32, f32),
+}
+
+/// The card on screen.
+struct Shown {
+    view: ViewId,
+    id: u32,
+    generation: u64,
+    data: CardData,
+    pointer: (f32, f32),
+    state: CardState,
+    built: card::Built,
+}
+
+#[derive(Default)]
+struct CardUi {
+    rest: Option<Rest>,
+    shown: Option<Shown>,
+    copied_until: Option<Duration>,
 }
 
 /// A [`TextMeasure`] on the renderer's text engine.
@@ -80,6 +131,12 @@ pub struct Shell<S: ViewSource> {
     look: Look,
     reduced_motion: bool,
     drive_total: Option<u64>,
+    card: CardUi,
+    /// The time of the latest event, for texts that expire.
+    clock: Duration,
+    notice: Option<(String, Duration)>,
+    esc_armed: Option<Duration>,
+    scan_since: Option<Duration>,
 }
 
 fn measure_for(text: &TextEngine, font_px: f32, scale: f32) -> Box<dyn TextMeasure> {
@@ -116,6 +173,11 @@ impl<S: ViewSource> Shell<S> {
             look,
             reduced_motion: false,
             drive_total: None,
+            card: CardUi::default(),
+            clock: Duration::ZERO,
+            notice: None,
+            esc_armed: None,
+            scan_since: None,
         }
     }
 
@@ -173,6 +235,7 @@ impl<S: ViewSource> Shell<S> {
 
     /// Installs the map once the first data is there.
     pub fn set_app(&mut self, app: App<S>) {
+        self.card = CardUi::default();
         self.app = Some(app);
     }
 
@@ -197,13 +260,33 @@ impl<S: ViewSource> Shell<S> {
     pub fn set_status(&mut self, status: String, scanning: bool) {
         self.status = status;
         self.scanning = scanning;
+        if !scanning {
+            self.scan_since = None;
+            self.esc_armed = None;
+        }
+    }
+
+    /// A scan started at `now`. Esc stops a scan that is younger than a few
+    /// seconds at once and asks for a second Esc after that.
+    pub fn begin_scan(&mut self, now: Duration) {
+        self.scan_since = Some(now);
     }
 
     /// Whether the pointer is on something that can be clicked, so the window
     /// shows a pointing hand.
     pub fn wants_pointer_cursor(&self) -> bool {
+        if self
+            .card
+            .shown
+            .as_ref()
+            .is_some_and(|s| s.state.hot.is_some())
+        {
+            return true;
+        }
         match self.hot {
-            Some(Hit::Link | Hit::Swatch(_) | Hit::Refresh | Hit::Overflow) => true,
+            Some(Hit::Link | Hit::Swatch(_) | Hit::Refresh | Hit::Overflow | Hit::CrumbSeg(_)) => {
+                true
+            }
             Some(Hit::Back) => self.can_go_back(),
             Some(Hit::Forward) => self.can_go_forward(),
             Some(Hit::Up) => self.can_go_up(),
@@ -241,6 +324,7 @@ impl<S: ViewSource> Shell<S> {
         self.geom_key.3 = !self.text.is_ready();
         self.hot = None;
         self.dim = None;
+        self.card = CardUi::default();
         let map = self.map_rect();
         self.map_event(InputEvent::Resized { map }, now)
     }
@@ -283,14 +367,33 @@ impl<S: ViewSource> Shell<S> {
     }
 
     fn map_event(&mut self, event: InputEvent, now: Duration) -> Vec<ShellEffect> {
-        match self.app.as_mut() {
+        let fx: Vec<ShellEffect> = match self.app.as_mut() {
             Some(app) => app
                 .update(event, now)
                 .into_iter()
                 .map(ShellEffect::Map)
                 .collect(),
             None => Vec::new(),
+        };
+        // A double click or Enter on a file asks for its card at once.
+        let request = self.app.as_mut().and_then(App::take_card_request);
+        if let Some(id) = request {
+            let pointer = self.pointer_for(id);
+            self.show_card(id, pointer);
         }
+        self.sync_card();
+        fx
+    }
+
+    /// Where to anchor a card asked for without a pointer: the middle of the
+    /// box.
+    fn pointer_for(&self, id: u32) -> (f32, f32) {
+        self.app
+            .as_ref()
+            .and_then(|a| a.item(id))
+            .map_or((0.0, 0.0), |i| {
+                (i.rect.x + i.rect.w / 2.0, i.rect.y + i.rect.h / 2.0)
+            })
     }
 
     fn set_hot(&mut self, hit: Option<Hit>) -> Vec<ShellEffect> {
@@ -309,24 +412,415 @@ impl<S: ViewSource> Shell<S> {
         vec![ShellEffect::Dim(dim)]
     }
 
+    // ---- the hover card -------------------------------------------------
+
+    fn card_metrics(&self) -> (f32, f32) {
+        (self.font_px * self.scale, self.scale)
+    }
+
+    /// Builds and shows the card of box `id` of the current view.
+    fn show_card(&mut self, id: u32, pointer: (f32, f32)) {
+        let Some(app) = self.app.as_ref() else {
+            return;
+        };
+        let view = app.current_view();
+        let Some(data) = app.source().card(view, id) else {
+            return;
+        };
+        let generation = app.generation();
+        self.card.shown = Some(Shown {
+            view,
+            id,
+            generation,
+            data,
+            pointer,
+            state: CardState::default(),
+            built: card::Built {
+                card: Card {
+                    rect: Rect::default(),
+                    parts: Vec::new(),
+                },
+                hits: Vec::new(),
+                anchor: Rect::default(),
+            },
+        });
+        self.rebuild_card();
+    }
+
+    /// Builds the card again from what it was made from: after new data, a
+    /// hovered button or the "Copied" confirmation.
+    fn rebuild_card(&mut self) {
+        let (em, scale) = self.card_metrics();
+        let map = self.map_rect();
+        let drive_total = self.drive_total;
+        let anchor = match (self.card.shown.as_ref(), self.app.as_ref()) {
+            (Some(s), Some(app)) => app.item(s.id).map(|i| i.rect),
+            _ => None,
+        };
+        let copied = self.card.copied_until.is_some();
+        let (Some(shown), Some(anchor)) = (self.card.shown.as_mut(), anchor) else {
+            self.card.shown = None;
+            return;
+        };
+        shown.state.copied = copied;
+        shown.built = card::build(
+            &shown.data,
+            drive_total,
+            anchor,
+            shown.pointer,
+            map,
+            card::Metrics {
+                em,
+                scale,
+                measure: self.measure.as_ref(),
+            },
+            shown.state,
+        );
+    }
+
+    fn hide_card(&mut self) {
+        self.card.shown = None;
+    }
+
+    /// Keeps the card in step with the map: gone when its box is, built from
+    /// the new numbers when the layout was replaced.
+    fn sync_card(&mut self) {
+        let Some(app) = self.app.as_ref() else {
+            self.card = CardUi::default();
+            return;
+        };
+        let (view, generation) = (app.current_view(), app.generation());
+        let Some(shown) = self.card.shown.as_mut() else {
+            return;
+        };
+        if shown.view != view {
+            self.card.shown = None;
+            return;
+        }
+        if shown.generation == generation {
+            return;
+        }
+        shown.generation = generation;
+        let (id, view) = (shown.id, shown.view);
+        match app.source().card(view, id) {
+            Some(data) if app.item(id).is_some() => {
+                if let Some(s) = self.card.shown.as_mut() {
+                    s.data = data;
+                }
+                self.rebuild_card();
+            }
+            _ => self.card.shown = None,
+        }
+        if let Some(r) = self.card.rest.as_mut() {
+            r.view = view;
+        }
+    }
+
+    /// The card to draw, if one is up.
+    pub fn card(&self) -> Option<&Card> {
+        self.card.shown.as_ref().map(|s| &s.built.card)
+    }
+
+    /// Whether the pointer is over the card or the gap beside it, where the
+    /// card stays up and the map below does not see the pointer.
+    fn over_card(&self, x: f32, y: f32) -> bool {
+        self.card.shown.as_ref().is_some_and(|s| {
+            let gap = (8.0 * self.scale).round();
+            s.built.card.rect.inflate(gap).contains(x, y)
+        })
+    }
+
+    fn card_pointer(&mut self, x: f32, y: f32) {
+        let Some(shown) = self.card.shown.as_mut() else {
+            return;
+        };
+        let hot = shown.built.hit(x, y);
+        if hot != shown.state.hot {
+            shown.state.hot = hot;
+            self.rebuild_card();
+        }
+    }
+
+    fn card_click(&mut self, x: f32, y: f32, now: Duration) -> Vec<ShellEffect> {
+        let Some(shown) = self.card.shown.as_ref() else {
+            return Vec::new();
+        };
+        let (view, id, path) = (shown.view, shown.id, shown.data.path.clone());
+        match shown.built.hit(x, y) {
+            Some(CardHit::Path) => {
+                self.card.copied_until = Some(now + COPIED_FOR);
+                self.rebuild_card();
+                vec![ShellEffect::CopyText(path)]
+            }
+            Some(CardHit::Button(action)) => {
+                self.hide_card();
+                self.card.rest = None;
+                self.run_action(action, view, vec![id], now)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Notes where the pointer rests on the map, so the card can show once it
+    /// has stayed put long enough.
+    fn track_rest(&mut self, x: f32, y: f32, now: Duration) {
+        let Some(app) = self.app.as_ref() else {
+            return;
+        };
+        let (view, hover) = (app.current_view(), app.hover());
+        if let Some(s) = &self.card.shown
+            && (hover != Some(s.id) || s.view != view)
+        {
+            self.card.shown = None;
+        }
+        let Some(id) = hover else {
+            self.card.rest = None;
+            return;
+        };
+        if self.card.shown.is_some() {
+            return;
+        }
+        let jitter = 3.0 * self.scale;
+        match self.card.rest.as_mut() {
+            Some(r) if r.id == id && r.view == view => {
+                // Moving restarts the rest; staying within a few pixels
+                // does not.
+                if (r.at.0 - x).abs() > jitter || (r.at.1 - y).abs() > jitter {
+                    r.since = now;
+                    r.at = (x, y);
+                }
+            }
+            _ => {
+                self.card.rest = Some(Rest {
+                    view,
+                    id,
+                    since: now,
+                    at: (x, y),
+                });
+            }
+        }
+    }
+
+    /// Advances texts that expire and shows the card once the pointer has
+    /// rested. Returns whether anything visible changed.
+    pub fn tick(&mut self, now: Duration) -> bool {
+        self.clock = now;
+        let mut changed = false;
+        if self.card.copied_until.is_some_and(|t| now >= t) {
+            self.card.copied_until = None;
+            if self.card.shown.is_some() {
+                self.rebuild_card();
+            }
+            changed = true;
+        }
+        if self.notice.as_ref().is_some_and(|(_, t)| now >= *t) {
+            self.notice = None;
+            changed = true;
+        }
+        if self.esc_armed.is_some_and(|t| now >= t) {
+            self.esc_armed = None;
+        }
+        if self.card.shown.is_none()
+            && let Some(r) = self.card.rest
+            && now.saturating_sub(r.since) >= CARD_REST
+        {
+            self.card.rest = None;
+            self.show_card(r.id, r.at);
+            changed |= self.card.shown.is_some();
+        }
+        changed
+    }
+
+    /// When [`Shell::tick`] next has something to do, if ever.
+    pub fn next_deadline(&self, now: Duration) -> Option<Duration> {
+        let mut soonest: Option<Duration> = None;
+        let mut at = |t: Duration| {
+            let d = t.saturating_sub(now);
+            soonest = Some(soonest.map_or(d, |s| s.min(d)));
+        };
+        if self.card.shown.is_none()
+            && let Some(r) = self.card.rest
+        {
+            at(r.since + CARD_REST);
+        }
+        if let Some(t) = self.card.copied_until {
+            at(t);
+        }
+        if let Some((_, t)) = &self.notice {
+            at(*t);
+        }
+        soonest
+    }
+
+    // ---- keys and actions ----------------------------------------------
+
+    /// Shows a short message in the info bar for a few seconds.
+    pub fn notify(&mut self, text: impl Into<String>, now: Duration) {
+        self.say(text, now);
+    }
+
+    fn say(&mut self, text: impl Into<String>, now: Duration) {
+        self.notice = Some((text.into(), now + NOTICE_FOR));
+    }
+
+    /// The selected boxes' view and ids.
+    fn selection(&self) -> (ViewId, Vec<u32>) {
+        match self.app.as_ref() {
+            Some(app) => (app.current_view(), app.selection().to_vec()),
+            None => (0, Vec::new()),
+        }
+    }
+
+    /// Why `action` cannot run on the selection, if it cannot.
+    fn refusal(&self, action: Action, view: ViewId, items: &[u32]) -> Option<&'static str> {
+        let app = self.app.as_ref()?;
+        if items.is_empty() && !matches!(action, Action::Undo | Action::ContextMenu) {
+            return Some(reason::NOTHING_SELECTED);
+        }
+        items.iter().find_map(|&id| {
+            let data = app.source().card(view, id)?;
+            card::why_not(&data, action).or(match action {
+                Action::ZoomInto | Action::Rescan if !data.is_folder => Some(reason::NOT_A_FOLDER),
+                Action::Rescan if !data.complete => Some(reason::SCANNING),
+                _ => None,
+            })
+        })
+    }
+
+    fn run_action(
+        &mut self,
+        action: Action,
+        view: ViewId,
+        items: Vec<u32>,
+        now: Duration,
+    ) -> Vec<ShellEffect> {
+        if let Some(why) = self.refusal(action, view, &items) {
+            self.say(format!("{}: {why}", action.label()), now);
+            return Vec::new();
+        }
+        match action {
+            Action::CopyPath => {
+                let paths: Vec<String> = items
+                    .iter()
+                    .filter_map(|&id| self.app.as_ref()?.source().path(view, id))
+                    .collect();
+                if paths.is_empty() {
+                    return Vec::new();
+                }
+                self.say(
+                    if paths.len() == 1 {
+                        "Copied the path".to_string()
+                    } else {
+                        format!("Copied {} paths", paths.len())
+                    },
+                    now,
+                );
+                return vec![ShellEffect::CopyText(paths.join("\n"))];
+            }
+            Action::ZoomInto => {
+                if let Some(app) = self.app.as_mut()
+                    && let Some(&id) = items.last()
+                {
+                    return app.open(id).into_iter().map(ShellEffect::Map).collect();
+                }
+                return Vec::new();
+            }
+            _ => {}
+        }
+        if cfg!(debug_assertions) && !action.is_handled_here() {
+            self.say(format!("{}: not yet", action.label()), now);
+        }
+        vec![ShellEffect::Action {
+            action,
+            view,
+            items,
+        }]
+    }
+
+    fn key(&mut self, key: Key, now: Duration) -> Vec<ShellEffect> {
+        let action = match key {
+            Key::Escape => return self.escape(now),
+            Key::CopyPath => Action::CopyPath,
+            Key::Delete => Action::Delete,
+            Key::DeletePermanently => Action::DeletePermanently,
+            Key::Undo => Action::Undo,
+            Key::Rescan => Action::Rescan,
+            Key::ContextMenu => Action::ContextMenu,
+            other => {
+                self.hide_card();
+                self.card.rest = None;
+                return self.map_event(InputEvent::Key(other), now);
+            }
+        };
+        let (view, items) = self.selection();
+        self.run_action(action, view, items, now)
+    }
+
+    /// Esc peels one thing at a time: the card, then the selection, then the
+    /// scan. A scan that has run for more than a few seconds needs a second
+    /// Esc, so a stray key press cannot throw away minutes of work.
+    fn escape(&mut self, now: Duration) -> Vec<ShellEffect> {
+        if self.card.shown.take().is_some() {
+            self.card.rest = None;
+            return Vec::new();
+        }
+        if self.app.as_ref().is_some_and(|a| !a.selection().is_empty()) {
+            return self.map_event(InputEvent::Key(Key::Escape), now);
+        }
+        if !self.scanning {
+            return Vec::new();
+        }
+        let ran = now.saturating_sub(self.scan_since.unwrap_or(now));
+        if ran <= CANCEL_CONFIRM_AFTER || self.esc_armed.is_some_and(|t| now < t) {
+            self.esc_armed = None;
+            return vec![ShellEffect::CancelScan];
+        }
+        self.esc_armed = Some(now + CONFIRM_WINDOW);
+        self.say("Press Esc again to stop the scan", now);
+        Vec::new()
+    }
+
     /// Handles one event in window coordinates.
     pub fn update(&mut self, event: InputEvent, now: Duration) -> Vec<ShellEffect> {
+        self.clock = now;
+        if let InputEvent::Key(key) = event {
+            return self.key(key, now);
+        }
         let point = match event {
             InputEvent::PointerMoved { x, y }
             | InputEvent::Click { x, y }
             | InputEvent::ClickWith { x, y, .. }
             | InputEvent::DoubleClick { x, y }
-            | InputEvent::Wheel { x, y, .. } => Some((x, y)),
+            | InputEvent::Wheel { x, y, .. }
+            | InputEvent::Touchpad { x, y, .. }
+            | InputEvent::Pinch { x, y, .. } => Some((x, y)),
             _ => None,
         };
         let Some((x, y)) = point else {
             if matches!(event, InputEvent::PointerLeft) {
+                self.hide_card();
+                self.card.rest = None;
                 let mut fx = self.set_hot(None);
                 fx.extend(self.map_event(event, now));
                 return fx;
             }
             return self.map_event(event, now);
         };
+        // The card and the gap beside it belong to the card: the map below
+        // does not see the pointer, so the box the card describes stays
+        // hovered while the pointer travels onto it.
+        if self.over_card(x, y) {
+            match event {
+                InputEvent::PointerMoved { .. } => {
+                    self.card_pointer(x, y);
+                    return self.set_hot(None);
+                }
+                InputEvent::Click { .. } | InputEvent::ClickWith { .. } => {
+                    return self.card_click(x, y, now);
+                }
+                _ => return Vec::new(),
+            }
+        }
         let hit = {
             let g = self.geometry();
             g.in_chrome(x, y).then(|| g.hit(x, y))
@@ -334,13 +828,37 @@ impl<S: ViewSource> Shell<S> {
         let Some(hit) = hit else {
             // Over the map.
             let mut fx = self.set_hot(None);
-            fx.extend(self.map_event(event, now));
+            match event {
+                InputEvent::PointerMoved { .. } => {
+                    fx.extend(self.map_event(event, now));
+                    self.track_rest(x, y, now);
+                }
+                InputEvent::Click { .. } | InputEvent::ClickWith { .. } => {
+                    // Clicking is activity: the card goes and the rest starts
+                    // over.
+                    self.hide_card();
+                    self.card.rest = None;
+                    fx.extend(self.map_event(event, now));
+                    self.track_rest(x, y, now);
+                }
+                _ => {
+                    self.hide_card();
+                    self.card.rest = None;
+                    fx.extend(self.map_event(event, now));
+                }
+            }
             return fx;
+        };
+        let hit = match hit {
+            Some(Hit::Crumb) => self.crumb_at(x).map_or(hit, |i| Some(Hit::CrumbSeg(i))),
+            other => other,
         };
         match event {
             InputEvent::PointerMoved { .. } => {
                 let mut fx = self.set_hot(hit);
                 // The pointer left the map for the chrome.
+                self.hide_card();
+                self.card.rest = None;
                 fx.extend(self.map_event(InputEvent::PointerLeft, now));
                 fx
             }
@@ -359,12 +877,54 @@ impl<S: ViewSource> Shell<S> {
             Hit::Up if self.can_go_up() => Some(Key::AltUp),
             Hit::Refresh => Some(Key::Refresh),
             Hit::Link => return vec![ShellEffect::OpenLink(chrome::LINK_URL)],
+            Hit::CrumbSeg(index) => {
+                self.hide_card();
+                self.card.rest = None;
+                return self.map_event(InputEvent::CrumbClick { index }, now);
+            }
             _ => None,
         };
         match key {
-            Some(k) => self.map_event(InputEvent::Key(k), now),
+            Some(k) => self.key(k, now),
             None => Vec::new(),
         }
+    }
+
+    /// The breadcrumb as laid out now.
+    fn crumb_parts(&mut self) -> Vec<CrumbPart> {
+        let area = self.geometry().crumb;
+        let em = self.font_px * self.scale;
+        let segs = self.crumb_segments();
+        chrome::layout_crumbs(area, em, &segs, self.measure.as_ref())
+    }
+
+    /// The names the breadcrumb shows: the view's trail, else its text, else
+    /// what was set before a map existed.
+    fn crumb_segments(&self) -> Vec<String> {
+        if let Some(app) = &self.app {
+            let view = app.current_view();
+            let trail = app.source().trail(view);
+            if !trail.is_empty() {
+                return trail;
+            }
+            let text = app.source().breadcrumb(view);
+            if !text.is_empty() {
+                return vec![text];
+            }
+        }
+        if self.crumb.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.crumb.clone()]
+        }
+    }
+
+    /// The clickable breadcrumb segment under `x`.
+    fn crumb_at(&mut self, x: f32) -> Option<usize> {
+        self.crumb_parts()
+            .iter()
+            .find(|p| p.target.is_some() && x >= p.rect.x && x < p.rect.right())
+            .and_then(|p| p.target)
     }
 
     fn can_go_back(&self) -> bool {
@@ -408,6 +968,10 @@ impl<S: ViewSource> Shell<S> {
                 line(&format!("More categories: {}", hidden.join(", ")))
             }
             Hit::Capacity => line(&self.capacity.breakdown()?.describe()),
+            Hit::CrumbSeg(i) => {
+                let segs = self.crumb_segments();
+                line(&format!("Go to {}", segs.get(i)?))
+            }
             Hit::Crumb | Hit::Info => return None,
         })
     }
@@ -417,6 +981,14 @@ impl<S: ViewSource> Shell<S> {
     pub fn info_line(&self) -> InfoLine {
         if let Some(t) = self.hot.and_then(|h| self.tooltip(h)) {
             return t;
+        }
+        if let Some((text, until)) = &self.notice
+            && self.clock < *until
+        {
+            return InfoLine {
+                name: text.clone(),
+                details: String::new(),
+            };
         }
         if let Some(app) = &self.app
             && let Some(line) = app
@@ -434,13 +1006,8 @@ impl<S: ViewSource> Shell<S> {
     /// The chrome to draw at `now`.
     pub fn chrome(&mut self, now: Duration) -> Chrome {
         let info = self.info_line();
-        let breadcrumb = match &self.app {
-            Some(app) => {
-                let c = app.source().breadcrumb(app.current_view());
-                if c.is_empty() { self.crumb.clone() } else { c }
-            }
-            None => self.crumb.clone(),
-        };
+        self.clock = self.clock.max(now);
+        let crumbs = self.crumb_parts();
         let (back, forward, up) = (self.can_go_back(), self.can_go_forward(), self.can_go_up());
         let hot = self.hot;
         let parts = self.capacity.parts_at(now).segments();
@@ -468,12 +1035,19 @@ impl<S: ViewSource> Shell<S> {
                 hot: hot == Some(h),
             });
         }
-        widgets.push(Widget::Text {
-            rect: g.crumb,
-            text: breadcrumb.into(),
-            role: TextRole::Primary,
-            hot: false,
-        });
+        for part in crumbs {
+            let role = match (part.current, part.target) {
+                (true, _) => TextRole::Primary,
+                (false, Some(_)) => TextRole::Link,
+                (false, None) => TextRole::Secondary,
+            };
+            widgets.push(Widget::Text {
+                rect: part.rect,
+                text: part.text.into(),
+                role,
+                hot: part.target.is_some_and(|i| hot == Some(Hit::CrumbSeg(i))),
+            });
+        }
         if has_capacity {
             widgets.push(Widget::Capacity {
                 rect: g.capacity,

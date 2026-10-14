@@ -3,6 +3,7 @@
 //! administrator rights goes to the separate bytescape-helper program.
 
 mod bench;
+mod clipboard;
 mod live;
 mod open;
 mod real;

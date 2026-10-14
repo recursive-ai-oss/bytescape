@@ -42,6 +42,26 @@ pub fn to_png_rgba(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Writes native pixel words (`0xAARRGGBB`, `width × height`) as a PNG.
+pub fn save_words_png(
+    words: &[u32],
+    width: u32,
+    height: u32,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let n = width as usize * height as usize;
+    if words.len() < n {
+        return Err("buffer is smaller than the picture".into());
+    }
+    let mut rgba = Vec::with_capacity(n * 4);
+    for &w in &words[..n] {
+        rgba.extend_from_slice(&[(w >> 16) as u8, (w >> 8) as u8, w as u8, 0xFF]);
+    }
+    let size = tiny_skia::IntSize::from_wh(width, height).ok_or("empty picture")?;
+    let pixmap = tiny_skia::Pixmap::from_vec(rgba, size).ok_or("bad picture size")?;
+    pixmap.save_png(path).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,6 +71,17 @@ mod tests {
         assert_eq!(word(Color::rgb(0x12, 0x34, 0x56)), 0xFF12_3456);
         let bytes = premultiplied(Color::rgb(0x12, 0x34, 0x56), 255);
         assert_eq!(u32::from_le_bytes(bytes), 0xFF12_3456);
+    }
+
+    #[test]
+    fn words_become_png_pixels() {
+        let dir = std::env::temp_dir().join(format!("bs-words-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("a.png");
+        save_words_png(&[0xFF12_3456, 0xFF00_00FF], 2, 1, &file).expect("saved");
+        assert!(std::fs::metadata(&file).expect("file").len() > 0);
+        assert!(save_words_png(&[0], 2, 1, &file).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
