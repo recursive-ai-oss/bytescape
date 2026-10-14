@@ -1,0 +1,9 @@
+# Reviewed exceptions to the wording rule for text shown inside the program.
+#
+# One per line: path | banned word | text
+# The exception covers a string literal (or knowledge-table value) in that file
+# that has that banned word and contains that text. An exception that matches
+# nothing fails the check, so this list cannot go stale.
+#
+# None are needed today. The product name "Disk Cleanup" is one word and
+# passes without an entry; only "clean up" as two words is banned.

@@ -281,7 +281,15 @@ fn cargo_metadata_full(root: &Path) -> Result<serde_json::Value, String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
     let output = std::process::Command::new(cargo)
         .current_dir(root)
-        .args(["metadata", "--format-version", "1", "--locked"])
+        // Every feature on, so a path crate that only an optional feature
+        // pulls in is in the graph too.
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--all-features",
+        ])
         .output()
         .map_err(|error| format!("could not run cargo metadata: {error}"))?;
     if !output.status.success() {

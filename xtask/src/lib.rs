@@ -7,6 +7,7 @@
 pub mod helper_deps;
 pub mod net_ban;
 pub mod public_text;
+pub mod ui_wording;
 pub mod unsafe_allow;
 pub mod util;
 pub mod wording;

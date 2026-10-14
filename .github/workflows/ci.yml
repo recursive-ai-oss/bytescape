@@ -78,8 +78,10 @@ jobs:
     env:
       # These runners are throwaway machines, so tests that change operating
       # system state (Recycle Bin, Trash, deletes) may run here. Never set
-      # this on a machine you care about.
-      BYTESCAPE_DISPOSABLE_HOST: "1"
+      # this on a machine you care about. On Linux the flag is left off for
+      # the main run: the tests it switches on there mount file systems and
+      # need root, so they run in their own step below, as root.
+      BYTESCAPE_DISPOSABLE_HOST: ${{ startsWith(matrix.os, 'windows') && '1' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -92,7 +94,24 @@ jobs:
       # gives the same date.
       - name: Set the build date
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor. Two
+      # tests need them, and a test that cannot run would pass quietly, so the
+      # restriction is lifted on this throwaway runner. btrfs-progs is for the
+      # test that builds a btrfs file system.
+      - name: Allow user namespaces, install btrfs tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends btrfs-progs
       - run: cargo test --locked --workspace
+      # The tests that need a private namespace or root, run for real. The
+      # script fails when any of them reports NOT RUN.
+      - name: Namespace and root tests (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        env:
+          BYTESCAPE_DISPOSABLE_HOST: "1"
+        run: bash packaging/ci/linux-privileged-tests.sh
 
   deny:
     name: cargo-deny
@@ -157,14 +176,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # The notes shipped inside the program are checked by their own tests.
-      # The wording lint for them arrives with the tables; until then this
-      # only builds and runs the crate's placeholder test.
+      # The notes shipped inside the program are checked by their own tests,
+      # with a list that is stricter than the wording rule.
       - name: Knowledge tables wording
         run: cargo test --locked -p bs-knowledge
-      # The shipped prose: README, changelog, docs, issue forms and package
-      # listings.
-      - name: Prose wording
+      # The shipped prose (README, changelog, docs, issue forms and package
+      # listings) and the words inside the program: string literals in the
+      # interface crates and the notes in the knowledge tables.
+      - name: Prose and interface wording
         if: ${{ !cancelled() }}
         run: cargo xtask wording
 
@@ -184,7 +203,9 @@ jobs:
       matrix:
         os: [ubuntu-24.04-arm, windows-11-arm]
     env:
-      BYTESCAPE_DISPOSABLE_HOST: "1"
+      # Same rule as the test job: on Linux the root-only tests run in their
+      # own step.
+      BYTESCAPE_DISPOSABLE_HOST: ${{ startsWith(matrix.os, 'windows') && '1' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -193,10 +214,23 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Allow user namespaces, install btrfs tools
+        if: runner.os == 'Linux'
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends btrfs-progs
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Tests
         if: ${{ !cancelled() }}
         run: cargo test --locked --workspace
+      - name: Namespace and root tests (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        env:
+          BYTESCAPE_DISPOSABLE_HOST: "1"
+        run: bash packaging/ci/linux-privileged-tests.sh
       - name: Project checks
         if: ${{ !cancelled() }}
         run: cargo xtask guards
@@ -216,7 +250,7 @@ jobs:
       # The script empties the file cache with sudo and writes large data
       # sets; it must refuse to run anywhere that is not a throwaway machine.
       BYTESCAPE_DISPOSABLE_HOST: "1"
-      BENCH_SCRIPT: crates/bs-scan/bench/g4.sh
+      BENCH_SCRIPT: crates/bs-scan/bench/walker-bench.sh
       BENCH_RESULTS: ${{ github.workspace }}/bench-results
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -262,7 +296,16 @@ jobs:
       # $BENCH_RESULTS.
       - name: Run the cold-cache benchmark
         if: steps.script.outputs.present == 'true'
-        run: bash "$BENCH_SCRIPT"
+        run: |
+          status=0
+          bash "$BENCH_SCRIPT" || status=$?
+          # The script exits 1 when a tool's total differs from the walker's
+          # or the tree changed during the runs. The timings are then not a
+          # valid comparison, so the job must be red and say why.
+          if [ "$status" -eq 1 ]; then
+            echo "::error title=Benchmark totals differ::A reference tool reported a different total from the walker, or the data changed during the runs. The timings are not a valid comparison; see summary.md in the uploaded results."
+          fi
+          exit "$status"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() && steps.script.outputs.present == 'true' }}
         with:

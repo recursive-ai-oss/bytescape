@@ -30,7 +30,7 @@ To build it yourself today, see [docs/building.md](docs/building.md).
 
 **Bytescape never connects to the internet.** There is no networking code in either program, no update check, no telemetry and no account. Two independent checks in the build reject the networking libraries that we know of. One of them also rejects library features (including the Windows networking APIs) and system calls, so adding any of these fails the build. They are a backstop for code review, not a proof: a networking library they do not know about would not be caught.
 
-If your session uses a remote or forwarded X display (for example over `ssh -X`), the window's drawing goes to that display like it does for any X program, and that is the only display traffic that can leave the machine.
+Where the screen is shown is your session's choice: if `DISPLAY` points at a remote or forwarded X display (`DISPLAY=host:0`, `ssh -X`), the window's drawing goes to that display like it does for any X program. That connection is made by your session and display server, not by Bytescape, which never connects anywhere itself.
 
 What stays on your machine:
 

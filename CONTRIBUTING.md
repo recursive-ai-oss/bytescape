@@ -62,7 +62,7 @@ The crates that read raw disk structures or sit on the privilege boundary (`bs-s
 
 ### Wording: Bytescape is a visualizer, not a cleanup advisor
 
-Notes and text say what something is and which program manages it. They never tell the user that something is safe to remove, never call data junk, never offer a reclaimable total or a cleanup list, and never say that space was "freed" when an item was only moved to the Recycle Bin or Trash. `cargo xtask wording` rejects the banned words ("safe", "junk", "reclaim*", "clean up" and "freed", whole words, any case) in the README, the changelog (it becomes the release notes), `docs/`, the issue forms and the package listings, and it fails on any such file that is not UTF-8 text. The same lint will cover the built-in notes when the knowledge tables arrive.
+Notes and text say what something is and which program manages it. They never tell the user that something is safe to remove, never call data junk, never offer a reclaimable total or a cleanup list, and never say that space was "freed" when an item was only moved to the Recycle Bin or Trash. `cargo xtask wording` rejects the banned words ("safe", "junk", "reclaim*", "clean up" and "freed", whole words, any case) in the README, the changelog (it becomes the release notes), `docs/`, the issue forms and the package listings, and it fails on any such file that is not UTF-8 text. It also covers the words inside the program: every string literal in `src/` of every crate under `crates/` (outside test code, so a new crate is covered from its first commit), and the notes in the knowledge tables. No crate is left out. Comments and identifiers are not text anyone reads, so they are not checked. The product name "Disk Cleanup" passes, because it is one word; "clean up" as two words does not. A real exception goes in `xtask/wording.allow` (`path | word | text`, one per line), is reviewed like any other change, and fails the check once it matches nothing.
 
 ### Numbers are measured
 
@@ -74,7 +74,7 @@ Everything in this repository is public, including comments, workflow files and 
 
 ## Tests that touch the machine
 
-Some tests move files to the Recycle Bin or Trash, or call the operating system in other ways that change state. They run only when `BYTESCAPE_DISPOSABLE_HOST=1` is set, which CI sets on its throwaway runners. Set it on your own machine only if it is a virtual machine or another disposable system.
+Some tests move files to the Recycle Bin or Trash, or call the operating system in other ways that change state. They run only when `BYTESCAPE_DISPOSABLE_HOST=1` is set, which CI sets on its throwaway runners. Set it on your own machine only if it is a virtual machine or another disposable system. Three Linux tests need more than that: two run inside a private user namespace and one mounts file systems as root. `BYTESCAPE_DISPOSABLE_HOST=1 packaging/ci/linux-privileged-tests.sh` runs them (it needs passwordless `sudo`, `btrfs-progs`, and on Ubuntu 24.04 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`) and fails if any of them reports `NOT RUN`. CI runs it on the Linux legs.
 
 ## Pull requests
 

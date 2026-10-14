@@ -1333,6 +1333,36 @@ fn unsafe_allow_flags_a_non_member_path_crate_compiled_into_the_product() {
 }
 
 #[test]
+fn unsafe_allow_flags_a_path_crate_that_only_an_optional_feature_pulls_in() {
+    // The crate is reachable only with a feature on, which a default
+    // `cargo metadata` leaves out of the graph.
+    let scratch = real_workspace(&["bs-knowledge"], &[]);
+    scratch.write(
+        "vendor/evil/Cargo.toml",
+        "[package]\nname = \"evil\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    );
+    scratch.write("vendor/evil/src/lib.rs", EVIL_LIB);
+    scratch.write(
+        "crates/bs-knowledge/Cargo.toml",
+        "[package]\nname = \"bs-knowledge\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nevil = { path = \"../../vendor/evil\", optional = true }\n\n[features]\nextra = [\"dep:evil\"]\n\n[lints]\nworkspace = true\n",
+    );
+    let relock = std::process::Command::new("cargo")
+        .current_dir(&scratch.0)
+        .args(["generate-lockfile", "--offline"])
+        .output()
+        .expect("cargo");
+    assert!(relock.status.success());
+    let findings = unsafe_allow::run(&scratch.0).expect("runs");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.subject == "vendor/evil/Cargo.toml"
+                && f.message.contains("not a workspace member")),
+        "{findings:?}"
+    );
+}
+
+#[test]
 fn unsafe_allow_flags_a_non_member_that_brings_its_own_workspace_lints() {
     // The same shape, with the crate defining its own [workspace.lints] that
     // allows what the real ones deny: it still cannot inherit ours.

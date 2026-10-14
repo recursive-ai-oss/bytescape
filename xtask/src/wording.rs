@@ -8,6 +8,10 @@
 //! command line (for example the store listing text). A file in scope that is
 //! not valid UTF-8 text is itself a finding, because it cannot be checked.
 //!
+//! The same rule also covers the words shown inside the program: string
+//! literals in the interface crates and the knowledge tables' notes (see
+//! [`crate::ui_wording`]).
+//!
 //! CONTRIBUTING, SECURITY and the pull request template are out of scope on
 //! purpose: they have to name the banned words to explain the rule.
 
@@ -28,44 +32,58 @@ pub struct Covered {
     pub explicit: bool,
 }
 
+/// The banned words, whole and in any case. The one list: the scan below and
+/// the comparison with the knowledge crate's own lint both read it.
+pub const BANNED_WORDS: [&str; 3] = ["safe", "junk", "freed"];
+
+/// Banned word stems, with the name used in messages: "reclaim" bans
+/// "reclaimable" and "reclaiming" too.
+pub const BANNED_STEMS: [(&str, &str); 1] = [("reclaim", "reclaim*")];
+
+/// Banned two-word phrases (lower case), with the name used in messages.
+pub const BANNED_PHRASES: [(&str, &str, &str); 1] = [("clean", "up", "clean up")];
+
 /// The banned word found at the start of `words[index]`, if any.
-fn banned_at(words: &[(usize, String)], index: usize) -> Option<&'static str> {
-    let word = words[index].1.as_str();
-    match word {
-        "safe" => Some("safe"),
-        "junk" => Some("junk"),
-        "freed" => Some("freed"),
-        _ if word.starts_with("reclaim") => Some("reclaim*"),
-        "clean" => {
-            let next = words.get(index + 1).map(|(_, text)| text.as_str());
-            (next == Some("up")).then_some("clean up")
-        }
-        _ => None,
+fn banned_at(words: &[(usize, usize, String)], index: usize) -> Option<&'static str> {
+    let word = words[index].2.as_str();
+    if let Some(banned) = BANNED_WORDS.iter().find(|banned| **banned == word) {
+        return Some(banned);
     }
+    if let Some((_, name)) = BANNED_STEMS.iter().find(|(stem, _)| word.starts_with(stem)) {
+        return Some(name);
+    }
+    let next = words.get(index + 1).map(|(_, _, text)| text.as_str());
+    BANNED_PHRASES
+        .iter()
+        .find(|(first, second, _)| word == *first && next == Some(*second))
+        .map(|(_, _, name)| *name)
 }
 
 /// Splits text into lowercase words (letters, digits, underscore) with their
-/// 1-based line numbers. Line breaks inside a phrase do not hide it.
-fn words_with_lines(text: &str) -> Vec<(usize, String)> {
+/// 1-based line numbers and the position (in characters) where they start.
+/// Line breaks inside a phrase do not hide it.
+fn words_with_lines(text: &str) -> Vec<(usize, usize, String)> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut line = 1;
     let mut word_line = 1;
-    for character in text.chars() {
+    let mut word_start = 0;
+    for (count, character) in text.chars().enumerate() {
         if character.is_alphanumeric() || character == '_' {
             if current.is_empty() {
                 word_line = line;
+                word_start = count;
             }
             current.extend(character.to_lowercase());
         } else if !current.is_empty() {
-            words.push((word_line, std::mem::take(&mut current)));
+            words.push((word_line, word_start, std::mem::take(&mut current)));
         }
         if character == '\n' {
             line += 1;
         }
     }
     if !current.is_empty() {
-        words.push((word_line, current));
+        words.push((word_line, word_start, current));
     }
     words
 }
@@ -75,6 +93,15 @@ pub fn scan_text(text: &str) -> Vec<(usize, &'static str)> {
     let words = words_with_lines(text);
     (0..words.len())
         .filter_map(|index| banned_at(&words, index).map(|word| (words[index].0, word)))
+        .collect()
+}
+
+/// Banned words in one text, as `(position, word)` pairs, where the position
+/// is the index of the word's first character.
+pub fn scan_text_positions(text: &str) -> Vec<(usize, &'static str)> {
+    let words = words_with_lines(text);
+    (0..words.len())
+        .filter_map(|index| banned_at(&words, index).map(|word| (words[index].1, word)))
         .collect()
 }
 
@@ -148,5 +175,6 @@ pub fn run(root: &Path, extra: &[PathBuf]) -> Result<Vec<Finding>, String> {
             ));
         }
     }
+    findings.extend(crate::ui_wording::run(root)?);
     Ok(findings)
 }
