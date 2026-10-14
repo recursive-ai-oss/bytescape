@@ -108,6 +108,9 @@ version = "0.1.0"
 [[package]]
 name = "bs-knowledge"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "bs-layout"

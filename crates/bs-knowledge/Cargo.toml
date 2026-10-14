@@ -9,5 +9,12 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+# No dependencies: the elevated helper checks deletions against these tables,
+# so the crate must stay free of anything that could be attacked. The data files
+# under `data/` are parsed by `build.rs`, not at run time.
+
 [lints]
 workspace = true
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

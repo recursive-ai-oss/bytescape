@@ -603,6 +603,26 @@ mod tests {
     }
 
     #[test]
+    fn every_mount_of_one_btrfs_filesystem_has_the_same_device_number() {
+        // As the kernel prints them: one superblock, one major:minor pair.
+        let text = include_str!("../../tests/fixtures/mountinfo/btrfs-subvolumes.txt");
+        let entries = parse(text.as_bytes());
+        let numbers: std::collections::HashSet<_> = entries
+            .iter()
+            .filter(|e| e.fs_type == "btrfs")
+            .map(|e| (e.major, e.minor))
+            .collect();
+        assert_eq!(numbers.len(), 1);
+        // A lookup by that number alone cannot tell the subvolumes apart, so the
+        // longest mount-point prefix picks the mount; the drive is the same.
+        let candidates = plan(entries, &removable(&[]));
+        let (major, minor) = *numbers.iter().next().unwrap();
+        let home = find(&candidates, (major, minor), b"/home/alice").unwrap();
+        let log = find(&candidates, (major, minor), b"/var/log/syslog").unwrap();
+        assert_eq!(home.entry.mount_point, log.entry.mount_point);
+    }
+
+    #[test]
     fn btrfs_subvolume_path_with_an_unknown_device_number_still_finds_the_drive() {
         // `stat` on a subvolume folder can report a device number that the
         // mount table does not list; the longest mount-point prefix decides.

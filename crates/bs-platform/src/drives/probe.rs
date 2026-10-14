@@ -1,6 +1,6 @@
 //! Running slow operating-system calls without letting them stall the caller.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
@@ -19,7 +19,10 @@ pub(crate) type Job<T> = Box<dyn FnOnce() -> T + Send + 'static>;
 /// recorded: two callers may ask about the same healthy mount at once.
 #[derive(Default)]
 pub(crate) struct InFlight {
-    stuck: Mutex<HashSet<Vec<u8>>>,
+    /// How many abandoned probes of each key are still running. Two callers
+    /// can abandon a probe of the same dead key at once; the key stays stuck
+    /// until both have returned.
+    stuck: Mutex<HashMap<Vec<u8>, usize>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,14 +46,14 @@ impl InFlight {
         Arc::clone(SHARED.get_or_init(Arc::default))
     }
 
-    fn stuck(&self) -> std::sync::MutexGuard<'_, HashSet<Vec<u8>>> {
+    fn stuck(&self) -> std::sync::MutexGuard<'_, HashMap<Vec<u8>, usize>> {
         self.stuck.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Starts tracking a probe. `None` if an abandoned probe for the key is
     /// still stuck.
     fn begin(self: &Arc<Self>, key: Vec<u8>) -> Option<Marker> {
-        if self.stuck().contains(&key) {
+        if self.stuck().contains_key(&key) {
             return None;
         }
         Some(Marker {
@@ -79,7 +82,7 @@ impl Marker {
         let mut state = slot.state.lock().unwrap_or_else(PoisonError::into_inner);
         if *state == State::Running {
             *state = State::Abandoned;
-            gate.stuck().insert(key.to_vec());
+            *gate.stuck().entry(key.to_vec()).or_insert(0) += 1;
         }
     }
 }
@@ -92,7 +95,13 @@ impl Drop for Marker {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if *state == State::Abandoned {
-            self.gate.stuck().remove(&self.key);
+            let mut stuck = self.gate.stuck();
+            if let Some(count) = stuck.get_mut(&self.key) {
+                *count -= 1;
+                if *count == 0 {
+                    stuck.remove(&self.key);
+                }
+            }
         }
         *state = State::Done;
     }
@@ -237,6 +246,65 @@ mod tests {
             vec![Some(1)]
         );
         assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_key_stays_stuck_until_every_abandoned_probe_of_it_has_returned() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let gate: Arc<InFlight> = Arc::default();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let probe = |sleep_ms: u64, starts: &Arc<AtomicUsize>| -> Vec<(Vec<u8>, Job<u8>)> {
+            let starts = Arc::clone(starts);
+            vec![(
+                b"/mnt/dead".to_vec(),
+                Box::new(move || {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(sleep_ms));
+                    1u8
+                }) as Job<u8>,
+            )]
+        };
+        // Two callers start at the same moment, so both get to spawn. One
+        // probe returns after 300 ms and the other after 1500 ms; both callers
+        // give up after 40 ms.
+        let callers: Vec<_> = [300u64, 1500]
+            .into_iter()
+            .map(|ms| {
+                let (gate, starts) = (Arc::clone(&gate), Arc::clone(&starts));
+                let jobs = probe(ms, &starts);
+                thread::spawn(move || run_parallel(&gate, jobs, Duration::from_millis(40)))
+            })
+            .collect();
+        for caller in callers {
+            assert_eq!(caller.join().unwrap(), vec![None]);
+        }
+        // Both probes ran if the callers really overlapped; otherwise the test
+        // has not exercised the case and says so instead of passing quietly.
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            2,
+            "the two callers did not overlap"
+        );
+
+        // After the short probe has returned, the long one is still stuck.
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            run_parallel(&gate, probe(1, &starts), Duration::from_millis(40)),
+            vec![None]
+        );
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            2,
+            "no third thread while one is stuck"
+        );
+
+        // After the long one returns too, the key is free.
+        thread::sleep(Duration::from_millis(1300));
+        assert_eq!(
+            run_parallel(&gate, probe(1, &starts), Duration::from_secs(5)),
+            vec![Some(1)]
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 3);
     }
 
     #[test]

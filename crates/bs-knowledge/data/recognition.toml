@@ -1,0 +1,650 @@
+# Folders that Bytescape recognizes, each with a short factual note.
+#
+# A note says what the folder is and who manages it. It never says whether
+# anything can or should be deleted: a test in this crate rejects notes that
+# do. Only list a folder when its purpose and owner are documented.
+#
+# Fields
+#   pattern   Where the folder is. `/` separates parts on both systems.
+#             `~` is the user's home folder, `%NAME%` an environment variable,
+#             `**/name` a folder of that name anywhere, `*` and `?` match
+#             inside one part. Patterns match the folder itself.
+#   os        "windows", "linux" or "any" (default "any").
+#   category  video, images, audio, documents, archives, apps-system,
+#             code-dev, cache-temp or other.
+#   contents  "inherit" (default): files inside take the category.
+#             "own": only the folder has it; files keep their own category.
+#   note      The factual note.
+#   handoff   Optional: "uninstall", "disk-cleanup" or "package", the tool
+#             that owns the folder (see the interface notes in the crate).
+
+# ---------------------------------------------------------------- Windows
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/Temp"
+os = "windows"
+category = "cache-temp"
+note = "Temporary files folder of the current user, used by Windows and programs."
+handoff = "disk-cleanup"
+
+[[entry]]
+pattern = "%SystemRoot%/Temp"
+os = "windows"
+category = "cache-temp"
+note = "Temporary files folder shared by Windows services and programs."
+handoff = "disk-cleanup"
+
+[[entry]]
+pattern = "%SystemRoot%/WinSxS"
+os = "windows"
+category = "apps-system"
+note = "Windows component store, managed by Windows servicing."
+handoff = "disk-cleanup"
+
+[[entry]]
+pattern = "%SystemRoot%/SoftwareDistribution"
+os = "windows"
+category = "apps-system"
+note = "Windows Update download and data store, managed by Windows Update."
+handoff = "disk-cleanup"
+
+[[entry]]
+pattern = "%SystemRoot%/Installer"
+os = "windows"
+category = "apps-system"
+note = "Windows Installer cache of installed program packages, managed by Windows Installer."
+
+[[entry]]
+pattern = "%SystemRoot%/System32"
+os = "windows"
+category = "apps-system"
+note = "Core Windows system files, managed by Windows."
+
+[[entry]]
+pattern = "%SystemRoot%/Fonts"
+os = "windows"
+category = "apps-system"
+note = "Installed fonts, managed by Windows."
+
+[[entry]]
+pattern = "%SystemRoot%/Prefetch"
+os = "windows"
+category = "cache-temp"
+note = "Program launch trace files that Windows uses to start programs faster."
+
+[[entry]]
+pattern = "%SystemRoot%/Minidump"
+os = "windows"
+category = "apps-system"
+note = "Small memory dump files written by Windows after a system crash."
+handoff = "disk-cleanup"
+
+[[entry]]
+pattern = "%SystemDrive%/Windows.old"
+os = "windows"
+category = "apps-system"
+note = "Previous Windows installation kept by Windows Setup."
+handoff = "disk-cleanup"
+
+[[entry]]
+pattern = "%SystemDrive%/$WINDOWS.~BT"
+os = "windows"
+category = "apps-system"
+note = "Files from a Windows upgrade in progress or recently finished, managed by Windows Setup."
+handoff = "disk-cleanup"
+
+[[entry]]
+pattern = "**/$Recycle.Bin"
+os = "windows"
+category = "apps-system"
+note = "Recycle Bin storage of this drive, managed by Windows."
+
+[[entry]]
+pattern = "**/System Volume Information"
+os = "windows"
+category = "apps-system"
+note = "Volume metadata such as restore points and indexing data, managed by Windows."
+
+[[entry]]
+pattern = "%SystemDrive%/pagefile.sys"
+os = "windows"
+category = "apps-system"
+note = "Paging file that Windows uses as virtual memory."
+
+[[entry]]
+pattern = "%SystemDrive%/hiberfil.sys"
+os = "windows"
+category = "apps-system"
+note = "Hibernation file that Windows writes when the computer hibernates."
+
+[[entry]]
+pattern = "%SystemDrive%/swapfile.sys"
+os = "windows"
+category = "apps-system"
+note = "Swap file that Windows uses for Microsoft Store apps."
+
+[[entry]]
+pattern = "%ProgramData%"
+os = "windows"
+category = "apps-system"
+contents = "own"
+note = "Application data shared by all users, written by Windows and installed programs."
+
+[[entry]]
+pattern = "%ProgramData%/Package Cache"
+os = "windows"
+category = "cache-temp"
+note = "Installer packages kept by program setup bundles for repair and uninstall."
+
+[[entry]]
+pattern = "%ProgramData%/Microsoft/Windows Defender"
+os = "windows"
+category = "apps-system"
+note = "Microsoft Defender Antivirus data, managed by Windows Security."
+
+[[entry]]
+pattern = "%ProgramData%/chocolatey"
+os = "windows"
+category = "apps-system"
+note = "Chocolatey package manager installation, managed by Chocolatey."
+
+[[entry]]
+pattern = "%ProgramFiles%"
+os = "windows"
+category = "apps-system"
+contents = "own"
+note = "Default install folder for 64-bit programs, managed by Windows and program installers."
+
+[[entry]]
+pattern = "%ProgramFiles(x86)%"
+os = "windows"
+category = "apps-system"
+contents = "own"
+note = "Default install folder for 32-bit programs on 64-bit Windows, managed by Windows and program installers."
+
+[[entry]]
+pattern = "%ProgramFiles%/*"
+os = "windows"
+category = "apps-system"
+note = "Folder of an installed program, managed by its installer."
+handoff = "uninstall"
+
+[[entry]]
+pattern = "%ProgramFiles(x86)%/*"
+os = "windows"
+category = "apps-system"
+note = "Folder of an installed 32-bit program, managed by its installer."
+handoff = "uninstall"
+
+[[entry]]
+pattern = "%ProgramFiles(Arm)%/*"
+os = "windows"
+category = "apps-system"
+note = "Folder of an installed 32-bit Arm program, managed by its installer."
+handoff = "uninstall"
+
+[[entry]]
+pattern = "%ProgramFiles%/WindowsApps"
+os = "windows"
+category = "apps-system"
+note = "Microsoft Store apps, managed by Windows."
+
+[[entry]]
+pattern = "%ProgramFiles(x86)%/Steam/steamapps"
+os = "windows"
+category = "apps-system"
+note = "Steam game library with installed games and downloads, managed by Steam."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%"
+os = "windows"
+category = "apps-system"
+contents = "own"
+note = "Per-user application data kept on this computer by programs."
+
+[[entry]]
+pattern = "%APPDATA%"
+os = "windows"
+category = "apps-system"
+contents = "own"
+note = "Per-user application settings that follow the user profile, written by programs."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/Programs"
+os = "windows"
+category = "apps-system"
+contents = "own"
+note = "Programs installed for the current user only, managed by their installers."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/Programs/*"
+os = "windows"
+category = "apps-system"
+note = "Folder of a program installed for the current user, managed by its installer."
+handoff = "uninstall"
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/Packages"
+os = "windows"
+category = "apps-system"
+note = "Per-app data of Microsoft Store apps, managed by Windows."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/CrashDumps"
+os = "windows"
+category = "apps-system"
+note = "Crash dump files that Windows Error Reporting writes for programs that stop responding or crash, when enabled."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/D3DSCache"
+os = "windows"
+category = "cache-temp"
+note = "Shader cache written by DirectX for graphics programs."
+handoff = "disk-cleanup"
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/Microsoft/Windows/INetCache"
+os = "windows"
+category = "cache-temp"
+note = "Internet cache of the Windows WinINet component, used by Internet Explorer and programs built on it."
+handoff = "disk-cleanup"
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/Microsoft/Windows/Explorer"
+os = "windows"
+category = "cache-temp"
+note = "Thumbnail and icon caches written by File Explorer."
+handoff = "disk-cleanup"
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/Google/Chrome/User Data"
+os = "windows"
+category = "apps-system"
+contents = "own"
+note = "Google Chrome profile data, managed by Chrome."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/Google/Chrome/User Data/*/Cache"
+os = "windows"
+category = "cache-temp"
+note = "Web cache of a Google Chrome profile, managed by Chrome."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/Microsoft/Edge/User Data"
+os = "windows"
+category = "apps-system"
+contents = "own"
+note = "Microsoft Edge profile data, managed by Edge."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/Microsoft/Edge/User Data/*/Cache"
+os = "windows"
+category = "cache-temp"
+note = "Web cache of a Microsoft Edge profile, managed by Edge."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/Mozilla/Firefox/Profiles/*/cache2"
+os = "windows"
+category = "cache-temp"
+note = "Web cache of a Firefox profile, managed by Firefox."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/Docker/wsl"
+os = "windows"
+category = "apps-system"
+note = "Docker Desktop disk images for its WSL backend, managed by Docker Desktop."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/pip/Cache"
+os = "windows"
+category = "cache-temp"
+note = "Download cache of pip, the Python package installer."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%/npm-cache"
+os = "windows"
+category = "cache-temp"
+note = "Download cache of npm, the Node.js package manager."
+
+[[entry]]
+pattern = "%USERPROFILE%/.nuget/packages"
+os = "windows"
+category = "code-dev"
+note = "Global packages folder of NuGet, populated by NuGet when projects restore packages."
+
+[[entry]]
+pattern = "%USERPROFILE%/OneDrive"
+os = "windows"
+category = "other"
+contents = "own"
+note = "OneDrive sync folder, managed by OneDrive; files in it may be stored online only."
+
+[[entry]]
+pattern = "%USERPROFILE%/Downloads"
+os = "windows"
+category = "other"
+contents = "own"
+note = "Downloads folder of the user profile, where browsers save files by default."
+
+# ------------------------------------------------------------------ Linux
+
+[[entry]]
+pattern = "/tmp"
+os = "linux"
+category = "cache-temp"
+note = "Temporary files folder defined by the Filesystem Hierarchy Standard."
+
+[[entry]]
+pattern = "/var/tmp"
+os = "linux"
+category = "cache-temp"
+note = "Temporary files folder for data that persists between reboots, defined by the Filesystem Hierarchy Standard."
+
+[[entry]]
+pattern = "/var/cache"
+os = "linux"
+category = "cache-temp"
+contents = "own"
+note = "Application cache data defined by the Filesystem Hierarchy Standard, managed by the programs that write it."
+
+[[entry]]
+pattern = "/var/cache/apt"
+os = "linux"
+category = "cache-temp"
+note = "Package cache managed by APT."
+
+[[entry]]
+pattern = "/var/cache/dnf"
+os = "linux"
+category = "cache-temp"
+note = "Package cache managed by DNF."
+
+[[entry]]
+pattern = "/var/cache/pacman/pkg"
+os = "linux"
+category = "cache-temp"
+note = "Package cache managed by pacman."
+
+[[entry]]
+pattern = "/var/cache/zypp"
+os = "linux"
+category = "cache-temp"
+note = "Package cache managed by libzypp and zypper."
+
+[[entry]]
+pattern = "/var/lib/apt"
+os = "linux"
+category = "apps-system"
+note = "Package lists and state managed by APT."
+
+[[entry]]
+pattern = "/var/lib/dpkg"
+os = "linux"
+category = "apps-system"
+note = "Package database managed by dpkg."
+
+[[entry]]
+pattern = "/var/lib/docker"
+os = "linux"
+category = "apps-system"
+note = "Docker Engine data with images, containers and volumes, managed by Docker."
+
+[[entry]]
+pattern = "/var/lib/containers"
+os = "linux"
+category = "apps-system"
+note = "Container storage of Podman and Buildah, managed by containers/storage."
+
+[[entry]]
+pattern = "/var/lib/flatpak"
+os = "linux"
+category = "apps-system"
+note = "System-wide Flatpak applications and runtimes, managed by Flatpak."
+
+[[entry]]
+pattern = "/var/lib/snapd"
+os = "linux"
+category = "apps-system"
+note = "Snap package data, managed by snapd."
+
+[[entry]]
+pattern = "/snap"
+os = "linux"
+category = "apps-system"
+note = "Mounted Snap packages, managed by snapd."
+
+[[entry]]
+pattern = "/var/lib/libvirt/images"
+os = "linux"
+category = "archives"
+note = "Default storage for virtual machine disk images, managed by libvirt."
+
+[[entry]]
+pattern = "/var/lib/mysql"
+os = "linux"
+category = "apps-system"
+note = "Default data directory of MySQL and MariaDB, managed by the database server."
+
+[[entry]]
+pattern = "/var/lib/postgresql"
+os = "linux"
+category = "apps-system"
+note = "Data directory of PostgreSQL on Debian-based systems, managed by the database server."
+
+[[entry]]
+pattern = "/var/log"
+os = "linux"
+category = "other"
+contents = "own"
+note = "Log files written by the system and by services."
+
+[[entry]]
+pattern = "/var/log/journal"
+os = "linux"
+category = "apps-system"
+note = "Persistent journal written by systemd-journald."
+
+[[entry]]
+pattern = "/usr"
+os = "linux"
+category = "apps-system"
+contents = "own"
+note = "Programs, libraries and shared data of the operating system, installed by the package manager."
+handoff = "package"
+
+[[entry]]
+pattern = "/usr/lib/modules"
+os = "linux"
+category = "apps-system"
+note = "Kernel modules, installed with the kernel packages."
+handoff = "package"
+
+[[entry]]
+pattern = "/etc"
+os = "linux"
+category = "apps-system"
+contents = "own"
+note = "System-wide configuration files, managed by the administrator and by packages."
+handoff = "package"
+
+[[entry]]
+pattern = "/boot"
+os = "linux"
+category = "apps-system"
+contents = "own"
+note = "Boot loader files and kernel images, installed by the distribution's packages."
+handoff = "package"
+
+[[entry]]
+pattern = "/opt"
+os = "linux"
+category = "apps-system"
+contents = "own"
+note = "Add-on application packages, defined by the Filesystem Hierarchy Standard."
+
+[[entry]]
+pattern = "/opt/*"
+os = "linux"
+category = "apps-system"
+note = "Folder of an add-on application package."
+handoff = "package"
+
+[[entry]]
+pattern = "/swapfile"
+os = "linux"
+category = "apps-system"
+note = "Swap file that the kernel uses when the system is set up with one."
+
+[[entry]]
+pattern = "~/.cache"
+os = "linux"
+category = "cache-temp"
+note = "Per-user cache folder from the XDG base directory specification, managed by the programs that write to it."
+
+[[entry]]
+pattern = "~/.local/share"
+os = "linux"
+category = "apps-system"
+contents = "own"
+note = "Per-user data folder from the XDG base directory specification, managed by the programs that write to it."
+
+[[entry]]
+pattern = "~/.config"
+os = "linux"
+category = "apps-system"
+contents = "own"
+note = "Per-user settings folder from the XDG base directory specification, managed by the programs that write to it."
+
+[[entry]]
+pattern = "~/.local/share/Trash"
+os = "linux"
+category = "other"
+note = "Trash folder defined by the freedesktop.org Trash specification, managed by the desktop's file manager."
+
+[[entry]]
+pattern = "~/.local/share/Steam/steamapps"
+os = "linux"
+category = "apps-system"
+note = "Steam game library with installed games and downloads, managed by Steam."
+
+[[entry]]
+pattern = "~/.steam/steam/steamapps"
+os = "linux"
+category = "apps-system"
+note = "Steam game library with installed games and downloads, managed by Steam."
+
+[[entry]]
+pattern = "~/.var/app"
+os = "linux"
+category = "apps-system"
+note = "Per-application data of Flatpak apps, managed by Flatpak."
+
+[[entry]]
+pattern = "~/.local/share/flatpak"
+os = "linux"
+category = "apps-system"
+note = "Per-user Flatpak applications and runtimes, managed by Flatpak."
+
+[[entry]]
+pattern = "~/snap"
+os = "linux"
+category = "apps-system"
+note = "Per-user data of Snap applications, managed by snapd."
+
+[[entry]]
+pattern = "~/.local/share/docker"
+os = "linux"
+category = "apps-system"
+note = "Data of rootless Docker with images, containers and volumes, managed by Docker."
+
+[[entry]]
+pattern = "~/.local/share/containers"
+os = "linux"
+category = "apps-system"
+note = "Rootless container storage of Podman and Buildah, managed by containers/storage."
+
+[[entry]]
+pattern = "~/.wine"
+os = "linux"
+category = "apps-system"
+note = "Default Wine prefix, a Windows environment created and managed by Wine."
+
+[[entry]]
+pattern = "~/.mozilla"
+os = "linux"
+category = "apps-system"
+contents = "own"
+note = "Firefox profiles and settings, managed by Firefox."
+
+# ------------------------------------------------------- Both systems
+
+[[entry]]
+pattern = "~/.cargo"
+category = "code-dev"
+contents = "own"
+note = "Cargo home folder with installed tools, the package registry and git checkouts, managed by Cargo."
+
+[[entry]]
+pattern = "~/.cargo/registry"
+category = "code-dev"
+note = "Crate sources and index downloaded by Cargo."
+
+[[entry]]
+pattern = "~/.rustup"
+category = "code-dev"
+note = "Rust toolchains installed and managed by rustup."
+
+[[entry]]
+pattern = "~/.npm"
+category = "cache-temp"
+note = "Download cache of npm, the Node.js package manager."
+
+[[entry]]
+pattern = "~/.gradle"
+category = "code-dev"
+note = "Gradle user home with wrapper distributions, caches and settings, managed by Gradle."
+
+[[entry]]
+pattern = "~/.m2/repository"
+category = "code-dev"
+note = "Local repository of downloaded artifacts, managed by Maven."
+
+[[entry]]
+pattern = "~/go/pkg/mod"
+category = "code-dev"
+note = "Module cache populated by the go command."
+
+[[entry]]
+pattern = "~/.vscode/extensions"
+category = "code-dev"
+note = "Extensions installed in Visual Studio Code, managed by the editor."
+
+[[entry]]
+pattern = "~/VirtualBox VMs"
+category = "archives"
+note = "Default folder for VirtualBox virtual machines, managed by VirtualBox."
+
+[[entry]]
+pattern = "**/node_modules"
+category = "code-dev"
+note = "Dependencies installed by npm, pnpm or Yarn for a project."
+
+[[entry]]
+pattern = "**/.git"
+category = "code-dev"
+note = "Git repository data with history and objects, managed by Git."
+
+[[entry]]
+pattern = "**/__pycache__"
+category = "cache-temp"
+note = "Bytecode cache written by the Python interpreter."
+
+[[entry]]
+pattern = "**/.gradle"
+category = "code-dev"
+note = "Per-project cache and state of Gradle."
+
+[[entry]]
+pattern = "**/.terraform"
+category = "code-dev"
+note = "Working data of Terraform, such as downloaded providers and modules."

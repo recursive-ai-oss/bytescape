@@ -33,8 +33,8 @@ pub struct Capacity {
     /// Free bytes the current user cannot use; `reserved_kind` says why.
     pub reserved: u64,
     /// The reason for `reserved`. It is set by the backend that produced the
-    /// figures, so a label can say "Reserved by filesystem" or "Over your
-    /// quota limit" without guessing from the operating system.
+    /// figures, so a label can say "Reserved by filesystem" or "Beyond your
+    /// disk quota" without guessing from the operating system.
     pub reserved_kind: ReservedKind,
 }
 

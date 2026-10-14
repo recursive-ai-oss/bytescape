@@ -1,0 +1,518 @@
+# Paths that are blocked or protected against deletion.
+#
+# blocked    Never offered for deletion. The operating system's own folders.
+# protected  Deleted only after a stronger confirmation that repeats the note.
+#            The note says what the path is and who manages it; a test in this
+#            crate rejects notes that give advice.
+#
+# This is the one table both the interface and the elevated helper check
+# against, so they cannot disagree.
+#
+# Fields
+#   pattern  Where the path is. `/` separates parts on both systems. `~` is the
+#            user's home folder, `%NAME%` an environment variable (an unset
+#            variable switches the entry off, which is why the main folders
+#            are listed by their usual drive as well), `*` and `?` match inside
+#            one part, and `?:` is any drive letter.
+#   os       "windows", "linux" or "any" (default "any").
+#   level    "blocked" or "protected".
+#   scope    "subtree" (default): the path and everything below it.
+#            "exact": only the path itself.
+#   note     Required for protected entries, optional for blocked ones.
+
+# ---------------------------------------------------------------- Windows
+
+[[entry]]
+pattern = "?:"
+os = "windows"
+level = "blocked"
+scope = "exact"
+note = "The root of a drive."
+
+[[entry]]
+pattern = "%SystemRoot%"
+os = "windows"
+level = "blocked"
+note = "The Windows folder, managed by Windows."
+
+[[entry]]
+pattern = "C:/Windows"
+os = "windows"
+level = "blocked"
+note = "The Windows folder, managed by Windows."
+
+[[entry]]
+pattern = "%ProgramFiles%"
+os = "windows"
+level = "blocked"
+scope = "exact"
+note = "Install folder for 64-bit programs, managed by Windows."
+
+[[entry]]
+pattern = "%ProgramFiles(x86)%"
+os = "windows"
+level = "blocked"
+scope = "exact"
+note = "Install folder for 32-bit programs, managed by Windows."
+
+[[entry]]
+pattern = "%ProgramW6432%"
+os = "windows"
+level = "blocked"
+scope = "exact"
+note = "Install folder for 64-bit programs, managed by Windows."
+
+[[entry]]
+pattern = "%ProgramFiles(Arm)%"
+os = "windows"
+level = "blocked"
+scope = "exact"
+note = "Install folder for 32-bit Arm programs on Windows on Arm, managed by Windows."
+
+[[entry]]
+pattern = "C:/Program Files"
+os = "windows"
+level = "blocked"
+scope = "exact"
+note = "Install folder for 64-bit programs, managed by Windows."
+
+[[entry]]
+pattern = "C:/Program Files (x86)"
+os = "windows"
+level = "blocked"
+scope = "exact"
+note = "Install folder for 32-bit programs, managed by Windows."
+
+[[entry]]
+pattern = "C:/Program Files (Arm)"
+os = "windows"
+level = "blocked"
+scope = "exact"
+note = "Install folder for 32-bit Arm programs on Windows on Arm, managed by Windows."
+
+[[entry]]
+pattern = "?:/System Volume Information"
+os = "windows"
+level = "blocked"
+note = "Volume metadata such as restore points, managed by Windows."
+
+[[entry]]
+pattern = "?:/Users"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Parent folder of the user profiles, managed by Windows."
+
+[[entry]]
+pattern = "?:/Users/*"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "A user profile folder, managed by Windows."
+
+[[entry]]
+pattern = "%USERPROFILE%"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "The profile folder of the current user, managed by Windows."
+
+[[entry]]
+pattern = "?:/ProgramData"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Application data shared by all users, written by Windows and installed programs."
+
+[[entry]]
+pattern = "%ProgramData%/Microsoft/Windows Defender"
+os = "windows"
+level = "protected"
+note = "Microsoft Defender Antivirus data, managed by Windows Security."
+
+[[entry]]
+pattern = "%ProgramFiles%/*"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Folder of an installed program, managed by its installer."
+
+[[entry]]
+pattern = "%ProgramFiles(x86)%/*"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Folder of an installed 32-bit program, managed by its installer."
+
+[[entry]]
+pattern = "%ProgramFiles(Arm)%/*"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Folder of an installed 32-bit Arm program, managed by its installer."
+
+[[entry]]
+pattern = "C:/Program Files/*"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Folder of an installed program, managed by its installer."
+
+[[entry]]
+pattern = "C:/Program Files (x86)/*"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Folder of an installed 32-bit program, managed by its installer."
+
+[[entry]]
+pattern = "C:/Program Files (Arm)/*"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Folder of an installed 32-bit Arm program, managed by its installer."
+
+[[entry]]
+pattern = "%ProgramFiles%/WindowsApps"
+os = "windows"
+level = "protected"
+note = "Microsoft Store apps, managed by Windows."
+
+[[entry]]
+pattern = "C:/Program Files/WindowsApps"
+os = "windows"
+level = "protected"
+note = "Microsoft Store apps, managed by Windows."
+
+[[entry]]
+pattern = "%LOCALAPPDATA%"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Per-user application data kept on this computer by programs."
+
+[[entry]]
+pattern = "%APPDATA%"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Per-user application settings that follow the user profile, written by programs."
+
+[[entry]]
+pattern = "?:/Windows.old"
+os = "windows"
+level = "protected"
+note = "Previous Windows installation kept by Windows Setup; Disk Cleanup and Storage settings manage it."
+
+[[entry]]
+pattern = "?:/$WINDOWS.~BT"
+os = "windows"
+level = "protected"
+note = "Files from a Windows upgrade, managed by Windows Setup."
+
+[[entry]]
+pattern = "?:/$Recycle.Bin"
+os = "windows"
+level = "protected"
+note = "Recycle Bin storage of this drive, managed by Windows."
+
+[[entry]]
+pattern = "?:/pagefile.sys"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Paging file that Windows uses as virtual memory."
+
+[[entry]]
+pattern = "?:/hiberfil.sys"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Hibernation file that Windows writes when the computer hibernates."
+
+[[entry]]
+pattern = "?:/swapfile.sys"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Swap file that Windows uses for Microsoft Store apps."
+
+[[entry]]
+pattern = "?:/bootmgr"
+os = "windows"
+level = "protected"
+scope = "exact"
+note = "Windows Boot Manager, managed by Windows."
+
+# ------------------------------------------------------------------ Linux
+
+[[entry]]
+pattern = "/"
+os = "linux"
+level = "blocked"
+scope = "exact"
+note = "The root of the filesystem."
+
+[[entry]]
+pattern = "/usr"
+os = "linux"
+level = "blocked"
+note = "Programs, libraries and shared data of the operating system, managed by the package manager."
+
+[[entry]]
+pattern = "/boot"
+os = "linux"
+level = "blocked"
+note = "Boot loader files and kernel images, managed by the distribution's packages."
+
+[[entry]]
+pattern = "/etc"
+os = "linux"
+level = "blocked"
+note = "System-wide configuration files, managed by the administrator and by packages."
+
+[[entry]]
+pattern = "/bin"
+os = "linux"
+level = "blocked"
+note = "Essential programs of the operating system, managed by the package manager."
+
+[[entry]]
+pattern = "/sbin"
+os = "linux"
+level = "blocked"
+note = "Essential system programs of the operating system, managed by the package manager."
+
+[[entry]]
+pattern = "/lib*"
+os = "linux"
+level = "blocked"
+note = "Essential libraries of the operating system, managed by the package manager."
+
+[[entry]]
+pattern = "/var/lib/dpkg"
+os = "linux"
+level = "blocked"
+note = "Package database managed by dpkg."
+
+[[entry]]
+pattern = "/var/lib/rpm"
+os = "linux"
+level = "blocked"
+note = "Package database managed by RPM."
+
+[[entry]]
+pattern = "/var/lib/pacman"
+os = "linux"
+level = "blocked"
+note = "Package database managed by pacman."
+
+[[entry]]
+pattern = "/proc"
+os = "linux"
+level = "blocked"
+note = "Process and kernel information provided by the kernel."
+
+[[entry]]
+pattern = "/sys"
+os = "linux"
+level = "blocked"
+note = "Device and kernel information provided by the kernel."
+
+[[entry]]
+pattern = "/dev"
+os = "linux"
+level = "blocked"
+note = "Device files, managed by the kernel and udev."
+
+[[entry]]
+pattern = "/mnt/?"
+os = "linux"
+level = "blocked"
+scope = "exact"
+note = "A drive mounted under /mnt, such as a Windows drive seen through WSL."
+
+[[entry]]
+pattern = "/mnt/?/Windows"
+os = "linux"
+level = "blocked"
+note = "The Windows folder of a Windows drive seen through WSL, managed by Windows."
+
+[[entry]]
+pattern = "/mnt/?/Program Files"
+os = "linux"
+level = "blocked"
+scope = "exact"
+note = "Install folder for 64-bit Windows programs seen through WSL, managed by Windows."
+
+[[entry]]
+pattern = "/mnt/?/Program Files (x86)"
+os = "linux"
+level = "blocked"
+scope = "exact"
+note = "Install folder for 32-bit Windows programs seen through WSL, managed by Windows."
+
+[[entry]]
+pattern = "/mnt/?/Program Files (Arm)"
+os = "linux"
+level = "blocked"
+scope = "exact"
+note = "Install folder for 32-bit Arm Windows programs seen through WSL, managed by Windows."
+
+[[entry]]
+pattern = "/mnt/?/System Volume Information"
+os = "linux"
+level = "blocked"
+note = "Volume metadata of a Windows drive seen through WSL, managed by Windows."
+
+[[entry]]
+pattern = "/var"
+os = "linux"
+level = "protected"
+scope = "exact"
+note = "Variable data such as logs, caches and package state, defined by the Filesystem Hierarchy Standard."
+
+[[entry]]
+pattern = "/var/lib"
+os = "linux"
+level = "protected"
+scope = "exact"
+note = "State data of installed programs and services, defined by the Filesystem Hierarchy Standard."
+
+[[entry]]
+pattern = "/opt"
+os = "linux"
+level = "protected"
+scope = "exact"
+note = "Add-on application packages, defined by the Filesystem Hierarchy Standard."
+
+[[entry]]
+pattern = "/root"
+os = "linux"
+level = "protected"
+scope = "exact"
+note = "Home folder of the root user."
+
+[[entry]]
+pattern = "/run"
+os = "linux"
+level = "protected"
+scope = "exact"
+note = "Runtime data of the running system, defined by the Filesystem Hierarchy Standard."
+
+[[entry]]
+pattern = "/srv"
+os = "linux"
+level = "protected"
+scope = "exact"
+note = "Data served by this system, defined by the Filesystem Hierarchy Standard."
+
+[[entry]]
+pattern = "/home"
+os = "linux"
+level = "protected"
+scope = "exact"
+note = "Parent folder of the users' home folders, defined by the Filesystem Hierarchy Standard."
+
+[[entry]]
+pattern = "/home/*"
+os = "linux"
+level = "protected"
+scope = "exact"
+note = "Home folder of a user account."
+
+[[entry]]
+pattern = "/mnt"
+os = "linux"
+level = "protected"
+scope = "exact"
+note = "Folder for temporarily mounted filesystems, defined by the Filesystem Hierarchy Standard."
+
+[[entry]]
+pattern = "/media"
+os = "linux"
+level = "protected"
+scope = "exact"
+note = "Mount points of removable media, defined by the Filesystem Hierarchy Standard."
+
+[[entry]]
+pattern = "/tmp"
+os = "linux"
+level = "protected"
+scope = "exact"
+note = "Temporary files folder defined by the Filesystem Hierarchy Standard."
+
+[[entry]]
+pattern = "/snap"
+os = "linux"
+level = "protected"
+scope = "exact"
+note = "Mounted Snap packages, managed by snapd."
+
+[[entry]]
+pattern = "/lost+found"
+os = "linux"
+level = "protected"
+note = "Folder where the filesystem check puts files it recovers."
+
+[[entry]]
+pattern = "/var/lib/docker"
+os = "linux"
+level = "protected"
+note = "Docker Engine data with images, containers and volumes, managed by Docker."
+
+[[entry]]
+pattern = "/var/lib/containers"
+os = "linux"
+level = "protected"
+note = "Container storage of Podman and Buildah, managed by containers/storage."
+
+[[entry]]
+pattern = "/var/lib/snapd"
+os = "linux"
+level = "protected"
+note = "Snap package data, managed by snapd."
+
+[[entry]]
+pattern = "/var/lib/flatpak"
+os = "linux"
+level = "protected"
+note = "System-wide Flatpak applications and runtimes, managed by Flatpak."
+
+[[entry]]
+pattern = "/var/lib/libvirt"
+os = "linux"
+level = "protected"
+note = "Virtual machine definitions and disk images, managed by libvirt."
+
+[[entry]]
+pattern = "/var/lib/mysql"
+os = "linux"
+level = "protected"
+note = "Default data directory of MySQL and MariaDB, managed by the database server."
+
+[[entry]]
+pattern = "/var/lib/postgresql"
+os = "linux"
+level = "protected"
+note = "Data directory of PostgreSQL on Debian-based systems, managed by the database server."
+
+[[entry]]
+pattern = "/var/lib/apt"
+os = "linux"
+level = "protected"
+note = "Package lists and state managed by APT."
+
+[[entry]]
+pattern = "/var/lib/systemd"
+os = "linux"
+level = "protected"
+note = "State data of systemd, managed by systemd."
+
+# ---------------------------------------------------------- Both systems
+
+[[entry]]
+pattern = "~"
+level = "protected"
+scope = "exact"
+note = "The home folder of the current user."

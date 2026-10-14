@@ -5,7 +5,7 @@
 26 23 0:23 / /sys/fs/selinux rw,nosuid,noexec,relatime shared:8 - selinuxfs selinuxfs rw
 27 98 0:24 / /run rw,nosuid,nodev,seclabel shared:3 - tmpfs tmpfs rw,size=3200000k,nr_inodes=800000,mode=755,inode64
 98 1 0:42 /root / rw,relatime shared:1 - btrfs /dev/mapper/luks-5e3c1a0a-1d3f-4f0b-9a5e-0c2f3d4e5f60 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/root
-99 98 0:43 /home /home rw,relatime shared:55 - btrfs /dev/mapper/luks-5e3c1a0a-1d3f-4f0b-9a5e-0c2f3d4e5f60 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=256,subvol=/home
+99 98 0:42 /home /home rw,relatime shared:55 - btrfs /dev/mapper/luks-5e3c1a0a-1d3f-4f0b-9a5e-0c2f3d4e5f60 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=256,subvol=/home
 100 98 259:5 / /boot rw,relatime shared:56 - ext4 /dev/nvme0n1p5 rw,seclabel
 101 100 259:4 / /boot/efi rw,relatime shared:57 - vfat /dev/nvme0n1p4 rw,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro
 110 27 0:50 / /run/user/1000 rw,nosuid,nodev,relatime shared:70 - tmpfs tmpfs rw,size=1600000k,nr_inodes=400000,mode=700,uid=1000,gid=1000,inode64

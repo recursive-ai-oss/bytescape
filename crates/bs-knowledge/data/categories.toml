@@ -1,0 +1,108 @@
+# What a file is, from its extension and from where it sits.
+#
+# The categories are the colors of the map (video, images, audio, documents,
+# archives, apps-system, code-dev, cache-temp); `other` has no color of its
+# own. The category numbers handed to the rest of the program are fixed: 0 is
+# unclassified and drawn as Other, and 1 to 8 follow the order above.
+#
+# Extensions are written without the dot and in lower case; matching ignores
+# case. An extension may appear under one category only. A category here
+# describes the kind of file, not whether anything may be removed.
+
+[[extensions]]
+category = "video"
+list = [
+  "mp4", "m4v", "mkv", "mov", "avi", "wmv", "flv", "f4v", "webm", "mpg", "mpeg",
+  "mpe", "m2ts", "mts", "vob", "3gp", "ogv", "divx", "asf", "rm", "rmvb",
+]
+
+[[extensions]]
+category = "images"
+list = [
+  "jpg", "jpeg", "jpe", "png", "gif", "bmp", "tif", "tiff", "webp", "heic",
+  "heif", "avif", "jxl", "svg", "ico", "icns", "raw", "cr2", "cr3", "nef",
+  "arw", "dng", "orf", "rw2", "psd", "xcf", "tga", "dds", "exr",
+]
+
+[[extensions]]
+category = "audio"
+list = [
+  "mp3", "flac", "wav", "aac", "m4a", "ogg", "oga", "opus", "wma", "aiff",
+  "aif", "ape", "mid", "midi", "amr", "mka", "wv",
+]
+
+[[extensions]]
+category = "documents"
+list = [
+  "pdf", "doc", "docx", "docm", "xls", "xlsx", "xlsm", "ppt", "pptx", "odt",
+  "ods", "odp", "rtf", "txt", "md", "epub", "mobi", "djvu", "csv", "tsv",
+  "xps", "pages", "numbers", "key",
+]
+
+[[extensions]]
+category = "archives"
+list = [
+  "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "zst",
+  "lz", "lz4", "lzma", "cab", "iso", "img", "dmg", "vhd", "vhdx", "vmdk",
+  "vdi", "qcow2", "wim", "esd", "squashfs",
+]
+
+[[extensions]]
+category = "apps-system"
+list = [
+  "exe", "dll", "sys", "msi", "msix", "appx", "drv", "ocx", "cpl", "scr", "so",
+  "ko", "deb", "rpm", "apk", "appimage", "snap",
+]
+
+[[extensions]]
+category = "code-dev"
+list = [
+  "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "rs", "go", "py", "pyc", "js",
+  "mjs", "cjs", "ts", "tsx", "jsx", "java", "kt", "kts", "swift", "cs", "vb",
+  "fs", "rb", "php", "pl", "pm", "lua", "sh", "bash", "zsh", "ps1", "bat",
+  "cmd", "sql", "json", "yaml", "yml", "toml", "xml", "html", "htm", "css",
+  "scss", "sass", "less", "vue", "svelte", "dart", "scala", "clj", "hs", "ml",
+  "erl", "ex", "exs", "r", "jl", "o", "a", "lib", "obj", "pdb", "class", "jar",
+  "whl", "gem", "nupkg", "rlib",
+]
+
+[[extensions]]
+category = "cache-temp"
+list = ["tmp", "temp", "cache", "part", "crdownload", "partial", "swp", "swo"]
+
+# Places whose contents take a category whatever the file type. A rule applies
+# to the folder and everything below it. The patterns follow the rules in
+# recognition.toml; folders with a note there also give their category to the
+# files inside, unless the entry says `contents = "own"`.
+
+[[paths]]
+pattern = "**/.cache"
+category = "cache-temp"
+
+[[paths]]
+pattern = "**/.pytest_cache"
+category = "cache-temp"
+
+[[paths]]
+pattern = "**/.mypy_cache"
+category = "cache-temp"
+
+[[paths]]
+pattern = "**/.ruff_cache"
+category = "cache-temp"
+
+[[paths]]
+pattern = "**/.parcel-cache"
+category = "cache-temp"
+
+[[paths]]
+pattern = "**/CMakeFiles"
+category = "code-dev"
+
+[[paths]]
+pattern = "**/.idea"
+category = "code-dev"
+
+[[paths]]
+pattern = "**/.vs"
+category = "code-dev"
