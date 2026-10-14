@@ -116,6 +116,11 @@ version = "0.1.0"
 [[package]]
 name = "bs-platform"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "proptest",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "bs-render"
