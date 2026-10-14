@@ -56,11 +56,16 @@ pub(crate) const MAX_AUTO_THREADS: usize = 16;
 mod tests {
     use super::*;
 
+    // The sysfs tests build a Linux sysfs layout (`dev/block/8:0/...`), whose
+    // names Windows rejects, and sysfs only exists on Linux.
+
     /// A directory that removes itself when dropped, even if the test that
     /// made it fails. It lives beside the test executable (in the build
     /// directory), not in the system's temporary directory.
+    #[cfg(target_os = "linux")]
     struct Sysfs(std::path::PathBuf);
 
+    #[cfg(target_os = "linux")]
     impl std::ops::Deref for Sysfs {
         type Target = std::path::Path;
 
@@ -69,12 +74,14 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     impl Drop for Sysfs {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn fake_sysfs(files: &[(&str, &str)]) -> Sysfs {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
@@ -93,6 +100,7 @@ mod tests {
         sysfs
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn whole_disk_and_partition_are_both_found() {
         let sys = fake_sysfs(&[
@@ -113,7 +121,7 @@ mod tests {
         assert_eq!(rotational_at(&sys, 9, 9), None);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_partition_uses_its_disks_queue() {
         // Real sysfs: /sys/dev/block/8:1 is a symlink to .../block/sda/sda1, so
@@ -129,6 +137,7 @@ mod tests {
         assert_eq!(rotational_at(&sys, 8, 1), Some(true));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn garbage_in_sysfs_is_unknown() {
         let sys = fake_sysfs(&[("dev/block/8:0/queue/rotational", "maybe\n")]);
