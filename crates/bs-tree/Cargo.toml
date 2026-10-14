@@ -9,5 +9,14 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+# Counting allocator for the memory benchmark.
+stats_alloc = "0.1"
+
+[[bench]]
+name = "memory"
+harness = false
+
 [lints]
 workspace = true
