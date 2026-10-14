@@ -90,65 +90,15 @@ deny = [
     { crate = "trust-dns-server" },
 ]
 
-# Features that open sockets or reach the network. The Windows API crates gate
-# their networking functions behind the `Win32_Networking*` features and the
-# URL download functions behind `Win32_System_Com_Urlmon`. A feature cannot
-# be limited to certain parent crates here, so an exception means removing the
-# one feature from its list below, with a comment, after the same review as
-# an entry in xtask/net-ban.allow.
-[[bans.features]]
-crate = "windows"
-deny = [
-    "Win32_Networking",
-    "Win32_Networking_ActiveDirectory",
-    "Win32_Networking_BackgroundIntelligentTransferService",
-    "Win32_Networking_Clustering",
-    "Win32_Networking_HttpServer",
-    "Win32_Networking_Ldap",
-    "Win32_Networking_NetworkListManager",
-    "Win32_Networking_RemoteDifferentialCompression",
-    "Win32_Networking_WebSocket",
-    "Win32_Networking_WinHttp",
-    "Win32_Networking_WinInet",
-    "Win32_Networking_WinSock",
-    "Win32_Networking_WindowsWebServices",
-    "Win32_System_Com_Urlmon",
-]
-
-[[bans.features]]
-crate = "windows-sys"
-deny = [
-    "Win32_Networking",
-    "Win32_Networking_ActiveDirectory",
-    "Win32_Networking_BackgroundIntelligentTransferService",
-    "Win32_Networking_Clustering",
-    "Win32_Networking_HttpServer",
-    "Win32_Networking_Ldap",
-    "Win32_Networking_NetworkListManager",
-    "Win32_Networking_RemoteDifferentialCompression",
-    "Win32_Networking_WebSocket",
-    "Win32_Networking_WinHttp",
-    "Win32_Networking_WinInet",
-    "Win32_Networking_WinSock",
-    "Win32_Networking_WindowsWebServices",
-    "Win32_System_Com_Urlmon",
-]
-
-[[bans.features]]
-crate = "tokio"
-deny = ["net"]
-
-[[bans.features]]
-crate = "mio"
-deny = ["net"]
-
-[[bans.features]]
-crate = "nix"
-deny = ["net", "socket"]
-
-[[bans.features]]
-crate = "winapi"
-deny = ["winsock2", "ws2def", "ws2ipdef", "ws2tcpip", "winhttp", "wininet", "urlmon", "mswsock"]
+# Crate features that open sockets (the Windows `Win32_Networking*` features,
+# `tokio` and `mio` with `net`, `rustix` with `net`, and others) are NOT banned
+# here, on purpose. cargo-deny judges features on one graph that merges every
+# platform together, so a Linux-only dependency that turns on a Windows API
+# feature would make it reject the Windows build, and an exception could only
+# be written by deleting the ban for every crate. `cargo xtask net-ban`
+# resolves features exactly for each of the four targets, and it also supports
+# exceptions limited to named parent crates (xtask/net-ban.allow), so all
+# feature bans live there.
 
 [sources]
 unknown-registry = "deny"

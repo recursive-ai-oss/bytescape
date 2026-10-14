@@ -28,7 +28,7 @@ To build it yourself today, see [docs/building.md](docs/building.md).
 
 ## Privacy
 
-**Bytescape never connects to the internet.** There is no networking code in either program, no update check, no telemetry and no account. Two independent checks in the build reject the networking libraries, library features (including the Windows networking APIs) and system calls that we know of, so adding one fails the build. They are a backstop for code review, not a proof: a networking library they do not know about would not be caught.
+**Bytescape never connects to the internet.** There is no networking code in either program, no update check, no telemetry and no account. Two independent checks in the build reject the networking libraries that we know of. One of them also rejects library features (including the Windows networking APIs) and system calls, so adding any of these fails the build. They are a backstop for code review, not a proof: a networking library they do not know about would not be caught.
 
 What stays on your machine:
 

@@ -10,9 +10,11 @@
 //! - a crate manifest other than those crates mentions `unsafe_code`;
 //! - any attribute anywhere allows the missing-safety-comment lint or the
 //!   `unsafe_op_in_unsafe_fn` lint;
-//! - the root manifest no longer sets `unsafe_code = "deny"`.
+//! - the root manifest no longer sets `unsafe_code = "deny"`;
+//! - a member manifest lacks `[lints] workspace = true`, which would switch
+//!   the workspace lints off for that crate.
 
-use crate::util::{Finding, read_text, relative, walk_files};
+use crate::util::{Finding, LineCounter, read_text, relative, walk_files};
 use std::path::Path;
 
 /// The crates that may allow `unsafe_code`, with the reason.
@@ -50,6 +52,7 @@ fn is_ident_byte(byte: u8) -> bool {
 fn relaxations(text: &str) -> Vec<(usize, String)> {
     let bytes = text.as_bytes();
     let mut found = Vec::new();
+    let mut lines = LineCounter::default();
     let mut index = 0;
     while index < bytes.len() {
         let starts_word =
@@ -84,7 +87,7 @@ fn relaxations(text: &str) -> Vec<(usize, String)> {
                     }
                     close += 1;
                 }
-                let line = 1 + bytes[..index].iter().filter(|&&b| b == b'\n').count();
+                let line = lines.line_at(bytes, index);
                 found.push((line, text[open..close.min(bytes.len())].to_string()));
             }
         }
@@ -133,6 +136,20 @@ pub fn check_source(rel: &str, text: &str) -> Vec<Finding> {
     findings
 }
 
+/// Does the manifest have a `[lints]` table containing `workspace = true`?
+fn inherits_workspace_lints(text: &str) -> bool {
+    let mut in_lints = false;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            in_lints = line.replace(' ', "") == "[lints]";
+        } else if in_lints && line.replace(' ', "") == "workspace=true" {
+            return true;
+        }
+    }
+    false
+}
+
 /// Checks one manifest's text.
 pub fn check_manifest(rel: &str, text: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -148,7 +165,14 @@ pub fn check_manifest(rel: &str, text: &str) -> Vec<Finding> {
                 "the workspace must keep `unsafe_code = \"deny\"`",
             ));
         }
-    } else if crate_of(rel).is_some() && !may_allow(rel) {
+    } else if !inherits_workspace_lints(text) {
+        findings.push(Finding::new(
+            rel,
+            None,
+            "must contain `[lints]` with `workspace = true`, so the workspace lints apply",
+        ));
+    }
+    if rel != "Cargo.toml" && crate_of(rel).is_some() && !may_allow(rel) {
         for (index, line) in text.lines().enumerate() {
             let code = line.split('#').next().unwrap_or("");
             if mentions(code, UNSAFE_LINT) {

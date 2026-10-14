@@ -172,6 +172,41 @@ pub fn cargo_tree_features(root: &Path, target: &str) -> Result<String, String> 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Turns increasing byte offsets into 1-based line numbers by counting line
+/// breaks only in the bytes between one query and the next, so a whole scan
+/// reads each byte once.
+#[derive(Debug)]
+pub struct LineCounter {
+    position: usize,
+    line: usize,
+}
+
+impl Default for LineCounter {
+    fn default() -> Self {
+        Self {
+            position: 0,
+            line: 1,
+        }
+    }
+}
+
+impl LineCounter {
+    /// The line of `index`. Offsets must not decrease between calls; if one
+    /// does, counting restarts from the beginning of the text.
+    pub fn line_at(&mut self, bytes: &[u8], index: usize) -> usize {
+        if index < self.position {
+            *self = Self::default();
+        }
+        let end = index.min(bytes.len());
+        self.line += bytes[self.position..end]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count();
+        self.position = end;
+        self.line
+    }
+}
+
 /// Parses an allow file: one entry per line, `#` starts a comment, blank
 /// lines are ignored. Entries are returned trimmed, comment removed.
 pub fn parse_allow_lines(text: &str) -> Vec<String> {

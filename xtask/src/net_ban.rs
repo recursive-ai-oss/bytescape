@@ -8,8 +8,10 @@
 //!    known networking system call.
 //!
 //! It is a backstop for review, not a proof: a networking library it does not
-//! know about is not caught. `deny.toml` repeats the crate and feature lists
-//! as a second, independent layer.
+//! know about is not caught. `deny.toml` repeats the crate list as a second,
+//! independent layer. Feature bans live here only: `cargo-deny` judges
+//! features on one graph merged across platforms, which is wrong for the
+//! platform-specific Windows API features.
 //!
 //! Exceptions live in `xtask/net-ban.allow`. A crate or feature exception
 //! must name the crate or crates that pull it in (`via`): it is honoured only
@@ -17,8 +19,8 @@
 //! never when it is in the elevated helper's dependency closure.
 
 use crate::util::{
-    Finding, TARGETS, cargo_metadata, cargo_tree_features, normalize_crate_name, package_names,
-    parse_allow_lines, read_text, relative, walk_files,
+    Finding, LineCounter, TARGETS, cargo_metadata, cargo_tree_features, normalize_crate_name,
+    package_names, parse_allow_lines, read_text, relative, walk_files,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -326,13 +328,29 @@ fn banned_items(name: &str, features: &[String]) -> Vec<(Kind, String)> {
     items
 }
 
+/// Do any feature bans apply to this crate?
+pub fn feature_relevant(name: &str) -> bool {
+    BANNED_FEATURES.iter().any(|(banned, _)| *banned == name)
+        || BANNED_FEATURE_PREFIXES
+            .iter()
+            .any(|(banned, _)| *banned == name)
+}
+
 /// Replaces the features in a `cargo metadata` document with the exact ones
 /// for the target, taken from `cargo tree` output (see
 /// [`cargo_tree_features`]). The metadata lists features that another
 /// platform's dependencies turn on, which would flag the Windows API crates on
-/// Windows because of a Linux-only dependency. A package the tree does not
-/// list is not built for the target and gets no features.
-pub fn refine_features(metadata: &mut Value, tree: &str) {
+/// Windows because of a Linux-only dependency.
+///
+/// This fails closed: it is an error when a workspace member, or a package
+/// whose features the bans look at (see [`feature_relevant`]) and that has
+/// features in the metadata, is missing from the tree output. Output that
+/// stops parsing would otherwise leave every package without features, and
+/// every feature ban would silently pass. Other packages may be absent: the
+/// metadata also lists dependencies that this target's configuration does not
+/// build (for example `libc` behind a backend the target does not use), and
+/// no ban looks at their features.
+pub fn refine_features(metadata: &mut Value, tree: &str) -> Result<(), String> {
     let mut exact: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     for line in tree.lines() {
         let Some((package, features)) = line.rsplit_once('|') else {
@@ -372,8 +390,33 @@ pub fn refine_features(metadata: &mut Value, tree: &str) {
                 .collect()
         })
         .unwrap_or_default();
+    let members: BTreeSet<String> = metadata["workspace_members"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut missing = Vec::new();
     if let Some(nodes) = metadata["resolve"]["nodes"].as_array_mut() {
         for node in nodes {
+            let id = node["id"].as_str().unwrap_or("").to_string();
+            let listed = identity.get(&id).is_some_and(|key| exact.contains_key(key));
+            let has_features = node["features"]
+                .as_array()
+                .is_some_and(|list| !list.is_empty());
+            let relevant = identity
+                .get(&id)
+                .is_some_and(|(name, _)| feature_relevant(name));
+            if !listed && (members.contains(&id) || (has_features && relevant)) {
+                let label = identity
+                    .get(&id)
+                    .map(|(name, version)| format!("{name} {version}"))
+                    .unwrap_or(id);
+                missing.push(label);
+            }
             let features: Vec<String> = node["id"]
                 .as_str()
                 .and_then(|id| identity.get(id))
@@ -383,6 +426,28 @@ pub fn refine_features(metadata: &mut Value, tree: &str) {
             node["features"] = serde_json::json!(features);
         }
     }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        missing.sort();
+        missing.dedup();
+        let shown: Vec<&str> = missing.iter().take(5).map(String::as_str).collect();
+        Err(format!(
+            "cargo tree does not list {} package(s) that cargo metadata has (for example {}); \
+             the feature check cannot be trusted",
+            missing.len(),
+            shown.join(", ")
+        ))
+    }
+}
+
+/// A `via` that names the item's own crate, or one of the workspace's crates,
+/// removes every path to the item and so would admit it from anywhere.
+fn via_is_unscoped(entry: &Entry, item_crate: &str, members: &BTreeSet<String>) -> bool {
+    entry
+        .via
+        .iter()
+        .any(|name| name == item_crate || members.contains(name))
 }
 
 /// Checks one `cargo metadata` document.
@@ -400,6 +465,7 @@ pub fn check_metadata(metadata: &Value, target: &str, allow: &Allow) -> Vec<Find
         .find(|id| graph.name(id) == HELPER)
         .map(|id| graph.reachable(std::slice::from_ref(id), &[], true))
         .unwrap_or_default();
+    let member_names: BTreeSet<String> = graph.roots.iter().map(|id| graph.name(id)).collect();
     let mut findings = Vec::new();
     for id in graph.deps.keys() {
         let name = graph.name(id);
@@ -420,6 +486,9 @@ pub fn check_metadata(metadata: &Value, target: &str, allow: &Allow) -> Vec<Find
                 )),
                 Some(_) if helper_closure.contains(id) => Some(format!(
                     "is in the dependency closure of {HELPER}, where no exception applies ({target})"
+                )),
+                Some(entry) if via_is_unscoped(entry, &name, &member_names) => Some(format!(
+                    "its `via` names the item's own crate or a workspace crate, which scopes nothing ({target})"
                 )),
                 Some(entry) => {
                     let outside = graph.reachable(&graph.roots, &entry.via, false);
@@ -472,6 +541,7 @@ const IDENTIFIER_PREFIXES: [&str; 7] = [
 pub fn source_hits(text: &str) -> Vec<(usize, &'static str)> {
     let bytes = text.as_bytes();
     let mut hits = Vec::new();
+    let mut lines = LineCounter::default();
     let mut index = 0;
     while index < bytes.len() {
         if !is_word_start(bytes, index) {
@@ -480,7 +550,7 @@ pub fn source_hits(text: &str) -> Vec<(usize, &'static str)> {
         }
         let end = word_end(bytes, index);
         let word = &text[index..end];
-        let line = line_of(bytes, index);
+        let line = lines.line_at(bytes, index);
         if (word == "std" || word == "core") && names_segment_after(bytes, end, "net") {
             hits.push((line, SOURCE_MESSAGE_STD));
         } else if word == "libc" && names_segment_after(bytes, end, "socket") {
@@ -530,10 +600,6 @@ fn skip_space(bytes: &[u8], mut index: usize) -> usize {
         index += 1;
     }
     index
-}
-
-fn line_of(bytes: &[u8], index: usize) -> usize {
-    1 + bytes[..index].iter().filter(|&&byte| byte == b'\n').count()
 }
 
 fn is_segment(bytes: &[u8], index: usize, segment: &str) -> bool {
@@ -621,7 +687,8 @@ pub fn run(root: &Path) -> Result<Vec<Finding>, String> {
         .collect();
     for target in TARGETS {
         let mut metadata = cargo_metadata(root, target)?;
-        refine_features(&mut metadata, &cargo_tree_features(root, target)?);
+        refine_features(&mut metadata, &cargo_tree_features(root, target)?)
+            .map_err(|message| format!("{target}: {message}"))?;
         findings.extend(check_metadata(&metadata, target, &allow));
     }
     findings.extend(scan_sources(root, &allow));

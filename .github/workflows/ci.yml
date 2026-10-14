@@ -169,16 +169,14 @@ jobs:
         run: cargo xtask wording
 
   # ARM64 legs. GitHub provides these runners free of charge to public
-  # repositories only, so the job runs only when the repository is public,
-  # instead of waiting forever for a runner that does not exist. The test
-  # reads the runner's own `repository_visibility` value, which every event
-  # type (pushes, schedules and manual runs included) carries; if it were
-  # ever missing the job would be skipped, never queued. It is a separate
-  # job, so it can be left out of the required checks until it has proven
-  # stable.
+  # repositories only, so the job waits for a repository variable instead of
+  # queueing forever on a runner that does not exist. A maintainer sets
+  # `ARM64_CI` to `true` (Settings, Secrets and variables, Actions, Variables)
+  # when the repository goes public. It is a separate job, so it can be left
+  # out of the required checks until it has proven stable.
   arm64:
     name: arm64 (${{ matrix.os }})
-    if: ${{ github.repository_visibility == 'public' }}
+    if: ${{ vars.ARM64_CI == 'true' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:

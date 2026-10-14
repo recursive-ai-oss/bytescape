@@ -216,18 +216,86 @@ fn refine_features_uses_the_exact_features_for_the_target() {
         ("bytescape", &[], &[("windows-sys", None), ("rustix", None)]),
         ("windows-sys", &["Win32_Networking_WinSock"], &[]),
         ("rustix", &["std"], &[]),
-        ("unbuilt", &["net"], &[]),
+        ("unbuilt", &[], &[]),
     ]);
     assert_eq!(flagged(&doc), 1);
-    let tree = "bytescape v0.1.0 (/some/path)|\n\
-        windows-sys v1.0.0|Win32_Foundation,default\n\
-        rustix v1.0.0|net,std\n\
-        rustix v1.0.0|std\n";
-    net_ban::refine_features(&mut doc, tree);
+    let tree = tree_listing();
+    net_ban::refine_features(&mut doc, &tree).expect("refines");
     // The windows-sys networking feature is gone; rustix gains its exact net feature.
     let findings = net_ban::check_metadata(&doc, "t", &no_allow());
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].subject, "rustix/net");
+}
+
+fn tree_listing() -> String {
+    [
+        "bytescape v1.0.0 (/some/path)|",
+        "windows-sys v1.0.0|Win32_Foundation,default",
+        "rustix v1.0.0|net,std",
+        "rustix v1.0.0|std",
+        "unbuilt v1.0.0|",
+    ]
+    .join("\n")
+}
+
+fn refinable() -> Value {
+    metadata_with_members(
+        &[
+            ("bytescape", &[], &[("windows-sys", None), ("rustix", None)]),
+            ("windows-sys", &["Win32_Networking_WinSock"], &[]),
+            ("rustix", &["std"], &[]),
+            ("plain", &[], &[]),
+        ],
+        &["bytescape"],
+    )
+}
+
+#[test]
+fn refine_features_fails_closed_when_the_tree_output_is_empty_or_unparsable() {
+    for tree in ["", "\n\n", "no separator here\n", "|||\n"] {
+        let mut doc = refinable();
+        let error = net_ban::refine_features(&mut doc, tree).expect_err("must fail");
+        assert!(error.contains("cannot be trusted"), "{error}");
+    }
+}
+
+#[test]
+fn refine_features_fails_when_a_workspace_member_is_missing() {
+    let tree = "windows-sys v1.0.0|Win32_Foundation\nrustix v1.0.0|std\nplain v1.0.0|\n";
+    let mut doc = refinable();
+    let error = net_ban::refine_features(&mut doc, tree).expect_err("must fail");
+    assert!(error.contains("bytescape"), "{error}");
+}
+
+#[test]
+fn refine_features_fails_when_a_package_the_feature_bans_cover_is_missing() {
+    let tree = "bytescape v1.0.0|\nrustix v1.0.0|std\nplain v1.0.0|\n";
+    let mut doc = refinable();
+    let error = net_ban::refine_features(&mut doc, tree).expect_err("must fail");
+    assert!(error.contains("windows-sys"), "{error}");
+}
+
+#[test]
+fn refine_features_accepts_packages_the_tree_leaves_out_when_no_ban_looks_at_them() {
+    // The metadata also lists dependencies the target does not build; their
+    // features matter to no ban.
+    let mut doc = metadata_with_members(
+        &[
+            ("bytescape", &[], &[("windows-sys", None), ("errno", None)]),
+            ("windows-sys", &["Win32_Foundation"], &[]),
+            ("errno", &["std"], &[]),
+        ],
+        &["bytescape"],
+    );
+    let tree = "bytescape v1.0.0|\nwindows-sys v1.0.0|Win32_Foundation\n";
+    net_ban::refine_features(&mut doc, tree).expect("errno is not covered by any feature ban");
+}
+
+#[test]
+fn refine_features_accepts_a_featureless_package_the_tree_leaves_out() {
+    let tree = "bytescape v1.0.0|\nwindows-sys v1.0.0|Win32_Foundation\nrustix v1.0.0|std\n";
+    let mut doc = refinable();
+    net_ban::refine_features(&mut doc, tree).expect("plain has no features, so it may be absent");
 }
 
 // ---- net-ban: the allowlist ----
@@ -312,6 +380,36 @@ fn an_entry_never_applies_inside_the_helper_closure() {
         "{}",
         findings[0]
     );
+}
+
+#[test]
+fn a_via_that_scopes_nothing_does_not_admit_the_item() {
+    // `via` naming the item's own crate, or a workspace crate that holds the
+    // dependency, removes every path to the item; that must not admit it.
+    let direct = metadata_with_members(
+        &[
+            ("bs-ui", &[], &[("rustix", None), ("socket2", None)]),
+            ("rustix", &["net"], &[]),
+            ("socket2", &[], &[]),
+        ],
+        &["bs-ui"],
+    );
+    for line in [
+        "feature rustix/net via rustix",
+        "feature rustix/net via bs-ui",
+        "feature rustix/net via winit,bs-ui",
+        "crate socket2 via socket2",
+        "crate socket2 via bs-ui",
+    ] {
+        let allow = net_ban::Allow::parse(&format!("{line}\n"));
+        let findings = net_ban::check_metadata(&direct, "t", &allow);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("scopes nothing")),
+            "{line}: {findings:?}"
+        );
+    }
 }
 
 #[test]
@@ -463,45 +561,23 @@ fn deny_toml_repeats_the_crate_list() {
 }
 
 #[test]
-fn deny_toml_repeats_the_feature_list() {
+fn deny_toml_leaves_feature_bans_to_net_ban() {
+    // cargo-deny cannot judge features per target, so a feature ban there would
+    // reject graphs the rules allow; net-ban holds all of them.
     let deny = deny_toml();
-    // Every banned feature the dependency graph can carry, except the socket
-    // feature of the display-server transport crate: `deny.toml` cannot limit
-    // a feature to certain parent crates, so only `net-ban` covers it.
-    for (name, feature) in net_ban::BANNED_FEATURES {
-        if name == "rustix" {
-            continue;
-        }
-        let section = deny
-            .split("[[bans.features]]")
-            .find(|part| part.contains(&format!("crate = \"{name}\"")))
-            .unwrap_or_else(|| panic!("deny.toml has no feature ban for {name}"));
-        assert!(
-            section.contains(&format!("\"{feature}\"")),
-            "deny.toml lacks {name}/{feature}"
-        );
-    }
-    for (name, prefix) in net_ban::BANNED_FEATURE_PREFIXES {
-        let section = deny
-            .split("[[bans.features]]")
-            .find(|part| part.contains(&format!("crate = \"{name}\"")))
-            .unwrap_or_else(|| panic!("deny.toml has no feature ban for {name}"));
-        assert!(
-            section.contains(&format!("\"{prefix}")),
-            "deny.toml lacks the {name}/{prefix} family"
-        );
-    }
-    for feature in [
-        "Win32_Networking_WinSock",
-        "Win32_Networking_WinHttp",
-        "Win32_Networking_WinInet",
-        "Win32_System_Com_Urlmon",
-    ] {
-        assert!(
-            deny.contains(&format!("\"{feature}\"")),
-            "deny.toml lacks {feature}"
-        );
-    }
+    assert!(
+        !deny.contains("[[bans.features]]"),
+        "feature bans belong in net-ban"
+    );
+    assert!(
+        deny.contains("net-ban"),
+        "deny.toml should say where the feature bans live"
+    );
+    assert!(
+        net_ban::BANNED_FEATURE_PREFIXES
+            .iter()
+            .any(|(name, _)| *name == "windows-sys")
+    );
 }
 
 #[test]
@@ -932,16 +1008,18 @@ fn unsafe_allow_ignores_other_lints_and_plain_words() {
     assert!(unsafe_allow::check_source("crates/bs-ui/src/lib.rs", text).is_empty());
 }
 
+const INHERITING: &str = "[package]\nname = \"x\"\n\n[lints]\nworkspace = true\n";
+
 #[test]
 fn unsafe_allow_checks_manifests() {
     let setting = join(&["unsafe", "_code = \"allow\"\n"]);
-    let manifest = format!("[lints.rust]\n{setting}");
+    let manifest = format!("{INHERITING}\n[lints.rust]\n{setting}");
     assert_eq!(
         unsafe_allow::check_manifest("crates/bs-ui/Cargo.toml", &manifest).len(),
         1
     );
     assert!(unsafe_allow::check_manifest("crates/bs-platform/Cargo.toml", &manifest).is_empty());
-    let commented = format!("# {setting}");
+    let commented = format!("{INHERITING}\n# {setting}");
     assert!(unsafe_allow::check_manifest("crates/bs-ui/Cargo.toml", &commented).is_empty());
 
     let denying = join(&["[workspace.lints.rust]\nunsafe", "_code = \"deny\"\n"]);
@@ -951,6 +1029,33 @@ fn unsafe_allow_checks_manifests() {
         unsafe_allow::check_manifest("Cargo.toml", &relaxed).len(),
         1
     );
+}
+
+#[test]
+fn unsafe_allow_requires_every_member_to_inherit_the_workspace_lints() {
+    let without = "[package]\nname = \"x\"\n";
+    let other_table = "[package]\nname = \"x\"\n\n[dependencies]\nworkspace = true\n";
+    let not_true = "[lints]\nworkspace = false\n";
+    for rel in [
+        "crates/bs-ui/Cargo.toml",
+        "crates/bs-platform/Cargo.toml",
+        "xtask/Cargo.toml",
+    ] {
+        for text in [without, other_table, not_true] {
+            let findings = unsafe_allow::check_manifest(rel, text);
+            assert_eq!(findings.len(), 1, "{rel}: {text}");
+            assert!(findings[0].message.contains("workspace = true"));
+        }
+        assert!(
+            unsafe_allow::check_manifest(rel, INHERITING).is_empty(),
+            "{rel}"
+        );
+        let spaced = "[ lints ]\nworkspace   =   true  # inherit\n";
+        assert!(
+            unsafe_allow::check_manifest(rel, spaced).is_empty(),
+            "{rel} spaced"
+        );
+    }
 }
 
 #[test]
@@ -984,4 +1089,42 @@ fn build_dates_are_utc_calendar_dates() {
     assert_eq!(build_date(Some(" 1700000000\n")), "2023-11-14");
     assert_eq!(build_date(Some("not a number")), "unknown");
     assert_eq!(build_date(None), "unknown");
+}
+
+// ---- line numbers ----
+
+#[test]
+fn line_counter_counts_incrementally() {
+    let text = "a\nb\n\nc";
+    let bytes = text.as_bytes();
+    let mut lines = xtask::util::LineCounter::default();
+    assert_eq!(lines.line_at(bytes, 0), 1);
+    assert_eq!(lines.line_at(bytes, 2), 2);
+    assert_eq!(lines.line_at(bytes, 4), 3);
+    assert_eq!(lines.line_at(bytes, 5), 4);
+    assert_eq!(lines.line_at(bytes, 5), 4);
+    // Going backwards restarts, and still answers correctly.
+    assert_eq!(lines.line_at(bytes, 1), 1);
+    assert_eq!(lines.line_at(bytes, 100), 4);
+}
+
+#[test]
+fn scanners_report_the_right_lines_and_handle_large_files() {
+    let planted = join(&["let f = AF_", "INET;"]);
+    let mut source = String::new();
+    for _ in 0..200_000 {
+        source.push_str("let a_perfectly_ordinary_word = 1;\n");
+    }
+    source.push_str(&planted);
+    source.push('\n');
+    let hits = net_ban::source_hits(&source);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, 200_001);
+
+    let attr = allow_attr(&join(&["unsafe", "_code"]));
+    let mut file = "fn f() {}\n".repeat(100_000);
+    file.push_str(&attr);
+    let findings = unsafe_allow::check_source("crates/bs-ui/src/lib.rs", &file);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].line, Some(100_001));
 }
