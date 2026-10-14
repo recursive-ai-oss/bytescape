@@ -200,3 +200,72 @@ jobs:
       - name: Project checks
         if: ${{ !cancelled() }}
         run: cargo xtask guards
+
+  # Cold-cache walker benchmark. It needs the operating system's file cache to
+  # be emptied before each run, which takes root, so it runs on the
+  # GitHub-hosted runner (passwordless sudo, throwaway machine) and only on
+  # request or on the weekly schedule. It is not a required check and never
+  # runs on pull requests. The benchmark itself lives in the script named
+  # below; the job skips with a notice until that script exists.
+  bench-cold:
+    name: bench-cold
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # The script empties the file cache with sudo and writes large data
+      # sets; it must refuse to run anywhere that is not a throwaway machine.
+      BYTESCAPE_DISPOSABLE_HOST: "1"
+      BENCH_SCRIPT: crates/bs-scan/bench/g4.sh
+      BENCH_RESULTS: ${{ github.workspace }}/bench-results
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Look for the benchmark script
+        id: script
+        run: |
+          if [ -f "$BENCH_SCRIPT" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=bench-cold skipped::$BENCH_SCRIPT does not exist yet, so there is nothing to measure. The job runs for real once the script is added."
+          fi
+      - uses: ./.github/actions/setup-rust
+        if: steps.script.outputs.present == 'true'
+      - name: Build release
+        if: steps.script.outputs.present == 'true'
+        run: cargo build --release --locked --workspace
+      - name: Check that the file cache can be emptied
+        if: steps.script.outputs.present == 'true'
+        run: |
+          test "$BYTESCAPE_DISPOSABLE_HOST" = 1
+          mkdir -p "$BENCH_RESULTS"
+          sync
+          echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+          # Where the numbers came from goes next to them: the commit, the
+          # time, the compiler, the hardware and the file system.
+          {
+            echo "## commit"; git rev-parse HEAD
+            echo "## date (UTC)"; date -u +%FT%TZ
+            echo "## compiler"; rustc -Vv
+            echo "## cpu"; lscpu
+            echo "## memory"; free -h
+            echo "## block devices"; lsblk -o NAME,SIZE,ROTA,TYPE,FSTYPE,MOUNTPOINT
+            echo "## file systems"; df -hT
+            echo "## kernel"; uname -a
+            echo "## runner image"; echo "${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          } > "$BENCH_RESULTS/machine.txt" 2>&1
+      # The script builds the data set, empties the cache with
+      # `sync; echo 3 | sudo tee /proc/sys/vm/drop_caches` before each run, runs
+      # the walker and the reference tools cold, and writes raw results into
+      # $BENCH_RESULTS.
+      - name: Run the cold-cache benchmark
+        if: steps.script.outputs.present == 'true'
+        run: bash "$BENCH_SCRIPT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() && steps.script.outputs.present == 'true' }}
+        with:
+          name: bench-cold-${{ github.run_id }}
+          path: bench-results/
+          if-no-files-found: error

@@ -56,7 +56,7 @@ fn metadata(packages: &[Package<'_>]) -> Value {
     let id = |name: &str| format!("registry+test#{name}@1.0.0");
     let package_list: Vec<Value> = packages
         .iter()
-        .map(|(name, _, _)| json!({ "name": name, "version": "1.0.0", "id": id(name) }))
+        .map(|(name, _, _)| json!({ "name": name, "version": "1.0.0", "id": id(name), "source": "registry+https://github.com/rust-lang/crates.io-index" }))
         .collect();
     let nodes: Vec<Value> = packages
         .iter()
@@ -214,14 +214,18 @@ fn refine_features_uses_the_exact_features_for_the_target() {
     // it does not.
     let mut doc = metadata(&[
         ("bytescape", &[], &[("windows-sys", None), ("rustix", None)]),
-        ("windows-sys", &["Win32_Networking_WinSock"], &[]),
-        ("rustix", &["std"], &[]),
+        (
+            "windows-sys",
+            &["Win32_Foundation", "Win32_Networking_WinSock"],
+            &[],
+        ),
+        ("rustix", &["net", "std"], &[]),
         ("unbuilt", &[], &[]),
     ]);
-    assert_eq!(flagged(&doc), 1);
+    assert_eq!(flagged(&doc), 2);
     let tree = tree_listing();
     net_ban::refine_features(&mut doc, &tree).expect("refines");
-    // The windows-sys networking feature is gone; rustix gains its exact net feature.
+    // The windows-sys networking feature is gone; the tree keeps rustix/net.
     let findings = net_ban::check_metadata(&doc, "t", &no_allow());
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].subject, "rustix/net");
@@ -230,7 +234,7 @@ fn refine_features_uses_the_exact_features_for_the_target() {
 fn tree_listing() -> String {
     [
         "bytescape v1.0.0 (/some/path)|",
-        "windows-sys v1.0.0|Win32_Foundation,default",
+        "windows-sys v1.0.0|Win32_Foundation",
         "rustix v1.0.0|net,std",
         "rustix v1.0.0|std",
         "unbuilt v1.0.0|",
@@ -242,8 +246,12 @@ fn refinable() -> Value {
     metadata_with_members(
         &[
             ("bytescape", &[], &[("windows-sys", None), ("rustix", None)]),
-            ("windows-sys", &["Win32_Networking_WinSock"], &[]),
-            ("rustix", &["std"], &[]),
+            (
+                "windows-sys",
+                &["Win32_Foundation", "Win32_Networking_WinSock"],
+                &[],
+            ),
+            ("rustix", &["net", "std"], &[]),
             ("plain", &[], &[]),
         ],
         &["bytescape"],
@@ -289,6 +297,64 @@ fn refine_features_accepts_packages_the_tree_leaves_out_when_no_ban_looks_at_the
     );
     let tree = "bytescape v1.0.0|\nwindows-sys v1.0.0|Win32_Foundation\n";
     net_ban::refine_features(&mut doc, tree).expect("errno is not covered by any feature ban");
+}
+
+/// A tree listing with the right packages and a damaged feature column.
+fn listing_with_column(column: &str) -> String {
+    [
+        "bytescape v1.0.0 (/p)",
+        "windows-sys v1.0.0",
+        "rustix v1.0.0",
+        "plain v1.0.0",
+    ]
+    .iter()
+    .map(|package| format!("{package}|{column}"))
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+#[test]
+fn refine_features_fails_closed_when_the_feature_column_is_dropped() {
+    // Every package is listed, but nothing follows the separator.
+    let mut doc = refinable();
+    let error =
+        net_ban::refine_features(&mut doc, &listing_with_column("")).expect_err("must fail");
+    assert!(error.contains("column is missing"), "{error}");
+}
+
+#[test]
+fn refine_features_fails_closed_when_the_feature_column_is_a_literal_placeholder() {
+    let mut doc = refinable();
+    let error =
+        net_ban::refine_features(&mut doc, &listing_with_column("{f}")).expect_err("must fail");
+    assert!(error.contains("garbled"), "{error}");
+}
+
+#[test]
+fn refine_features_fails_closed_when_the_tree_has_features_the_metadata_lacks() {
+    for column in ["???", "Win32_Foundation,Win32_Made_Up", "std;net"] {
+        let mut doc = refinable();
+        let error = net_ban::refine_features(&mut doc, &listing_with_column(column))
+            .expect_err("must fail");
+        assert!(error.contains("garbled"), "{column}: {error}");
+    }
+}
+
+#[test]
+fn refine_features_accepts_features_that_are_a_subset_of_the_metadata() {
+    let mut doc = refinable();
+    let tree = "bytescape v1.0.0|\nwindows-sys v1.0.0|Win32_Foundation\nrustix v1.0.0|std\nplain v1.0.0|\n";
+    net_ban::refine_features(&mut doc, tree).expect("subset");
+}
+
+#[test]
+fn refine_features_accepts_a_workspace_with_no_features_at_all() {
+    let mut doc = metadata_with_members(
+        &[("bytescape", &[], &[]), ("plain", &[], &[])],
+        &["bytescape"],
+    );
+    net_ban::refine_features(&mut doc, "bytescape v1.0.0|\nplain v1.0.0|\n")
+        .expect("nothing to check");
 }
 
 #[test]
@@ -408,6 +474,61 @@ fn a_via_that_scopes_nothing_does_not_admit_the_item() {
                 .iter()
                 .any(|f| f.message.contains("scopes nothing")),
             "{line}: {findings:?}"
+        );
+    }
+}
+
+/// The windowing graph with the `winit` package's source replaced.
+fn windowing_graph_with_winit_source(source: Value) -> Value {
+    let mut doc = windowing_graph(&[]);
+    for package in doc["packages"].as_array_mut().expect("packages") {
+        if package["name"] == "winit" {
+            package["source"] = source.clone();
+        }
+    }
+    doc
+}
+
+#[test]
+fn a_via_naming_a_crate_that_does_not_come_from_crates_io_does_not_admit_the_item() {
+    // Anyone can write a path crate, a git repository or a private registry
+    // crate with the name of a windowing library; only crates.io crates scope
+    // an exception.
+    let allow = net_ban::Allow::parse("feature rustix/net via winit\n");
+    for (case, source) in [
+        ("path crate", Value::Null),
+        (
+            "git checkout",
+            json!("git+https://example.com/winit?branch=main"),
+        ),
+        ("git over a file url", json!("git+file:///tmp/gitwinit")),
+        (
+            "another registry",
+            json!("registry+https://example.com/index"),
+        ),
+        (
+            "another sparse registry",
+            json!("sparse+https://example.com/index/"),
+        ),
+    ] {
+        let doc = windowing_graph_with_winit_source(source);
+        let findings = net_ban::check_metadata(&doc, "t", &allow);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("does not come from crates.io")),
+            "{case}: {findings:?}"
+        );
+    }
+    // Both spellings of crates.io scope the exception.
+    for source in [
+        "registry+https://github.com/rust-lang/crates.io-index",
+        "sparse+https://index.crates.io/",
+    ] {
+        let doc = windowing_graph_with_winit_source(json!(source));
+        assert!(
+            net_ban::check_metadata(&doc, "t", &allow).is_empty(),
+            "{source}"
         );
     }
 }
@@ -1059,6 +1180,233 @@ fn unsafe_allow_requires_every_member_to_inherit_the_workspace_lints() {
 }
 
 #[test]
+fn unsafe_allow_accepts_every_cargo_spelling_of_lint_inheritance() {
+    let package = "[package]\nname = \"x\"\n";
+    let spellings = [
+        format!("{package}\n[lints]\nworkspace = true\n"),
+        format!("{package}\n[lints]\nworkspace\t=\ttrue\n"),
+        format!("{package}\n[\tlints\t]\n\tworkspace = true # inherit\n"),
+        format!("{package}\n[lints]\r\nworkspace = true\r\n"),
+        format!("lints.workspace = true\n\n{package}"),
+        format!("lints\t.\tworkspace\t=\ttrue\n{package}"),
+        format!("lints = {{ workspace = true }}\n\n{package}"),
+        format!("lints={{workspace=true}}\n{package}"),
+        format!("lints\t=\t{{\tworkspace\t=\ttrue\t}}\n{package}"),
+    ];
+    for text in &spellings {
+        assert!(
+            unsafe_allow::check_manifest("crates/bs-ui/Cargo.toml", text).is_empty(),
+            "should accept: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn unsafe_allow_rejects_lookalikes_of_lint_inheritance() {
+    let package = "[package]\nname = \"x\"\n";
+    let rejected = [
+        // Dotted and inline forms only count before the first table header.
+        format!("{package}lints.workspace = true\n"),
+        format!("{package}lints = {{ workspace = true }}\n"),
+        // Wrong value, wrong key, wrong table.
+        "lints.workspace = false\n".to_string(),
+        "lints = { workspace = false }\n".to_string(),
+        "lints = { other = true }\n".to_string(),
+        format!("{package}\n[lints.rust]\nunused = \"warn\"\n"),
+        format!("{package}\n[workspace]\nworkspace = true\n"),
+        format!("{package}\n# lints.workspace = true\n"),
+    ];
+    for text in &rejected {
+        assert_eq!(
+            unsafe_allow::check_manifest("crates/bs-ui/Cargo.toml", text).len(),
+            1,
+            "should reject: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn unsafe_allow_checks_only_workspace_members_for_inheritance() {
+    let scratch = Scratch::new();
+    scratch.write(
+        "Cargo.toml",
+        "[workspace.lints.rust]\nunsafe_code = \"deny\"\n",
+    );
+    scratch.write("crates/bs-ui/Cargo.toml", INHERITING);
+    scratch.write(
+        "crates/bs-tree/Cargo.toml",
+        "[package]\nname = \"bs-tree\"\n",
+    );
+    // A separate workspace (a fuzz setup, a test fixture) cannot inherit.
+    scratch.write(
+        "fuzz/Cargo.toml",
+        "[package]\nname = \"fuzz\"\n[workspace]\n",
+    );
+    let members = vec![
+        "crates/bs-ui/Cargo.toml".to_string(),
+        "crates/bs-tree/Cargo.toml".to_string(),
+    ];
+    let findings = unsafe_allow::run_with_members(&scratch.0, &members).expect("runs");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].subject, "crates/bs-tree/Cargo.toml");
+}
+
+#[test]
+fn unsafe_allow_still_checks_the_unsafe_setting_in_manifests_outside_the_workspace() {
+    let scratch = Scratch::new();
+    scratch.write(
+        "Cargo.toml",
+        "[workspace.lints.rust]\nunsafe_code = \"deny\"\n",
+    );
+    let relaxed = format!("{INHERITING}\n[lints.rust]\nunsafe_code = \"allow\"\n");
+    scratch.write("crates/bs-ui/Cargo.toml", &relaxed);
+    let findings = unsafe_allow::run_with_members(&scratch.0, &[]).expect("runs");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+}
+
+/// A real, path-only Cargo workspace in a scratch folder (no network needed).
+fn real_workspace(members: &[&str], extra: &[(&str, &str)]) -> Scratch {
+    let scratch = Scratch::new();
+    let member_list = members
+        .iter()
+        .map(|m| format!("\"crates/{m}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    scratch.write(
+        "Cargo.toml",
+        &format!("[workspace]\nresolver = \"3\"\nmembers = [{member_list}]\nexclude = [\"vendor\", \"fuzz\"]\n\n[workspace.lints.rust]\nunsafe_code = \"deny\"\n"),
+    );
+    for member in members {
+        scratch.write(
+            &format!("crates/{member}/Cargo.toml"),
+            &format!("[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lints]\nworkspace = true\n"),
+        );
+        scratch.write(&format!("crates/{member}/src/lib.rs"), "");
+    }
+    for (path, text) in extra {
+        scratch.write(path, text);
+    }
+    let status =
+        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .current_dir(&scratch.0)
+            .args(["generate-lockfile", "--offline"])
+            .output()
+            .expect("cargo runs");
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    scratch
+}
+
+const EVIL_LIB: &str = "pub fn peek(p: *const u8) -> u8 { unsafe { *p } }\n";
+
+#[test]
+fn unsafe_allow_flags_a_non_member_path_crate_compiled_into_the_product() {
+    // A known bypass shape: a path crate with its own [workspace], excluded
+    // from the workspace, that a member depends on.
+    let scratch = real_workspace(&["bs-knowledge"], &[]);
+    scratch.write(
+        "vendor/evil/Cargo.toml",
+        "[package]\nname = \"evil\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    );
+    scratch.write("vendor/evil/src/lib.rs", EVIL_LIB);
+    scratch.write(
+        "crates/bs-knowledge/Cargo.toml",
+        "[package]\nname = \"bs-knowledge\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nevil = { path = \"../../vendor/evil\" }\n\n[lints]\nworkspace = true\n",
+    );
+    let relock = std::process::Command::new("cargo")
+        .current_dir(&scratch.0)
+        .args(["generate-lockfile", "--offline"])
+        .output()
+        .expect("cargo");
+    assert!(relock.status.success());
+    let findings = unsafe_allow::run(&scratch.0).expect("runs");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.subject == "vendor/evil/Cargo.toml"
+                && f.message.contains("not a workspace member")),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn unsafe_allow_flags_a_non_member_that_brings_its_own_workspace_lints() {
+    // The same shape, with the crate defining its own [workspace.lints] that
+    // allows what the real ones deny: it still cannot inherit ours.
+    let scratch = real_workspace(&["bs-knowledge"], &[]);
+    scratch.write(
+        "vendor/evil/Cargo.toml",
+        "[package]\nname = \"evil\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lints]\nworkspace = true\n\n[workspace]\n\n[workspace.lints.rust]\nunsafe_code = \"allow\"\n",
+    );
+    scratch.write("vendor/evil/src/lib.rs", EVIL_LIB);
+    scratch.write(
+        "crates/bs-knowledge/Cargo.toml",
+        "[package]\nname = \"bs-knowledge\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nevil = { path = \"../../vendor/evil\" }\n\n[lints]\nworkspace = true\n",
+    );
+    let relock = std::process::Command::new("cargo")
+        .current_dir(&scratch.0)
+        .args(["generate-lockfile", "--offline"])
+        .output()
+        .expect("cargo");
+    assert!(relock.status.success());
+    let findings = unsafe_allow::run(&scratch.0).expect("runs");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.subject == "vendor/evil/Cargo.toml"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn unsafe_allow_leaves_a_separate_workspace_outside_the_product_graph_alone() {
+    let scratch = real_workspace(&["bs-knowledge"], &[]);
+    scratch.write(
+        "fuzz/Cargo.toml",
+        "[package]\nname = \"fuzz\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    );
+    scratch.write("fuzz/src/lib.rs", EVIL_LIB);
+    let findings = unsafe_allow::run(&scratch.0).expect("runs");
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn unsafe_allow_classifies_members_and_path_crates_from_metadata() {
+    let metadata = json!({
+        "workspace_members": ["m1"],
+        "packages": [
+            { "id": "m1", "manifest_path": "/r/crates/a/Cargo.toml", "source": null },
+            { "id": "p1", "manifest_path": "/r/vendor/evil/Cargo.toml", "source": null },
+            { "id": "g1", "manifest_path": "/home/.cargo/git/x/Cargo.toml", "source": "git+https://example.com/x#abc" },
+            { "id": "c1", "manifest_path": "/home/.cargo/registry/y/Cargo.toml", "source": "registry+https://github.com/rust-lang/crates.io-index" }
+        ]
+    });
+    let (members, outside) =
+        unsafe_allow::classify_packages(&metadata, std::path::Path::new("/r")).expect("classifies");
+    assert_eq!(members, vec!["crates/a/Cargo.toml"]);
+    assert_eq!(outside, vec!["vendor/evil/Cargo.toml"]);
+    let empty = json!({ "workspace_members": [], "packages": [] });
+    assert!(unsafe_allow::classify_packages(&empty, std::path::Path::new("/r")).is_err());
+}
+
+#[test]
+fn the_workspace_member_list_comes_from_cargo() {
+    let members = unsafe_allow::member_manifests(&xtask::util::default_root()).expect("metadata");
+    assert!(
+        members.contains(&"xtask/Cargo.toml".to_string()),
+        "{members:?}"
+    );
+    assert!(
+        members.contains(&"crates/bytescape/Cargo.toml".to_string()),
+        "{members:?}"
+    );
+    assert!(!members.contains(&"Cargo.toml".to_string()));
+}
+
+#[test]
 fn unsafe_allow_runs_over_a_tree() {
     let scratch = Scratch::new();
     let denying = join(&["unsafe", "_code = \"deny\"\n"]);
@@ -1067,12 +1415,21 @@ fn unsafe_allow_runs_over_a_tree() {
         "crates/bs-platform/src/lib.rs",
         &allow_attr(&join(&["unsafe", "_code"])),
     );
-    assert!(unsafe_allow::run(&scratch.0).expect("runs").is_empty());
+    assert!(
+        unsafe_allow::run_with_members(&scratch.0, &[])
+            .expect("runs")
+            .is_empty()
+    );
     scratch.write(
         "crates/bs-ui/src/lib.rs",
         &allow_attr(&join(&["unsafe", "_code"])),
     );
-    assert_eq!(unsafe_allow::run(&scratch.0).expect("runs").len(), 1);
+    assert_eq!(
+        unsafe_allow::run_with_members(&scratch.0, &[])
+            .expect("runs")
+            .len(),
+        1
+    );
 }
 
 // ---- build metadata ----

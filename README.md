@@ -30,6 +30,8 @@ To build it yourself today, see [docs/building.md](docs/building.md).
 
 **Bytescape never connects to the internet.** There is no networking code in either program, no update check, no telemetry and no account. Two independent checks in the build reject the networking libraries that we know of. One of them also rejects library features (including the Windows networking APIs) and system calls, so adding any of these fails the build. They are a backstop for code review, not a proof: a networking library they do not know about would not be caught.
 
+If your session uses a remote or forwarded X display (for example over `ssh -X`), the window's drawing goes to that display like it does for any X program, and that is the only display traffic that can leave the machine.
+
 What stays on your machine:
 
 - **Crash reports.** If Bytescape crashes, the report is written to a file on your computer. On the next start you can read it in full. File and folder paths are hidden by default, with a switch to show them. Nothing is sent anywhere. "Report on GitHub" only opens your browser with a pre-filled issue that you can edit or close. (Planned for the first release.)

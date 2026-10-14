@@ -12,7 +12,9 @@
 //!   `unsafe_op_in_unsafe_fn` lint;
 //! - the root manifest no longer sets `unsafe_code = "deny"`;
 //! - a member manifest lacks `[lints] workspace = true`, which would switch
-//!   the workspace lints off for that crate.
+//!   the workspace lints off for that crate;
+//! - a path crate in the resolved dependency graph is not a workspace member,
+//!   because it cannot inherit the workspace lints at all.
 
 use crate::util::{Finding, LineCounter, read_text, relative, walk_files};
 use std::path::Path;
@@ -136,26 +138,64 @@ pub fn check_source(rel: &str, text: &str) -> Vec<Finding> {
     findings
 }
 
-/// Does the manifest have a `[lints]` table containing `workspace = true`?
+/// Does the manifest inherit the workspace lints? Cargo accepts three
+/// spellings, with any spacing (tabs included) and trailing comments:
+///
+/// ```text
+/// [lints]
+/// workspace = true
+///
+/// lints.workspace = true          (before the first table header)
+/// lints = { workspace = true }    (before the first table header)
+/// ```
 fn inherits_workspace_lints(text: &str) -> bool {
-    let mut in_lints = false;
+    let mut section: Option<String> = None;
     for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
+        let line: String = line
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if line.is_empty() {
+            continue;
+        }
         if line.starts_with('[') {
-            in_lints = line.replace(' ', "") == "[lints]";
-        } else if in_lints && line.replace(' ', "") == "workspace=true" {
+            section = Some(line);
+            continue;
+        }
+        let inherits = match section.as_deref() {
+            Some("[lints]") => line == "workspace=true",
+            Some(_) => false,
+            None => {
+                line == "lints.workspace=true"
+                    || (line.starts_with("lints={")
+                        && line.ends_with('}')
+                        && line["lints={".len()..line.len() - 1]
+                            .split(',')
+                            .any(|item| item == "workspace=true"))
+            }
+        };
+        if inherits {
             return true;
         }
     }
     false
 }
 
-/// Checks one manifest's text.
+/// Checks the manifest of a workspace member (or the root manifest).
 pub fn check_manifest(rel: &str, text: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     if rel == "Cargo.toml" {
         let denies = text.lines().any(|line| {
-            let line = line.split('#').next().unwrap_or("").replace(' ', "");
+            let line: String = line
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
             line == format!("{UNSAFE_LINT}=\"deny\"")
         });
         if !denies {
@@ -169,9 +209,17 @@ pub fn check_manifest(rel: &str, text: &str) -> Vec<Finding> {
         findings.push(Finding::new(
             rel,
             None,
-            "must contain `[lints]` with `workspace = true`, so the workspace lints apply",
+            "must contain `[lints]` with `workspace = true` (or `lints.workspace = true`), so the workspace lints apply",
         ));
     }
+    findings.extend(check_unsafe_setting(rel, text));
+    findings
+}
+
+/// Checks that a crate that may not allow unsafe code does not set the lint
+/// in its manifest. This applies to every crate manifest, member or not.
+pub fn check_unsafe_setting(rel: &str, text: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
     if rel != "Cargo.toml" && crate_of(rel).is_some() && !may_allow(rel) {
         for (index, line) in text.lines().enumerate() {
             let code = line.split('#').next().unwrap_or("");
@@ -187,8 +235,98 @@ pub fn check_manifest(rel: &str, text: &str) -> Vec<Finding> {
     findings
 }
 
+/// The manifests of the workspace members, and of the path crates in the
+/// resolved dependency graph that are not members: `(members, outside)`, as
+/// relative paths.
+///
+/// A path crate that is not a member cannot inherit the workspace lints, so it
+/// would be compiled into the product with the default lints. Separate
+/// workspaces that the product does not depend on (a fuzz setup, a fixture)
+/// are not in the graph and do not appear.
+pub fn classify_packages(
+    metadata: &serde_json::Value,
+    root: &Path,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let member_ids: Vec<&str> = metadata["workspace_members"]
+        .as_array()
+        .map(|ids| ids.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    let mut members = Vec::new();
+    let mut outside = Vec::new();
+    for package in metadata["packages"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        let (Some(id), Some(path)) = (package["id"].as_str(), package["manifest_path"].as_str())
+        else {
+            continue;
+        };
+        let rel = relative(root, Path::new(path));
+        if member_ids.contains(&id) {
+            members.push(rel);
+        } else if package["source"].is_null() {
+            outside.push(rel);
+        }
+    }
+    members.sort();
+    outside.sort();
+    if members.is_empty() {
+        return Err(String::from("cargo metadata lists no workspace members"));
+    }
+    Ok((members, outside))
+}
+
+fn cargo_metadata_full(root: &Path) -> Result<serde_json::Value, String> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
+    let output = std::process::Command::new(cargo)
+        .current_dir(root)
+        .args(["metadata", "--format-version", "1", "--locked"])
+        .output()
+        .map_err(|error| format!("could not run cargo metadata: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("cargo metadata gave invalid JSON: {error}"))
+}
+
+/// Relative paths of the workspace members' manifests, from
+/// `cargo metadata`.
+pub fn member_manifests(root: &Path) -> Result<Vec<String>, String> {
+    Ok(classify_packages(&cargo_metadata_full(root)?, root)?.0)
+}
+
+/// Findings for path crates in the dependency graph that are not workspace
+/// members.
+pub fn outside_member_findings(outside: &[String]) -> Vec<Finding> {
+    outside
+        .iter()
+        .map(|rel| {
+            Finding::new(
+                rel.clone(),
+                None,
+                "is a path crate in the dependency graph but not a workspace member, so it cannot inherit the workspace lints; make it a member",
+            )
+        })
+        .collect()
+}
+
 /// Runs the check against the repository at `root`.
 pub fn run(root: &Path) -> Result<Vec<Finding>, String> {
+    let (members, outside) = classify_packages(&cargo_metadata_full(root)?, root)?;
+    let mut findings = run_with_members(root, &members)?;
+    findings.extend(outside_member_findings(&outside));
+    Ok(findings)
+}
+
+/// Like [`run`], with the member manifests (relative paths) given. Only
+/// members must inherit the workspace lints: a manifest outside the
+/// workspace cannot, because Cargo would reject it.
+pub fn run_with_members(root: &Path, members: &[String]) -> Result<Vec<Finding>, String> {
     let manifest = root.join("Cargo.toml");
     if !manifest.is_file() {
         return Err(String::from("Cargo.toml is missing at the root"));
@@ -209,8 +347,10 @@ pub fn run(root: &Path) -> Result<Vec<Finding>, String> {
         };
         if is_rust {
             findings.extend(check_source(&rel, &text));
-        } else {
+        } else if rel == "Cargo.toml" || members.contains(&rel) {
             findings.extend(check_manifest(&rel, &text));
+        } else {
+            findings.extend(check_unsafe_setting(&rel, &text));
         }
     }
     Ok(findings)

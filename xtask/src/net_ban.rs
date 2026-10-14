@@ -218,6 +218,9 @@ struct Graph {
     deps: BTreeMap<String, Vec<(String, bool)>>,
     features: BTreeMap<String, Vec<String>>,
     roots: Vec<String>,
+    /// Names of packages whose source is not crates.io: path crates (null
+    /// source), git checkouts and alternative registries.
+    not_crates_io: BTreeSet<String>,
 }
 
 impl Graph {
@@ -265,11 +268,23 @@ impl Graph {
                 .cloned()
                 .collect(),
         };
+        let not_crates_io = metadata["packages"]
+            .as_array()
+            .map(|packages| {
+                packages
+                    .iter()
+                    .filter(|package| !is_crates_io(&package["source"]))
+                    .filter_map(|package| package["name"].as_str())
+                    .map(normalize_crate_name)
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(Self {
             names,
             deps,
             features,
             roots,
+            not_crates_io,
         })
     }
 
@@ -346,7 +361,10 @@ pub fn feature_relevant(name: &str) -> bool {
 /// whose features the bans look at (see [`feature_relevant`]) and that has
 /// features in the metadata, is missing from the tree output. Output that
 /// stops parsing would otherwise leave every package without features, and
-/// every feature ban would silently pass. Other packages may be absent: the
+/// every feature ban would silently pass. It is also an error when the feature
+/// column itself is not believable: features in the tree that the metadata
+/// does not have (garbled text, or a literal `{f}`), or no features at all in
+/// the tree while the metadata has some (a dropped column). Other packages may be absent: the
 /// metadata also lists dependencies that this target's configuration does not
 /// build (for example `libc` behind a backend the target does not use), and
 /// no ban looks at their features.
@@ -400,9 +418,32 @@ pub fn refine_features(metadata: &mut Value, tree: &str) -> Result<(), String> {
         })
         .unwrap_or_default();
     let mut missing = Vec::new();
+    let mut garbled = Vec::new();
+    let mut metadata_has_features = false;
+    let mut tree_has_features = false;
     if let Some(nodes) = metadata["resolve"]["nodes"].as_array_mut() {
         for node in nodes {
             let id = node["id"].as_str().unwrap_or("").to_string();
+            let from_metadata: BTreeSet<String> = node["features"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(from_tree) = identity.get(&id).and_then(|key| exact.get(key)) {
+                metadata_has_features |= !from_metadata.is_empty();
+                tree_has_features |= !from_tree.is_empty();
+                if !from_tree.is_subset(&from_metadata) {
+                    let label = identity
+                        .get(&id)
+                        .map(|(name, version)| format!("{name} {version}"))
+                        .unwrap_or_default();
+                    garbled.push(label);
+                }
+            }
             let listed = identity.get(&id).is_some_and(|key| exact.contains_key(key));
             let has_features = node["features"]
                 .as_array()
@@ -426,6 +467,23 @@ pub fn refine_features(metadata: &mut Value, tree: &str) -> Result<(), String> {
             node["features"] = serde_json::json!(features);
         }
     }
+    if !garbled.is_empty() {
+        garbled.sort();
+        garbled.dedup();
+        let shown: Vec<&str> = garbled.iter().take(5).map(String::as_str).collect();
+        return Err(format!(
+            "cargo tree lists features that cargo metadata does not have for {} package(s) (for example {}); \
+             its feature column is garbled and the feature check cannot be trusted",
+            garbled.len(),
+            shown.join(", ")
+        ));
+    }
+    if metadata_has_features && !tree_has_features {
+        return Err(String::from(
+            "cargo tree lists no features for any package although cargo metadata has some; \
+             its feature column is missing and the feature check cannot be trusted",
+        ));
+    }
     if missing.is_empty() {
         Ok(())
     } else {
@@ -441,13 +499,36 @@ pub fn refine_features(metadata: &mut Value, tree: &str) -> Result<(), String> {
     }
 }
 
+/// The two spellings of the crates.io registry in `cargo metadata`.
+const CRATES_IO_SOURCES: [&str; 2] = [
+    "registry+https://github.com/rust-lang/crates.io-index",
+    "sparse+https://index.crates.io/",
+];
+
+/// Is this package source (the `source` field of `cargo metadata`) crates.io?
+/// A path crate has no source; a git checkout and an alternative registry have
+/// a different one.
+fn is_crates_io(source: &Value) -> bool {
+    source
+        .as_str()
+        .is_some_and(|source| CRATES_IO_SOURCES.contains(&source))
+}
+
 /// A `via` that names the item's own crate, or one of the workspace's crates,
-/// removes every path to the item and so would admit it from anywhere.
-fn via_is_unscoped(entry: &Entry, item_crate: &str, members: &BTreeSet<String>) -> bool {
+/// removes every path to the item and so would admit it from anywhere. So
+/// does one that names a crate whose source is not crates.io (a path crate, a
+/// git checkout or an alternative registry): anyone can write such a crate
+/// with the name of a windowing library, so only crates.io crates count.
+fn via_is_unscoped(
+    entry: &Entry,
+    item_crate: &str,
+    members: &BTreeSet<String>,
+    not_crates_io: &BTreeSet<String>,
+) -> bool {
     entry
         .via
         .iter()
-        .any(|name| name == item_crate || members.contains(name))
+        .any(|name| name == item_crate || members.contains(name) || not_crates_io.contains(name))
 }
 
 /// Checks one `cargo metadata` document.
@@ -487,9 +568,13 @@ pub fn check_metadata(metadata: &Value, target: &str, allow: &Allow) -> Vec<Find
                 Some(_) if helper_closure.contains(id) => Some(format!(
                     "is in the dependency closure of {HELPER}, where no exception applies ({target})"
                 )),
-                Some(entry) if via_is_unscoped(entry, &name, &member_names) => Some(format!(
-                    "its `via` names the item's own crate or a workspace crate, which scopes nothing ({target})"
-                )),
+                Some(entry)
+                    if via_is_unscoped(entry, &name, &member_names, &graph.not_crates_io) =>
+                {
+                    Some(format!(
+                        "its `via` names the item's own crate, a workspace crate or a crate that does not come from crates.io, which scopes nothing ({target})"
+                    ))
+                }
                 Some(entry) => {
                     let outside = graph.reachable(&graph.roots, &entry.via, false);
                     outside.contains(id).then(|| {
