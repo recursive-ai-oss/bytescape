@@ -2,6 +2,12 @@
 //! manager, terminals, drive lists, installed-program and package lookup,
 //! launching the elevated helper and the light and dark setting.
 
+pub mod appearance;
+pub mod drives;
+
+#[cfg(all(test, target_os = "linux"))]
+mod testutil;
+
 #[cfg(test)]
 mod tests {
     #[test]

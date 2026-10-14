@@ -1,0 +1,12 @@
+22 1 0:21 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+23 1 0:22 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw
+24 1 0:5 / /dev rw,nosuid,relatime shared:9 - devtmpfs udev rw,size=8123456k,nr_inodes=2030864,mode=755,inode64
+25 1 0:23 / /run rw,nosuid,nodev,noexec,relatime shared:11 - tmpfs tmpfs rw,size=1636000k,mode=755,inode64
+29 1 0:27 /@ / rw,relatime shared:1 - btrfs /dev/nvme0n1p3 rw,ssd,discard=async,space_cache=v2,subvolid=256,subvol=/@
+41 29 0:28 /@home /home rw,relatime shared:42 - btrfs /dev/nvme0n1p3 rw,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/@home
+42 29 0:29 /@log /var/log rw,relatime shared:43 - btrfs /dev/nvme0n1p3 rw,ssd,discard=async,space_cache=v2,subvolid=258,subvol=/@log
+43 29 0:30 /@snapshots /.snapshots rw,relatime shared:44 - btrfs /dev/nvme0n1p3 rw,ssd,discard=async,space_cache=v2,subvolid=259,subvol=/@snapshots
+44 1 0:31 / /data rw,relatime shared:45 - btrfs /dev/nvme0n1p3 rw,ssd,discard=async,space_cache=v2,subvolid=5,subvol=/
+50 29 259:2 / /boot rw,relatime shared:46 - ext4 /dev/nvme0n1p2 rw
+51 50 259:1 / /boot/efi rw,relatime shared:47 - vfat /dev/nvme0n1p1 rw,fmask=0077,dmask=0077,codepage=437,iocharset=iso8859-1,shortname=mixed,errors=remount-ro
+60 25 0:40 / /run/user/1000 rw,nosuid,nodev,relatime shared:60 - tmpfs tmpfs rw,size=1636000k,nr_inodes=409000,mode=700,uid=1000,gid=1000,inode64

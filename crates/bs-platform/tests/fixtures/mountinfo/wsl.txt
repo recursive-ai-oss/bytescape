@@ -1,0 +1,12 @@
+60 62 8:32 / / rw,relatime - ext4 /dev/sdc rw,discard,errors=remount-ro,data=ordered
+61 60 0:2 / /dev rw,nosuid,relatime - devtmpfs none rw,size=8000000k,nr_inodes=2000000,mode=755
+62 60 0:3 / /proc rw,nosuid,nodev,noexec,noatime - proc proc rw
+63 60 0:4 / /sys rw,nosuid,nodev,noexec,noatime - sysfs sysfs rw
+64 60 0:5 / /run rw,nosuid,nodev,noatime - tmpfs none rw,mode=755
+65 64 0:6 / /run/lock rw,nosuid,nodev,noexec,noatime - tmpfs none rw
+70 60 0:8 / /mnt/wsl rw,relatime shared:1 - tmpfs tmpfs rw
+71 60 0:9 / /usr/lib/wsl/drivers ro,nosuid,nodev,noatime - 9p drivers rw,dirsync,aname=drivers;fmask=222;dmask=222,mmap,access=client,msize=65536,trans=fd,rfd=6,wfd=6
+72 60 0:10 / /usr/lib/wsl/lib ro,nosuid,nodev,noatime - overlay none rw,lowerdir=/gpu_lib_packaged:/gpu_lib_inbox,upperdir=/gpu_lib/rw/upper,workdir=/gpu_lib/rw/work
+73 60 0:11 / /mnt/c rw,noatime - 9p C:\134 rw,dirsync,aname=drvfs;path=C:\;uid=1000;gid=1000;symlinkroot=/mnt/,mmap,access=client,msize=65536,trans=fd,rfd=8,wfd=8
+74 60 0:12 / /mnt/d rw,noatime - 9p D:\134 rw,dirsync,aname=drvfs;path=D:\;uid=1000;gid=1000;symlinkroot=/mnt/,mmap,access=client,msize=65536,trans=fd,rfd=8,wfd=8
+75 60 8:16 / /mnt/wslg/distro ro,relatime - ext4 /dev/sdb rw,discard

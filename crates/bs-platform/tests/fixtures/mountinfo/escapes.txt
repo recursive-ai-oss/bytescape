@@ -1,0 +1,6 @@
+10 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+11 10 8:17 / /mnt/My\040Passport rw,relatime - ntfs3 /dev/sdb1 rw,uid=1000
+12 10 8:33 / /mnt/tab\011here rw,relatime - ext4 /dev/sdc1 rw
+13 10 8:34 / /mnt/new\012line rw,relatime - xfs /dev/sdc2 rw
+14 10 8:35 / /mnt/back\134slash rw,relatime - ext4 /dev/sdc3 rw
+15 10 8:36 /Mu\303\274sik /mnt/M\303\274sik rw,relatime - ext4 /dev/sdc4 rw

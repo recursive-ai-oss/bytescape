@@ -1,0 +1,17 @@
+22 98 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:5 - proc proc rw
+23 98 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:6 - sysfs sysfs rw
+24 98 0:5 / /dev rw,nosuid,seclabel shared:2 - devtmpfs devtmpfs rw,size=4096k,nr_inodes=1048576,mode=755,inode64
+25 23 0:6 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:7 - securityfs securityfs rw
+26 23 0:23 / /sys/fs/selinux rw,nosuid,noexec,relatime shared:8 - selinuxfs selinuxfs rw
+27 98 0:24 / /run rw,nosuid,nodev,seclabel shared:3 - tmpfs tmpfs rw,size=3200000k,nr_inodes=800000,mode=755,inode64
+98 1 0:42 /root / rw,relatime shared:1 - btrfs /dev/mapper/luks-5e3c1a0a-1d3f-4f0b-9a5e-0c2f3d4e5f60 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/root
+99 98 0:43 /home /home rw,relatime shared:55 - btrfs /dev/mapper/luks-5e3c1a0a-1d3f-4f0b-9a5e-0c2f3d4e5f60 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=256,subvol=/home
+100 98 259:5 / /boot rw,relatime shared:56 - ext4 /dev/nvme0n1p5 rw,seclabel
+101 100 259:4 / /boot/efi rw,relatime shared:57 - vfat /dev/nvme0n1p4 rw,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro
+110 27 0:50 / /run/user/1000 rw,nosuid,nodev,relatime shared:70 - tmpfs tmpfs rw,size=1600000k,nr_inodes=400000,mode=700,uid=1000,gid=1000,inode64
+111 110 0:51 / /run/user/1000/gvfs rw,nosuid,nodev,relatime shared:71 - fuse.gvfsd-fuse gvfsd-fuse rw,user_id=1000,group_id=1000
+112 110 0:52 / /run/user/1000/doc rw,nosuid,nodev,relatime shared:72 - fuse.portal portal rw,user_id=1000,group_id=1000
+120 98 8:18 / /run/media/bob/Backup rw,nosuid,nodev,relatime shared:80 - exfat /dev/sdb2 rw,fmask=0022,dmask=0022,iocharset=utf8,errors=remount-ro
+121 98 0:60 / /var/lib/containers/storage/overlay/1f2e3d/merged rw,relatime shared:81 - overlay overlay rw,lowerdir=/a,upperdir=/b,workdir=/c
+130 98 0:70 / /mnt/nas rw,relatime shared:90 - nfs4 nas.local:/export/media rw,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=192.168.1.20,local_lock=none,addr=192.168.1.10
+131 98 0:71 / /mnt/share rw,relatime shared:91 - cifs //nas.local/share rw,vers=3.1.1,cache=strict,username=bob,uid=1000,gid=1000
