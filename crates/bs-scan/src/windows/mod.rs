@@ -444,13 +444,7 @@ fn handle_item(
         return;
     }
     let class = wininfo::classify(item.attributes, item.reparse_tag);
-    let mut flags = NodeFlags::EMPTY;
-    if class.placeholder {
-        flags |= NodeFlags::CLOUD_PLACEHOLDER;
-    }
-    if class.not_followed {
-        flags |= NodeFlags::NOT_FOLLOWED;
-    }
+    let flags = wininfo::entry_flags(&class, item.estimated);
     let mut meta = Meta {
         logical: item.logical,
         allocated: item.allocated,

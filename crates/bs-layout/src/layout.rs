@@ -293,7 +293,7 @@ struct Cand {
     size: u64,
     /// A node index, or a group index when `group` is set.
     id: u32,
-    /// The node's flag bits (11 bits), a folder bit and its own delete
+    /// The node's flag bits (12 bits), a folder bit and its own delete
     /// state, packed; read once while gathering so that a group's summary
     /// costs nothing more.
     info: u16,
@@ -302,8 +302,8 @@ struct Cand {
     group: bool,
 }
 
-const INFO_DIR: u16 = 1 << 11;
-const INFO_DELETE_SHIFT: u16 = 12;
+const INFO_DIR: u16 = 1 << 12;
+const INFO_DELETE_SHIFT: u16 = 13;
 
 // The packing above needs the tree's flags to stay below `INFO_DIR`, and its
 // delete states to be 0, 1 and 2 (two bits). If the tree grows another flag
@@ -687,16 +687,24 @@ fn snap_edge(v: f64, lo: i32, hi: i32) -> i32 {
     (v.round() as i32).clamp(lo, hi)
 }
 
+/// What goes before a size: "≥" when it is a lower bound, "≈" when it
+/// includes a figure the filesystem did not give (an estimate), both when
+/// both hold.
+fn size_mark(lower_bound: bool, estimated: bool) -> &'static str {
+    match (lower_bound, estimated) {
+        (false, false) => "",
+        (true, false) => "≥ ",
+        (false, true) => "≈ ",
+        (true, true) => "≥ ≈ ",
+    }
+}
+
 /// Writes the size text of a node into `out`: the bytes still on disk, "≥"
 /// when they are only a lower bound, and what was moved to the bin
 /// or deleted. Writing into a caller's buffer keeps labels to one
 /// allocation each.
 fn write_node_size(out: &mut String, node: &NodeRef<'_>, eff: DeleteState, bin: BinName) {
-    let mark = if node.bytes_are_lower_bound() {
-        "≥ "
-    } else {
-        ""
-    };
+    let mark = size_mark(node.bytes_are_lower_bound(), node.size_is_estimated());
     match eff {
         DeleteState::InBin => {
             out.push_str("Moved to ");
@@ -743,6 +751,7 @@ fn summarize(members: &[Cand], inherited: DeleteState) -> GroupInfo {
         in_bin: 0,
         deleted: 0,
         lower_bound: false,
+        estimated: false,
         in_progress: false,
         all_marked: !members.is_empty(),
         dominant: CategoryId::NEUTRAL,
@@ -753,6 +762,7 @@ fn summarize(members: &[Cand], inherited: DeleteState) -> GroupInfo {
         info.has_folder |= c.is_dir();
         let flags = c.flags();
         info.in_progress |= !flags.contains(NodeFlags::COMPLETE);
+        info.estimated |= flags.contains(NodeFlags::ESTIMATED_SIZE);
         info.lower_bound |= !flags.contains(NodeFlags::COMPLETE)
             || flags.intersects(
                 NodeFlags::UNREADABLE | NodeFlags::UNREADABLE_BELOW | NodeFlags::RECORDS_LOST_BELOW,
@@ -797,6 +807,7 @@ struct GroupInfo {
     in_bin: u64,
     deleted: u64,
     lower_bound: bool,
+    estimated: bool,
     in_progress: bool,
     all_marked: bool,
     dominant: CategoryId,
@@ -812,6 +823,7 @@ fn group_info(snap: &Snapshot, spec: &GroupSpec) -> Option<GroupInfo> {
         in_bin: 0,
         deleted: 0,
         lower_bound: false,
+        estimated: false,
         in_progress: false,
         all_marked: !spec.members.is_empty(),
         dominant: CategoryId::NEUTRAL,
@@ -826,6 +838,7 @@ fn group_info(snap: &Snapshot, spec: &GroupSpec) -> Option<GroupInfo> {
         let is_dir = node.kind() == NodeKind::Dir;
         info.has_folder |= is_dir;
         info.lower_bound |= node.bytes_are_lower_bound();
+        info.estimated |= node.size_is_estimated();
         info.in_progress |= node.is_in_progress();
         let own = match node.delete_state() {
             DeleteState::None => inherited,
@@ -863,7 +876,7 @@ impl GroupInfo {
 
     fn size_text(&self, bin: BinName) -> String {
         let bin = bin.as_str();
-        let mark = if self.lower_bound { "≥ " } else { "" };
+        let mark = size_mark(self.lower_bound, self.estimated);
         if self.all_marked {
             return match (self.in_bin > 0, self.deleted > 0) {
                 (true, true) => format!(

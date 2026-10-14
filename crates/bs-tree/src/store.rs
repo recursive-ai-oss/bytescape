@@ -7,10 +7,10 @@
 //! since the last one. The name pool works the same way.
 
 use crate::error::ApplyError;
+use crate::hash::FastMap;
 use crate::types::{
     ByteCount, DeleteState, DeleteTotals, NodeFlags, NodeId, NodeKind, ReadFailure,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) const NONE: u32 = u32::MAX;
@@ -27,8 +27,8 @@ const POOL_MAX_CHUNKS: usize = 1 << (32 - POOL_BITS);
 
 // Layout of the per-node `bits` column.
 const FLAG_BITS: u16 = NodeFlags::ALL;
-const DELETE_SHIFT: u16 = 11;
-const KIND_SHIFT: u16 = 13;
+const DELETE_SHIFT: u16 = 12;
+const KIND_SHIFT: u16 = 14;
 
 /// One chunk of node columns. 47 bytes per node.
 #[derive(Clone)]
@@ -173,10 +173,10 @@ pub(crate) struct Store {
     chunks: Vec<Arc<NodeChunk>>,
     len: u32,
     pool: Pool,
-    pub(crate) marks: Arc<HashMap<u32, Mark>>,
-    pub(crate) delete_totals: Arc<HashMap<u32, DeleteTotals>>,
-    pub(crate) failures: Arc<HashMap<u32, ReadFailure>>,
-    pub(crate) link_origin: Arc<HashMap<u32, u32>>,
+    pub(crate) marks: Arc<FastMap<u32, Mark>>,
+    pub(crate) delete_totals: Arc<FastMap<u32, DeleteTotals>>,
+    pub(crate) failures: Arc<FastMap<u32, ReadFailure>>,
+    pub(crate) link_origin: Arc<FastMap<u32, u32>>,
     pub(crate) meta: Meta,
 }
 

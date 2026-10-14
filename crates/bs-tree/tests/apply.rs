@@ -912,3 +912,112 @@ fn a_scanner_that_knows_the_link_count_can_flag_a_single_name() {
     assert_eq!(n.allocated(), 4096, "still counted once");
     assert!(!n.flags().contains(NodeFlags::HARD_LINK_DUPLICATE));
 }
+
+fn estimated(logical: u64, allocated: u64) -> Meta {
+    Meta {
+        flags: NodeFlags::ESTIMATED_SIZE,
+        ..sized(logical, allocated)
+    }
+}
+
+#[test]
+fn an_estimated_size_shows_on_every_ancestor_and_nowhere_else() {
+    let mut agg = Aggregator::new();
+    let mut b = Batch::new();
+    root_batch(&mut b);
+    b.dir(DirKey(1), DirKey(0), b"d", &Meta::default()).unwrap();
+    b.dir(DirKey(2), DirKey(1), b"deep", &Meta::default())
+        .unwrap();
+    b.dir(DirKey(3), DirKey(0), b"clean", &Meta::default())
+        .unwrap();
+    b.file(NodeKind::File, DirKey(2), b"guess", &estimated(5000, 8192))
+        .unwrap();
+    b.file(NodeKind::File, DirKey(2), b"exact", &sized(5000, 8192))
+        .unwrap();
+    b.file(NodeKind::File, DirKey(3), b"measured", &sized(10, 4096))
+        .unwrap();
+    for k in [3, 2, 1, 0] {
+        b.listing_done(DirKey(k));
+    }
+    agg.apply(&b);
+    let snap = agg.publish();
+    snap.verify().unwrap();
+    let est = |path: &[u8]| {
+        snap.node(id_by_path(&snap, path))
+            .unwrap()
+            .size_is_estimated()
+    };
+    for path in [&b"/r/d/deep/guess"[..], b"/r/d/deep", b"/r/d", b"/r"] {
+        assert!(est(path), "{}", String::from_utf8_lossy(path));
+    }
+    for path in [&b"/r/d/deep/exact"[..], b"/r/clean", b"/r/clean/measured"] {
+        assert!(!est(path), "{}", String::from_utf8_lossy(path));
+    }
+    // An estimate is not a lower bound, and the scan is complete.
+    assert!(!snap.root().unwrap().bytes_are_lower_bound());
+    assert!(snap.scan_complete());
+}
+
+#[test]
+fn an_estimate_that_arrives_before_its_parent_still_marks_the_ancestors() {
+    let mut agg = Aggregator::new();
+    let mut b = Batch::new();
+    // The file and the deep directory come before the directory they are in.
+    b.file(NodeKind::File, DirKey(2), b"guess", &estimated(1, 4096))
+        .unwrap();
+    b.dir(DirKey(2), DirKey(1), b"deep", &Meta::default())
+        .unwrap();
+    b.dir(DirKey(1), DirKey(0), b"d", &Meta::default()).unwrap();
+    root_batch(&mut b);
+    b.listing_done(DirKey(2));
+    b.listing_done(DirKey(1));
+    b.listing_done(DirKey(0));
+    let report = agg.apply(&b);
+    assert_eq!(report.rejected, 0);
+    let snap = agg.publish();
+    snap.verify().unwrap();
+    assert!(snap.root().unwrap().size_is_estimated());
+    assert!(
+        snap.node(id_by_path(&snap, b"/r/d"))
+            .unwrap()
+            .size_is_estimated()
+    );
+}
+
+#[test]
+fn the_estimate_flag_survives_the_wire_and_marks_nothing_else() {
+    let mut b = Batch::new();
+    root_batch(&mut b);
+    b.file(NodeKind::File, DirKey(0), b"guess", &estimated(1, 4096))
+        .unwrap();
+    let mut bytes = Vec::new();
+    b.encode(&mut bytes).unwrap();
+    let decoded = Batch::decode(&bytes).unwrap();
+    let mut agg = Aggregator::new();
+    agg.apply(&decoded);
+    let snap = agg.publish();
+    let guess = snap.node(id_by_path(&snap, b"/r/guess")).unwrap();
+    assert!(guess.size_is_estimated());
+    assert!(!guess.is_hard_link() && !guess.is_unreadable());
+}
+
+#[test]
+fn an_estimated_size_does_not_make_a_delete_mark_a_lower_bound() {
+    let mut agg = Aggregator::new();
+    let mut b = Batch::new();
+    root_batch(&mut b);
+    b.dir(DirKey(1), DirKey(0), b"d", &Meta::default()).unwrap();
+    b.file(NodeKind::File, DirKey(1), b"guess", &estimated(1, 4096))
+        .unwrap();
+    b.listing_done(DirKey(1));
+    b.listing_done(DirKey(0));
+    agg.apply(&b);
+    let snap = agg.publish();
+    let d = id_by_path(&snap, b"/r/d");
+    let moved = agg.mark_deleted(d, bs_tree::DeleteState::InBin).unwrap();
+    assert!(!moved.lower_bound);
+    let snap = agg.publish();
+    snap.verify().unwrap();
+    assert!(!snap.root().unwrap().delete_totals().is_lower_bound());
+    assert!(snap.root().unwrap().size_is_estimated());
+}

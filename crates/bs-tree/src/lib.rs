@@ -47,6 +47,7 @@
 mod aggregator;
 mod batch;
 mod error;
+mod hash;
 mod snapshot;
 mod store;
 mod types;

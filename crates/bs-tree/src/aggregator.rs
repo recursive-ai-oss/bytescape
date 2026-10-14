@@ -3,13 +3,14 @@
 
 use crate::batch::{Batch, Entry, Record};
 use crate::error::{ApplyError, DeleteError};
+use crate::hash::FastMap;
 use crate::snapshot::Snapshot;
 use crate::store::{Mark, NONE, NewNode, Store};
 use crate::types::{
     ByteCount, DeleteState, DeleteTotals, FileKey, MAX_NAME_LEN, Moved, NodeFlags, NodeId,
     NodeKind, ReadFailure,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -163,17 +164,17 @@ pub struct Aggregator {
     store: Store,
     limits: ApplierLimits,
     /// Directory key to node id, for every directory seen.
-    keys: HashMap<u32, u32>,
+    keys: FastMap<u32, u32>,
     /// Directories still being counted, by node id.
-    open: HashMap<u32, OpenDir>,
+    open: FastMap<u32, OpenDir>,
     /// First sighting of each hard-linked file.
-    links: HashMap<FileKey, u32>,
+    links: FastMap<FileKey, u32>,
     /// Records waiting for the directory with this key.
-    parked: HashMap<u32, Vec<Parked>>,
+    parked: FastMap<u32, Vec<Parked>>,
     /// For parked directory entries: their key to the key they wait for.
     /// Followed with path halving to find the key at the top of a chain of
     /// waiting directories, which makes the cycle check cheap.
-    wait_links: HashMap<u32, u32>,
+    wait_links: FastMap<u32, u32>,
     parked_records: usize,
     parked_bytes: usize,
     /// Directory keys whose parked records can now be applied.
@@ -215,11 +216,11 @@ impl Aggregator {
         Aggregator {
             store: Store::default(),
             limits,
-            keys: HashMap::new(),
-            open: HashMap::new(),
-            links: HashMap::new(),
-            parked: HashMap::new(),
-            wait_links: HashMap::new(),
+            keys: FastMap::default(),
+            open: FastMap::default(),
+            links: FastMap::default(),
+            parked: FastMap::default(),
+            wait_links: FastMap::default(),
             parked_records: 0,
             parked_bytes: 0,
             ready: Vec::new(),
@@ -313,11 +314,11 @@ impl Aggregator {
         }
         self.finished = true;
         // Dropped, not cleared: clearing keeps the table's memory.
-        self.keys = HashMap::new();
-        self.open = HashMap::new();
-        self.links = HashMap::new();
-        self.parked = HashMap::new();
-        self.wait_links = HashMap::new();
+        self.keys = FastMap::default();
+        self.open = FastMap::default();
+        self.links = FastMap::default();
+        self.parked = FastMap::default();
+        self.wait_links = FastMap::default();
         self.ready = Vec::new();
         self.parked_records = 0;
         self.parked_bytes = 0;
@@ -429,7 +430,7 @@ impl Aggregator {
     fn mark_lost(&mut self, node: Option<u32>) {
         let target = node.or((self.store.len() > 0).then_some(0));
         match target {
-            Some(at) => self.raise(at, NodeFlags::RECORDS_LOST_BELOW, true),
+            Some(at) => self.raise(at, NodeFlags::RECORDS_LOST_BELOW, true, true),
             None => self.lost_before_root = true,
         }
     }
@@ -438,7 +439,10 @@ impl Aggregator {
     /// stopping at the first node that already has it: a node that has the
     /// flag has it on all its ancestors too, so each node is visited once per
     /// flag over the life of the tree.
-    fn raise(&mut self, start: u32, flag: NodeFlags, include_self: bool) {
+    ///
+    /// `lower_bound` says the flag means "the totals here are a lower bound",
+    /// which delete marks on the nodes passed must hear about.
+    fn raise(&mut self, start: u32, flag: NodeFlags, include_self: bool, lower_bound: bool) {
         let mut at = if include_self {
             start
         } else {
@@ -449,7 +453,9 @@ impl Aggregator {
                 return;
             }
             self.store.set_flag(at, flag);
-            self.became_lower_bound(at);
+            if lower_bound {
+                self.became_lower_bound(at);
+            }
             at = self.store.parent(at).unwrap_or(NONE);
         }
     }
@@ -620,6 +626,10 @@ impl Aggregator {
                 },
             );
         }
+        if flags.contains(NodeFlags::ESTIMATED_SIZE) && parent != NONE {
+            // A guess in the totals shows on every directory above it.
+            self.raise(parent, NodeFlags::ESTIMATED_SIZE, true, false);
+        }
         if parent == NONE && self.lost_before_root {
             self.store.set_flag(id, NodeFlags::RECORDS_LOST_BELOW);
         }
@@ -662,7 +672,7 @@ impl Aggregator {
         self.store.set_flag(node, NodeFlags::UNREADABLE);
         self.became_lower_bound(node);
         Arc::make_mut(&mut self.store.failures).insert(node, failure);
-        self.raise(node, NodeFlags::UNREADABLE_BELOW, false);
+        self.raise(node, NodeFlags::UNREADABLE_BELOW, false, true);
         if let Some(dir) = self.open.get_mut(&node)
             && !dir.listing_done
         {

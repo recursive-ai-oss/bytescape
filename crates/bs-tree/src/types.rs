@@ -118,6 +118,14 @@ impl NodeFlags {
     /// belonged to and on all its ancestors; on the root when the directory
     /// is not known.
     pub const RECORDS_LOST_BELOW: NodeFlags = NodeFlags(1 << 10);
+    /// The allocated size of this entry, or of something at or below this
+    /// directory, is an estimate: the filesystem gave no allocation figure,
+    /// so the scanner rounded the logical size up to a cluster. A producer
+    /// sets it on the entries it estimated; the tree sets it on every
+    /// ancestor too, so a total that includes a guess says so. Unlike the
+    /// lower-bound flags it says the figure may be off in either direction,
+    /// and an interface shows "≈" for it. Set by the scanner.
+    pub const ESTIMATED_SIZE: NodeFlags = NodeFlags(1 << 11);
 
     /// The flags a scanner may set. The tree ignores any other bit in a
     /// record.
@@ -126,11 +134,12 @@ impl NodeFlags {
             | Self::SHARED.0
             | Self::CLOUD_PLACEHOLDER.0
             | Self::NOT_FOLLOWED.0
-            | Self::SPARSE_OR_COMPRESSED.0,
+            | Self::SPARSE_OR_COMPRESSED.0
+            | Self::ESTIMATED_SIZE.0,
     );
 
     /// Every defined bit.
-    pub(crate) const ALL: u16 = (1 << 11) - 1;
+    pub(crate) const ALL: u16 = (1 << 12) - 1;
 
     /// The raw bits.
     pub const fn bits(self) -> u16 {
@@ -172,7 +181,7 @@ impl BitOrAssign for NodeFlags {
 
 impl fmt::Debug for NodeFlags {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const NAMES: [(NodeFlags, &str); 11] = [
+        const NAMES: [(NodeFlags, &str); 12] = [
             (NodeFlags::COMPLETE, "COMPLETE"),
             (NodeFlags::UNREADABLE, "UNREADABLE"),
             (NodeFlags::UNREADABLE_BELOW, "UNREADABLE_BELOW"),
@@ -184,6 +193,7 @@ impl fmt::Debug for NodeFlags {
             (NodeFlags::SPARSE_OR_COMPRESSED, "SPARSE_OR_COMPRESSED"),
             (NodeFlags::NAME_TRUNCATED, "NAME_TRUNCATED"),
             (NodeFlags::RECORDS_LOST_BELOW, "RECORDS_LOST_BELOW"),
+            (NodeFlags::ESTIMATED_SIZE, "ESTIMATED_SIZE"),
         ];
         let mut first = true;
         write!(f, "NodeFlags(")?;

@@ -1157,3 +1157,102 @@ fn the_grouping_limit_is_a_2_5_em_square_of_the_parents_content_area() {
         }
     }
 }
+
+/// root / d(1) / { guess(2): estimated size, exact(3) }, other(4)
+fn with_an_estimate() -> bs_tree::Snapshot {
+    use bs_tree::{Batch, DirKey, Meta, NodeFlags, NodeKind};
+    let sized = |allocated: u64, flags: NodeFlags| Meta {
+        logical: allocated,
+        allocated,
+        flags,
+        ..Meta::default()
+    };
+    let mut agg = Aggregator::new();
+    let mut b = Batch::new();
+    b.dir(
+        DirKey(0),
+        DirKey::NONE,
+        b"/root",
+        &sized(4096, NodeFlags::EMPTY),
+    )
+    .unwrap();
+    b.dir(DirKey(1), DirKey(0), b"d", &sized(4096, NodeFlags::EMPTY))
+        .unwrap();
+    b.file(
+        NodeKind::File,
+        DirKey(1),
+        b"guess",
+        &sized(40_000_000, NodeFlags::ESTIMATED_SIZE),
+    )
+    .unwrap();
+    b.file(
+        NodeKind::File,
+        DirKey(1),
+        b"exact",
+        &sized(10_000_000, NodeFlags::EMPTY),
+    )
+    .unwrap();
+    b.file(
+        NodeKind::File,
+        DirKey(0),
+        b"other",
+        &sized(20_000_000, NodeFlags::EMPTY),
+    )
+    .unwrap();
+    b.listing_done(DirKey(1));
+    b.listing_done(DirKey(0));
+    agg.apply(&b);
+    agg.snapshot()
+}
+
+#[test]
+fn an_estimated_size_is_shown_with_an_approximation_sign_and_so_is_what_contains_it() {
+    let snap = with_an_estimate();
+    let l = layout(&snap, &folder(0), BIG, m13(1.0));
+    let size = |n: usize| {
+        l.item_for_node(id(n))
+            .unwrap_or_else(|| panic!("node {n} is drawn"))
+            .label
+            .as_ref()
+            .unwrap()
+            .size
+            .to_string()
+    };
+    // The estimate and the folder holding it carry the sign; the rest do not.
+    assert!(size(2).starts_with("≈ "), "{}", size(2));
+    assert!(size(1).starts_with("≈ "), "{}", size(1));
+    assert!(l.items()[0].label.as_ref().unwrap().size.starts_with("≈ "));
+    assert!(!size(3).contains('≈'), "{}", size(3));
+    assert!(!size(4).contains('≈'), "{}", size(4));
+    // The tree says the same, and does not call the estimate a lower bound.
+    assert!(snap.node(id(1)).unwrap().size_is_estimated());
+    assert!(!snap.node(id(1)).unwrap().bytes_are_lower_bound());
+    assert!(!size(2).contains('≥'));
+}
+
+#[test]
+fn a_size_that_is_both_a_lower_bound_and_an_estimate_says_both() {
+    // The same tree with the root's listing left open.
+    use bs_tree::{Batch, DirKey, Meta, NodeFlags, NodeKind};
+    let mut agg = Aggregator::new();
+    let mut b = Batch::new();
+    b.dir(DirKey(0), DirKey::NONE, b"/root", &Meta::default())
+        .unwrap();
+    b.file(
+        NodeKind::File,
+        DirKey(0),
+        b"guess",
+        &Meta {
+            logical: 30_000_000,
+            allocated: 30_000_000,
+            flags: NodeFlags::ESTIMATED_SIZE,
+            ..Meta::default()
+        },
+    )
+    .unwrap();
+    agg.apply(&b);
+    let snap = agg.snapshot();
+    let l = layout(&snap, &folder(0), BIG, m13(1.0));
+    let root = l.items()[0].label.as_ref().unwrap().size.to_string();
+    assert!(root.starts_with("≥ ≈ "), "{root}");
+}

@@ -154,8 +154,8 @@ impl Snapshot {
     ///
     /// Checked: parent/child links agree; a directory's file count is the sum
     /// of its children's; its sizes are at least the sum of its children's;
-    /// a complete directory has only complete subdirectories; unreadable
-    /// and lost-record flags show on every ancestor; both names of a hard link
+    /// a complete directory has only complete subdirectories; unreadable,
+    /// lost-record and estimated-size flags show on every ancestor; both names of a hard link
     /// are flagged; delete totals never exceed the counted
     /// totals; only directories have children.
     pub fn verify(&self) -> Result<(), Violation> {
@@ -192,6 +192,7 @@ impl Snapshot {
             let mut seen = 0u32;
             let mut child_unreadable = false;
             let mut child_lost = false;
+            let mut child_estimated = false;
             let mut all_children_complete = true;
             let mut next = s.first_child(id).unwrap_or(NONE);
             while next != NONE {
@@ -206,6 +207,7 @@ impl Snapshot {
                 child_unreadable |=
                     child_flags.intersects(NodeFlags::UNREADABLE | NodeFlags::UNREADABLE_BELOW);
                 child_lost |= child_flags.contains(NodeFlags::RECORDS_LOST_BELOW);
+                child_estimated |= child_flags.contains(NodeFlags::ESTIMATED_SIZE);
                 if !child_flags.contains(NodeFlags::COMPLETE) {
                     all_children_complete = false;
                 }
@@ -230,6 +232,9 @@ impl Snapshot {
                 }
                 if child_lost && !flags.contains(NodeFlags::RECORDS_LOST_BELOW) {
                     return Err(bad(id, "lost records below not reflected in parent"));
+                }
+                if child_estimated && !flags.contains(NodeFlags::ESTIMATED_SIZE) {
+                    return Err(bad(id, "estimated size below not reflected in parent"));
                 }
             }
             if flags.contains(NodeFlags::HARD_LINK_DUPLICATE) {
@@ -378,6 +383,14 @@ impl<'a> NodeRef<'a> {
             || self.flags().intersects(
                 NodeFlags::UNREADABLE | NodeFlags::UNREADABLE_BELOW | NodeFlags::RECORDS_LOST_BELOW,
             )
+    }
+
+    /// Whether the allocated size of this entry, or of something at or below
+    /// it, is an estimate rather than a figure the filesystem gave (see
+    /// [`NodeFlags::ESTIMATED_SIZE`]). Show it with "≈" and never as a
+    /// measured number. Logical sizes are not affected.
+    pub fn size_is_estimated(&self) -> bool {
+        self.flags().contains(NodeFlags::ESTIMATED_SIZE)
     }
 
     /// Why the entry could not be read, if it could not.

@@ -80,6 +80,25 @@ pub(crate) fn classify(attributes: u32, reparse_tag: u32) -> Classified {
     }
 }
 
+/// The producer flags for a classified record. `estimated` says the record
+/// came from a listing that gave no allocation size, so its allocated size
+/// was rounded up from the logical size: the tree then marks the entry and
+/// every directory above it, and no total built on the guess looks measured.
+pub(crate) fn entry_flags(class: &Classified, estimated: bool) -> bs_tree::NodeFlags {
+    use bs_tree::NodeFlags;
+    let mut flags = NodeFlags::EMPTY;
+    if class.placeholder {
+        flags |= NodeFlags::CLOUD_PLACEHOLDER;
+    }
+    if class.not_followed {
+        flags |= NodeFlags::NOT_FOLLOWED;
+    }
+    if estimated {
+        flags |= NodeFlags::ESTIMATED_SIZE;
+    }
+    flags
+}
+
 /// One record of a directory listing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DirRecord {
@@ -567,6 +586,23 @@ mod tests {
         let dedup = classify(attr::REPARSE_POINT, 0x8000_0013);
         assert!(dedup.not_followed && !dedup.placeholder);
         assert_eq!(dedup.class, EntryClass::File);
+    }
+
+    #[test]
+    fn only_estimated_listings_set_the_estimate_flag() {
+        use bs_tree::NodeFlags;
+        let plain = classify(0x20, 0);
+        assert_eq!(entry_flags(&plain, false), NodeFlags::EMPTY);
+        assert_eq!(entry_flags(&plain, true), NodeFlags::ESTIMATED_SIZE);
+        // It sits beside the other producer flags without replacing them.
+        let link = classify(attr::DIRECTORY | attr::REPARSE_POINT, 0xA000_0003);
+        let both = entry_flags(&link, true);
+        assert!(both.contains(NodeFlags::NOT_FOLLOWED));
+        assert!(both.contains(NodeFlags::ESTIMATED_SIZE));
+        let cloud = classify(attr::OFFLINE, 0);
+        let flags = entry_flags(&cloud, false);
+        assert!(flags.contains(NodeFlags::CLOUD_PLACEHOLDER));
+        assert!(!flags.contains(NodeFlags::ESTIMATED_SIZE));
     }
 
     #[test]
