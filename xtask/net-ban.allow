@@ -23,3 +23,5 @@
 #   feature rustix/net via winit,softbuffer  # Wayland and X11 socket to the local display server
 #
 # Every added line also needs a maintainer's explicit approval.
+
+feature rustix/net via winit,softbuffer  # display server socket

@@ -11,3 +11,8 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+bs-render = { path = "../bs-render" }
+bs-ui = { path = "../bs-ui" }
+winit = { workspace = true }

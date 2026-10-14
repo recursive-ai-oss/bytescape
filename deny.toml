@@ -11,6 +11,15 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+# ttf-parser is flagged as unmaintained (no known vulnerability). It is reached
+# only through fontdb, which cosmic-text uses to find system fonts, and it
+# parses font files already installed on the user's machine. It cannot be
+# avoided today: fontdb 0.24 no longer depends on it, but the latest
+# cosmic-text (0.19) requires fontdb 0.23, and a 0.x requirement does not
+# accept 0.24. A discovery path without ttf-parser would mean replacing
+# cosmic-text's font system with another stack (for example fontique) or
+# patching cosmic-text. Remove this entry when cosmic-text moves to fontdb 0.24.
+ignore = ["RUSTSEC-2026-0192"]
 
 [licenses]
 allow = [

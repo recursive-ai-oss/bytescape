@@ -1,0 +1,645 @@
+//! The software renderer: a retained picture of the current view, dirty-region
+//! repainting for hover and selection, tiled full repaints and the cached-image
+//! zoom.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tiny_skia::{Pixmap, PixmapMut};
+
+use crate::canvas::Canvas;
+use crate::geom::{IRect, Rect};
+use crate::pixel;
+use crate::scene::{Bar, Item, Palette, SceneStyle, draw_bars, draw_items, draw_overlay};
+use crate::skia::{HatchTiles, SkiaCanvas};
+use crate::text::TextEngine;
+use crate::zoom::{ZoomFrame, compose_zoom, parallel_bands, zoom_geometry};
+
+/// Length of a zoom animation.
+pub const ZOOM_DURATION: Duration = Duration::from_millis(150);
+
+/// Which way a zoom goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZoomDirection {
+    /// Into a child folder: the child's box grows to fill the window.
+    In,
+    /// Out to the parent: the window shrinks to the folder's box.
+    Out,
+}
+
+struct Anim {
+    direction: ZoomDirection,
+    /// The large image (the parent view) and the small one (the child view).
+    big: Pixmap,
+    small: Pixmap,
+    child: Rect,
+    start: Duration,
+}
+
+/// What `paint` changed in the target buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Painted {
+    /// Regions of the target that were written. The whole target counts as one
+    /// region after a zoom frame or a full repaint.
+    pub damage: Vec<IRect>,
+    /// True while a zoom is still running, so the caller schedules the next
+    /// frame immediately.
+    pub animating: bool,
+}
+
+/// Retained software renderer for one window.
+pub struct Renderer {
+    width: u32,
+    height: u32,
+    scale: f32,
+    font_px: f32,
+    reduced_motion: bool,
+    palette: Palette,
+    text: TextEngine,
+    hatches: HatchTiles,
+    threads: usize,
+    items: Arc<Vec<Item>>,
+    bars: Vec<Bar>,
+    index: HashMap<u32, usize>,
+    front: Pixmap,
+    stub: Pixmap,
+    pool: Vec<Pixmap>,
+    labels_drawn: bool,
+    hover: Option<u32>,
+    selected: Option<u32>,
+    dirty: Option<IRect>,
+    full_dirty: bool,
+    anim: Option<Anim>,
+    timings: PaintTimings,
+}
+
+/// Where the time of the latest `paint` went, for diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaintTimings {
+    /// Repainting the retained picture (tiled), in microseconds.
+    pub render_micros: u64,
+    /// Copying the picture into the target buffer, in microseconds.
+    pub copy_micros: u64,
+}
+
+impl Renderer {
+    /// Creates a renderer. Returns `None` for a zero-sized window.
+    pub fn new(
+        width: u32,
+        height: u32,
+        scale: f32,
+        font_px: f32,
+        palette: Palette,
+        text: TextEngine,
+    ) -> Option<Self> {
+        let front = Pixmap::new(width, height)?;
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(16);
+        Some(Self {
+            width,
+            height,
+            scale,
+            font_px,
+            reduced_motion: false,
+            palette,
+            text,
+            hatches: HatchTiles::default(),
+            threads,
+            items: Arc::new(Vec::new()),
+            bars: Vec::new(),
+            index: HashMap::new(),
+            front,
+            stub: Pixmap::new(1, 1)?,
+            pool: Vec::new(),
+            labels_drawn: false,
+            hover: None,
+            selected: None,
+            dirty: None,
+            full_dirty: true,
+            anim: None,
+            timings: PaintTimings::default(),
+        })
+    }
+
+    /// Timing breakdown of the latest `paint`.
+    pub fn timings(&self) -> PaintTimings {
+        self.timings
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
+    }
+
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    pub fn set_reduced_motion(&mut self, on: bool) {
+        self.reduced_motion = on;
+    }
+
+    pub fn text(&self) -> &TextEngine {
+        &self.text
+    }
+
+    pub fn palette(&self) -> &Palette {
+        &self.palette
+    }
+
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
+        self.finish_zoom();
+        self.invalidate();
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Changes the window size or scale factor. The caller supplies a fresh
+    /// item list afterwards; caches are keyed by scale, so nothing stale is
+    /// reused.
+    pub fn resize(&mut self, width: u32, height: u32, scale: f32) {
+        if let Some(front) = Pixmap::new(width, height) {
+            self.front = front;
+            self.width = width;
+            self.height = height;
+            self.scale = scale;
+            // The animation's images have the old size; drop them with it.
+            self.pool.clear();
+            self.anim = None;
+            self.items = Arc::new(Vec::new());
+            self.index.clear();
+            self.invalidate();
+        }
+    }
+
+    pub fn style(&self, labels: bool) -> SceneStyle {
+        SceneStyle::new(self.scale, self.font_px, labels)
+    }
+
+    /// Jumps a running zoom to its end, rendering the new view at full quality.
+    pub fn finish_animation(&mut self) {
+        self.finish_zoom();
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.anim.is_some()
+    }
+
+    /// The items of the view on screen.
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
+
+    fn invalidate(&mut self) {
+        self.full_dirty = true;
+        self.labels_drawn = false;
+    }
+
+    fn take_pixmap(&mut self) -> Option<Pixmap> {
+        match self.pool.pop() {
+            Some(p) if p.width() == self.width && p.height() == self.height => Some(p),
+            _ => Pixmap::new(self.width, self.height),
+        }
+    }
+
+    fn set_view(&mut self, items: Arc<Vec<Item>>) {
+        self.index = items.iter().enumerate().map(|(i, it)| (it.id, i)).collect();
+        self.items = items;
+        self.hover = None;
+        self.selected = None;
+    }
+
+    /// Sets the chrome bars drawn over the map and repaints everything.
+    pub fn set_bars(&mut self, bars: Vec<Bar>) {
+        self.bars = bars;
+        self.invalidate();
+    }
+
+    /// Replaces the view without animation and repaints everything.
+    pub fn set_items(&mut self, items: Arc<Vec<Item>>) {
+        self.finish_zoom();
+        self.set_view(items);
+        self.invalidate();
+    }
+
+    /// Paints `items` into `pixmap` with horizontal bands on several threads.
+    fn render_tiled(&self, pixmap: &mut Pixmap, items: &[Item], labels: bool) {
+        let (w, h) = (self.width, self.height);
+        let style = self.style(labels);
+        let stride = w as usize * 4;
+        let band_rows = (h as usize / (self.threads * 4)).clamp(16, 256);
+        let pal = &self.palette;
+        let bars = &self.bars;
+        parallel_bands(
+            pixmap.data_mut(),
+            stride,
+            band_rows,
+            self.threads,
+            |row0, band| {
+                let rows = band.len() / stride;
+                let Some(band_map) = PixmapMut::from_bytes(band, w, rows as u32) else {
+                    return;
+                };
+                let mut canvas = SkiaCanvas::band(
+                    band_map,
+                    (0, row0 as i32),
+                    (w, h),
+                    self.text.clone(),
+                    self.hatches.clone(),
+                );
+                let region = Rect::new(0.0, row0 as f32, w as f32, rows as f32);
+                canvas_fill_bg(&mut canvas, region, pal);
+                draw_items(&mut canvas, items, pal, &style, Some(region));
+                draw_bars(&mut canvas, bars, pal, &style, Some(region));
+            },
+        );
+    }
+
+    /// Repaints the picture in full, with labels when fonts are available.
+    fn render_front(&mut self) {
+        let mut pm = std::mem::replace(&mut self.front, self.stub.clone());
+        let labels = self.text.is_ready();
+        let items = Arc::clone(&self.items);
+        self.render_tiled(&mut pm, &items, labels);
+        self.front = pm;
+        self.labels_drawn = labels;
+        self.full_dirty = true;
+        self.paint_overlays(None);
+    }
+
+    fn overlay_rects(&self) -> [Option<(Rect, bool, bool)>; 2] {
+        let rect_of = |id: Option<u32>| {
+            id.and_then(|id| self.index.get(&id))
+                .and_then(|&i| self.items.get(i))
+                .map(|it| it.rect)
+        };
+        let hover = rect_of(self.hover);
+        let sel = rect_of(self.selected);
+        [
+            sel.map(|r| (r, self.hover.is_some() && self.hover == self.selected, true)),
+            hover
+                .filter(|_| self.hover != self.selected)
+                .map(|r| (r, true, false)),
+        ]
+    }
+
+    fn paint_overlays(&mut self, region: Option<Rect>) {
+        let overlays = self.overlay_rects();
+        let pal = self.palette.clone();
+        let scale = self.scale;
+        let mut canvas =
+            SkiaCanvas::new(self.front.as_mut(), self.text.clone(), self.hatches.clone());
+        if let Some(r) = region {
+            canvas.push_clip(r);
+        }
+        for (rect, hover, selected) in overlays.into_iter().flatten() {
+            if region.is_none_or(|r| r.intersects(&rect.inflate(2.0 * scale))) {
+                draw_overlay(&mut canvas, rect, &pal, hover, selected, scale);
+            }
+        }
+    }
+
+    /// Redraws only `region` of the retained picture: the items under it, then
+    /// the outlines.
+    fn repaint_region(&mut self, region: Rect) {
+        let Some(region) =
+            region.intersect(&Rect::new(0.0, 0.0, self.width as f32, self.height as f32))
+        else {
+            return;
+        };
+        let region = region.outer_pixels().to_rect();
+        let style = self.style(self.labels_drawn);
+        {
+            let mut canvas =
+                SkiaCanvas::new(self.front.as_mut(), self.text.clone(), self.hatches.clone());
+            canvas.push_clip(region);
+            canvas_fill_bg(&mut canvas, region, &self.palette);
+            draw_items(
+                &mut canvas,
+                &self.items,
+                &self.palette,
+                &style,
+                Some(region),
+            );
+            draw_bars(&mut canvas, &self.bars, &self.palette, &style, Some(region));
+        }
+        self.paint_overlays(Some(region));
+        let ir = region.outer_pixels();
+        self.dirty = Some(self.dirty.map_or(ir, |d| d.union(&ir)));
+    }
+
+    fn rect_of(&self, id: Option<u32>) -> Option<Rect> {
+        id.and_then(|id| self.index.get(&id))
+            .and_then(|&i| self.items.get(i))
+            .map(|it| it.rect)
+    }
+
+    /// Repaints what an outline on `rect` touched. A hover outline only covers
+    /// the box's edge, so only four thin strips repaint; a selection also tints
+    /// the whole box, so it repaints in full.
+    fn repaint_outline(&mut self, rect: Rect, whole_box: bool) {
+        if self.full_dirty {
+            return;
+        }
+        if whole_box {
+            self.repaint_region(rect);
+            return;
+        }
+        let t = (2.0 * self.scale).round().max(1.0) + 1.0;
+        let r = rect.snapped();
+        if r.w <= 2.0 * t || r.h <= 2.0 * t {
+            self.repaint_region(r);
+            return;
+        }
+        self.repaint_region(Rect::new(r.x, r.y, r.w, t));
+        self.repaint_region(Rect::new(r.x, r.bottom() - t, r.w, t));
+        self.repaint_region(Rect::new(r.x, r.y + t, t, r.h - 2.0 * t));
+        self.repaint_region(Rect::new(r.right() - t, r.y + t, t, r.h - 2.0 * t));
+    }
+
+    /// Moves the hover outline. Only the old and new boxes' edges repaint.
+    pub fn set_hover(&mut self, id: Option<u32>) {
+        if self.hover == id {
+            return;
+        }
+        if self.anim.is_some() {
+            // The outline is painted when the zoom ends.
+            self.hover = id;
+            return;
+        }
+        let old = self.rect_of(self.hover);
+        let old_selected = self.hover.is_some() && self.hover == self.selected;
+        self.hover = id;
+        let new = self.rect_of(id);
+        let new_selected = id.is_some() && id == self.selected;
+        if let Some(r) = old {
+            self.repaint_outline(r, old_selected);
+        }
+        if let Some(r) = new {
+            self.repaint_outline(r, new_selected);
+        }
+    }
+
+    /// Moves the selection outline. Only the old and new boxes repaint.
+    pub fn set_selected(&mut self, id: Option<u32>) {
+        if self.selected == id {
+            return;
+        }
+        if self.anim.is_some() {
+            self.selected = id;
+            return;
+        }
+        let old = self.rect_of(self.selected);
+        self.selected = id;
+        let new = self.rect_of(id);
+        for r in [old, new].into_iter().flatten() {
+            self.repaint_outline(r, true);
+        }
+    }
+
+    /// Starts a zoom to `items`, the new view. `child` is the folder's box in
+    /// the larger of the two views: the current one when zooming in, the new
+    /// one when zooming out. The target view is rendered once, without labels;
+    /// the animation scales and crossfades the two cached images, and the
+    /// full-quality view replaces them at the end.
+    pub fn begin_zoom(
+        &mut self,
+        direction: ZoomDirection,
+        items: Arc<Vec<Item>>,
+        child: Rect,
+        now: Duration,
+    ) {
+        // A zoom already running ends first, so the new one starts from a real
+        // picture of the view on screen.
+        self.finish_zoom();
+        if self.reduced_motion {
+            self.set_items(items);
+            return;
+        }
+        if self.full_dirty || !self.labels_drawn && self.text.is_ready() {
+            self.render_front();
+        }
+        let Some(mut other) = self.take_pixmap() else {
+            self.set_items(items);
+            return;
+        };
+        self.render_tiled(&mut other, &items, false);
+        let current = std::mem::replace(&mut self.front, self.stub.clone());
+        let target = other;
+        let (big, small) = match direction {
+            ZoomDirection::In => (current, target),
+            ZoomDirection::Out => (target, current),
+        };
+        self.set_view(items);
+        self.prewarm_labels();
+        self.anim = Some(Anim {
+            direction,
+            big,
+            small,
+            child,
+            start: now,
+        });
+    }
+
+    /// Shapes the new view's labels on a worker thread while the animation
+    /// runs, so the full-quality frame at the end only blits cached labels.
+    fn prewarm_labels(&self) {
+        if !self.text.is_ready() {
+            return;
+        }
+        let items = Arc::clone(&self.items);
+        let pal = self.palette.clone();
+        let style = self.style(true);
+        let text = self.text.clone();
+        let spawned = std::thread::Builder::new()
+            .name("labels".into())
+            .spawn(move || {
+                let mut warm = crate::warm::WarmCanvas::new(text);
+                draw_items(&mut warm, &items, &pal, &style, None);
+                draw_bars(&mut warm, &[], &pal, &style, None);
+            });
+        drop(spawned);
+    }
+
+    /// Progress of the running animation, `0.0..=1.0` in time.
+    fn anim_time(&self, now: Duration) -> Option<f32> {
+        self.anim.as_ref().map(|a| {
+            (now.saturating_sub(a.start).as_secs_f32() / ZOOM_DURATION.as_secs_f32()).min(1.0)
+        })
+    }
+
+    /// Writes the current picture into `target` (`width × height` native pixel
+    /// words) and reports what changed.
+    ///
+    /// `whole` forces a full copy; pass it when the buffer's contents are not
+    /// the previous frame's.
+    pub fn paint(&mut self, target: &mut [u32], now: Duration, whole: bool) -> Painted {
+        self.timings = PaintTimings::default();
+        let full = IRect::new(0, 0, self.width as i32, self.height as i32);
+        if target.len() < (self.width * self.height) as usize {
+            return Painted {
+                damage: Vec::new(),
+                animating: false,
+            };
+        }
+        if let Some(t) = self.anim_time(now) {
+            if t < 1.0 {
+                self.paint_zoom_frame(target, t);
+                return Painted {
+                    damage: vec![full],
+                    animating: true,
+                };
+            }
+            self.finish_zoom();
+        }
+        self.ensure_front();
+        if self.full_dirty || (!self.labels_drawn && self.text.is_ready()) {
+            let t = std::time::Instant::now();
+            self.render_front();
+            self.timings.render_micros = t.elapsed().as_micros() as u64;
+        }
+        if self.full_dirty || whole {
+            let t = std::time::Instant::now();
+            self.copy_front(target, full);
+            self.timings.copy_micros = t.elapsed().as_micros() as u64;
+            self.full_dirty = false;
+            self.dirty = None;
+            return Painted {
+                damage: vec![full],
+                animating: false,
+            };
+        }
+        match self.dirty.take() {
+            Some(d) => {
+                self.copy_front(target, d);
+                Painted {
+                    damage: vec![d],
+                    animating: false,
+                }
+            }
+            None => Painted {
+                damage: Vec::new(),
+                animating: false,
+            },
+        }
+    }
+
+    fn paint_zoom_frame(&self, target: &mut [u32], t: f32) {
+        let Some(a) = &self.anim else {
+            return;
+        };
+        let eased = 1.0 - (1.0 - t).powi(3);
+        let p = match a.direction {
+            ZoomDirection::In => eased,
+            ZoomDirection::Out => 1.0 - eased,
+        };
+        let frame: ZoomFrame = zoom_geometry(self.width as f32, self.height as f32, a.child, p);
+        let (w, h) = (self.width as usize, self.height as usize);
+        compose_zoom(
+            target,
+            w,
+            h,
+            a.big.data(),
+            a.small.data(),
+            &frame,
+            self.threads,
+        );
+    }
+
+    /// Ends a running animation, if any, and puts a real picture back in
+    /// `front`. This is the only place the animation state is cleared, so the
+    /// placeholder swapped in while the images were animating never outlives it.
+    /// The new view is repainted at full quality, with labels, on the next
+    /// `paint`.
+    fn finish_zoom(&mut self) {
+        let Some(anim) = self.anim.take() else {
+            return;
+        };
+        self.pool.push(anim.big);
+        self.pool.push(anim.small);
+        self.front = self.take_pixmap().unwrap_or_else(|| self.stub.clone());
+        self.invalidate();
+    }
+
+    /// Guards against a picture of the wrong size (it cannot happen through
+    /// the public calls, but a wrong size would otherwise be an out-of-range
+    /// slice).
+    fn ensure_front(&mut self) {
+        if self.front.width() != self.width || self.front.height() != self.height {
+            if let Some(pm) = Pixmap::new(self.width, self.height) {
+                self.front = pm;
+            }
+            self.invalidate();
+        }
+    }
+
+    fn copy_front(&self, target: &mut [u32], region: IRect) {
+        let Some(r) = region.intersect(&IRect::new(0, 0, self.width as i32, self.height as i32))
+        else {
+            return;
+        };
+        let w = self.width as usize;
+        let data = self.front.data();
+        let rows = &mut target[r.y as usize * w..r.bottom() as usize * w];
+        let (x0, x1) = (r.x as usize, r.right() as usize);
+        let first = r.y as usize;
+        let src_for = |row: usize| &data[(first + row) * w * 4..][..w * 4];
+        if r.h >= 256 {
+            let band_rows = (r.h as usize / (self.threads * 2)).max(16);
+            parallel_bands(rows, w, band_rows, self.threads, |row0, band| {
+                for (i, line) in band.chunks_exact_mut(w).enumerate() {
+                    copy_words(&mut line[x0..x1], &src_for(row0 + i)[x0 * 4..x1 * 4]);
+                }
+            });
+        } else {
+            for (i, line) in rows.chunks_exact_mut(w).enumerate() {
+                copy_words(&mut line[x0..x1], &src_for(i)[x0 * 4..x1 * 4]);
+            }
+        }
+    }
+
+    /// The current picture as straight RGBA, for PNG export. Renders first if
+    /// anything is pending.
+    pub fn snapshot_rgba(&mut self) -> Vec<u8> {
+        self.finish_zoom();
+        self.ensure_front();
+        if self.full_dirty || (!self.labels_drawn && self.text.is_ready()) {
+            self.render_front();
+            self.full_dirty = false;
+        }
+        pixel::to_png_rgba(self.front.data())
+    }
+
+    /// Writes the current picture to a PNG file.
+    pub fn save_png(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let rgba = self.snapshot_rgba();
+        let size = tiny_skia::IntSize::from_wh(self.width, self.height)
+            .ok_or_else(|| "empty picture".to_string())?;
+        let pixmap = Pixmap::from_vec(rgba, size).ok_or_else(|| "bad picture size".to_string())?;
+        pixmap.save_png(path).map_err(|e| e.to_string())
+    }
+
+    /// Hit test: the topmost item containing the point.
+    pub fn item_at(&self, x: f32, y: f32) -> Option<&Item> {
+        self.items.iter().rev().find(|it| it.rect.contains(x, y))
+    }
+}
+
+fn canvas_fill_bg(canvas: &mut SkiaCanvas<'_>, region: Rect, pal: &Palette) {
+    canvas.fill_rect(region, pal.bg);
+}
+
+fn copy_words(dst: &mut [u32], src: &[u8]) {
+    for (d, s) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
+        *d = u32::from_le_bytes(*s);
+    }
+}

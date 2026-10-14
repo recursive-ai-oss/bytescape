@@ -1,9 +1,642 @@
 //! The application state machine, input handling, views, widgets and animation.
+//!
+//! Input is described by this crate's own [`InputEvent`] and handled by the
+//! pure [`App::update`], which returns [`Effect`]s for the host to apply. The
+//! window code translates real events into `InputEvent`s; tests and the
+//! benchmark harness feed the same events in directly, so a scripted zoom takes
+//! exactly the path a user's wheel takes.
+
+pub mod chrome;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use bs_render::{Item, Rect, ZoomDirection};
+
+/// Identifies a folder view. Opaque to the UI; the [`ViewSource`] defines it.
+pub type ViewId = u64;
+
+/// The laid-out contents of one view.
+#[derive(Clone, Debug)]
+pub struct Layout {
+    pub items: Arc<Vec<Item>>,
+    /// For each folder box in `items` that can be entered: its item id and the
+    /// view it opens.
+    pub folders: Vec<(u32, ViewId)>,
+}
+
+/// Where views come from. The real implementation sits on the size tree and
+/// the layout code; tests and the benchmark use a synthetic one.
+pub trait ViewSource {
+    fn root(&self) -> ViewId;
+    /// Lays out `view` to fill `map` (device pixels).
+    fn layout(&mut self, view: ViewId, map: Rect) -> Layout;
+    fn parent(&self, view: ViewId) -> Option<ViewId>;
+}
+
+/// A keyboard key the map reacts to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    Enter,
+    Backspace,
+    Home,
+    Escape,
+    AltLeft,
+    AltRight,
+    AltUp,
+}
+
+/// An input event, already translated from the windowing system.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum InputEvent {
+    PointerMoved {
+        x: f32,
+        y: f32,
+    },
+    PointerLeft,
+    /// Positive `steps` is wheel up (deeper), negative is wheel down (up).
+    Wheel {
+        x: f32,
+        y: f32,
+        steps: f32,
+    },
+    Click {
+        x: f32,
+        y: f32,
+    },
+    DoubleClick {
+        x: f32,
+        y: f32,
+    },
+    Key(Key),
+    /// The window size or scale factor changed.
+    Resized {
+        map: Rect,
+    },
+}
+
+/// What the host should do after an event.
+#[derive(Clone, Debug)]
+pub enum Effect {
+    SetHover(Option<u32>),
+    SetSelected(Option<u32>),
+    /// Show a new view without animation.
+    SetView(Arc<Vec<Item>>),
+    /// Animate to a new view. `child` is the folder's box in the larger view.
+    Zoom {
+        direction: ZoomDirection,
+        items: Arc<Vec<Item>>,
+        child: Rect,
+    },
+    /// The running animation should jump to its end now.
+    SkipAnimation,
+    /// The view's folder path changed; the breadcrumb should be rebuilt.
+    ViewChanged(ViewId),
+}
+
+struct Level {
+    view: ViewId,
+    layout: Layout,
+}
+
+/// The state of the map window.
+pub struct App<S: ViewSource> {
+    source: S,
+    map: Rect,
+    stack: Vec<Level>,
+    hover: Option<u32>,
+    selected: Option<u32>,
+    /// Whether the renderer is still running a zoom. The renderer owns the
+    /// animation clock; the host copies its answer here before each event.
+    animating: bool,
+    history_back: Vec<ViewId>,
+    history_forward: Vec<ViewId>,
+}
+
+impl<S: ViewSource> App<S> {
+    pub fn new(mut source: S, map: Rect) -> Self {
+        let root = source.root();
+        let layout = source.layout(root, map);
+        Self {
+            source,
+            map,
+            stack: vec![Level { view: root, layout }],
+            hover: None,
+            selected: None,
+            animating: false,
+            history_back: Vec::new(),
+            history_forward: Vec::new(),
+        }
+    }
+
+    /// Tells the app whether the renderer is still animating a zoom. Call this
+    /// with `renderer.is_animating()` before feeding an event; navigation that
+    /// arrives mid-animation then asks the renderer to jump to the end first.
+    pub fn set_animating(&mut self, animating: bool) {
+        self.animating = animating;
+    }
+
+    /// The map rectangle the views were last laid out for.
+    pub fn map(&self) -> Rect {
+        self.map
+    }
+
+    /// The view source, for changing its geometry before a resize.
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
+    pub fn items(&self) -> Arc<Vec<Item>> {
+        self.stack
+            .last()
+            .map(|l| Arc::clone(&l.layout.items))
+            .unwrap_or_default()
+    }
+
+    pub fn current_view(&self) -> ViewId {
+        self.stack.last().map_or(0, |l| l.view)
+    }
+
+    pub fn depth(&self) -> usize {
+        self.stack.len()
+    }
+
+    pub fn hover(&self) -> Option<u32> {
+        self.hover
+    }
+
+    pub fn selected(&self) -> Option<u32> {
+        self.selected
+    }
+
+    fn top(&self) -> Option<&Level> {
+        self.stack.last()
+    }
+
+    fn hit(&self, x: f32, y: f32) -> Option<&Item> {
+        self.top()?
+            .layout
+            .items
+            .iter()
+            .rev()
+            .find(|it| it.rect.contains(x, y))
+    }
+
+    /// The box one level below the view's root that holds the point.
+    fn child_under(&self, x: f32, y: f32) -> Option<(u32, ViewId, Rect)> {
+        let level = self.top()?;
+        let it = level
+            .layout
+            .items
+            .iter()
+            .find(|it| it.depth == 1 && it.rect.contains(x, y))?;
+        let view = level
+            .layout
+            .folders
+            .iter()
+            .find(|(id, _)| *id == it.id)
+            .map(|(_, v)| *v)?;
+        Some((it.id, view, it.rect))
+    }
+
+    /// Handles one event. `_now` is the time since the app started; nothing
+    /// uses it yet, and it is reserved for time-based input handling such as
+    /// coalescing wheel events.
+    pub fn update(&mut self, event: InputEvent, _now: Duration) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        match event {
+            InputEvent::PointerMoved { x, y } => {
+                let id = self.hit(x, y).map(|i| i.id);
+                if id != self.hover {
+                    self.hover = id;
+                    fx.push(Effect::SetHover(id));
+                }
+            }
+            InputEvent::PointerLeft => {
+                if self.hover.take().is_some() {
+                    fx.push(Effect::SetHover(None));
+                }
+            }
+            InputEvent::Click { x, y } => {
+                let id = self.hit(x, y).map(|i| i.id);
+                if id != self.selected {
+                    self.selected = id;
+                    fx.push(Effect::SetSelected(id));
+                }
+            }
+            InputEvent::Wheel { x, y, steps } => {
+                self.skip_running_animation(&mut fx);
+                if steps > 0.0 {
+                    self.zoom_in_at(x, y, &mut fx);
+                } else if steps < 0.0 {
+                    self.zoom_out(&mut fx);
+                }
+            }
+            InputEvent::DoubleClick { x, y } => {
+                self.skip_running_animation(&mut fx);
+                self.zoom_in_at(x, y, &mut fx);
+            }
+            InputEvent::Key(Key::Enter) => {
+                self.skip_running_animation(&mut fx);
+                if let Some(sel) = self.selected {
+                    let target = self.top().and_then(|l| {
+                        let it = l.layout.items.iter().find(|i| i.id == sel)?;
+                        let view = l.layout.folders.iter().find(|(id, _)| *id == sel)?.1;
+                        Some((view, it.rect))
+                    });
+                    if let Some((view, rect)) = target {
+                        self.enter(view, rect, &mut fx);
+                    }
+                }
+            }
+            InputEvent::Key(Key::Backspace | Key::AltUp) => {
+                self.skip_running_animation(&mut fx);
+                self.zoom_out(&mut fx);
+            }
+            InputEvent::Key(Key::Home) => {
+                self.skip_running_animation(&mut fx);
+                while self.stack.len() > 1 {
+                    self.stack.pop();
+                }
+                self.after_set_view(&mut fx);
+            }
+            InputEvent::Key(Key::Escape) => {
+                if self.selected.take().is_some() {
+                    fx.push(Effect::SetSelected(None));
+                }
+            }
+            InputEvent::Key(Key::AltLeft) => {
+                self.skip_running_animation(&mut fx);
+                if let Some(view) = self.history_back.pop() {
+                    let here = self.current_view();
+                    self.history_forward.push(here);
+                    self.jump_to(view, &mut fx);
+                }
+            }
+            InputEvent::Key(Key::AltRight) => {
+                self.skip_running_animation(&mut fx);
+                if let Some(view) = self.history_forward.pop() {
+                    let here = self.current_view();
+                    self.history_back.push(here);
+                    self.jump_to(view, &mut fx);
+                }
+            }
+            InputEvent::Resized { map } => {
+                self.map = map;
+                let view = self.current_view();
+                let mut views = Vec::new();
+                let mut v = Some(view);
+                while let Some(id) = v {
+                    views.push(id);
+                    v = self.source.parent(id);
+                }
+                views.reverse();
+                self.stack = views
+                    .into_iter()
+                    .map(|view| Level {
+                        view,
+                        layout: self.source.layout(view, map),
+                    })
+                    .collect();
+                self.hover = None;
+                self.selected = None;
+                self.animating = false;
+                fx.push(Effect::SetView(self.items()));
+            }
+        }
+        fx
+    }
+
+    fn skip_running_animation(&mut self, fx: &mut Vec<Effect>) {
+        if self.animating {
+            fx.push(Effect::SkipAnimation);
+            self.animating = false;
+        }
+    }
+
+    fn zoom_in_at(&mut self, x: f32, y: f32, fx: &mut Vec<Effect>) {
+        if let Some((_, view, rect)) = self.child_under(x, y) {
+            self.enter(view, rect, fx);
+        }
+    }
+
+    fn enter(&mut self, view: ViewId, child: Rect, fx: &mut Vec<Effect>) {
+        let layout = self.source.layout(view, self.map);
+        let items = Arc::clone(&layout.items);
+        self.history_back.push(self.current_view());
+        self.history_forward.clear();
+        self.stack.push(Level { view, layout });
+        self.hover = None;
+        self.selected = None;
+        fx.push(Effect::Zoom {
+            direction: ZoomDirection::In,
+            items,
+            child,
+        });
+        fx.push(Effect::ViewChanged(view));
+    }
+
+    fn zoom_out(&mut self, fx: &mut Vec<Effect>) {
+        if self.stack.len() < 2 {
+            return;
+        }
+        let Some(gone) = self.stack.pop() else {
+            return;
+        };
+        self.history_back.push(gone.view);
+        self.history_forward.clear();
+        let Some(parent) = self.stack.last() else {
+            return;
+        };
+        let child = parent
+            .layout
+            .folders
+            .iter()
+            .find(|(_, v)| *v == gone.view)
+            .and_then(|(id, _)| parent.layout.items.iter().find(|i| i.id == *id))
+            .map(|i| i.rect)
+            .unwrap_or(self.map);
+        self.hover = None;
+        self.selected = None;
+        fx.push(Effect::Zoom {
+            direction: ZoomDirection::Out,
+            items: Arc::clone(&parent.layout.items),
+            child,
+        });
+        fx.push(Effect::ViewChanged(parent.view));
+    }
+
+    fn jump_to(&mut self, view: ViewId, fx: &mut Vec<Effect>) {
+        let mut chain = vec![view];
+        let mut v = self.source.parent(view);
+        while let Some(id) = v {
+            chain.push(id);
+            v = self.source.parent(id);
+        }
+        chain.reverse();
+        self.stack = chain
+            .into_iter()
+            .map(|view| Level {
+                view,
+                layout: self.source.layout(view, self.map),
+            })
+            .collect();
+        self.after_set_view(fx);
+    }
+
+    fn after_set_view(&mut self, fx: &mut Vec<Effect>) {
+        self.hover = None;
+        self.selected = None;
+        fx.push(Effect::SetView(self.items()));
+        fx.push(Effect::ViewChanged(self.current_view()));
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use bs_render::{Flags, ItemKind};
+
+    /// A two-level source: the root holds two folders, each of which opens a
+    /// view of its own.
+    struct Fake;
+
+    fn item(id: u32, depth: u8, rect: Rect, kind: ItemKind) -> Item {
+        Item {
+            rect,
+            kind,
+            depth,
+            label: None,
+            id,
+            category: 0,
+            flags: Flags::default(),
+        }
+    }
+
+    impl ViewSource for Fake {
+        fn root(&self) -> ViewId {
+            0
+        }
+        fn layout(&mut self, view: ViewId, map: Rect) -> Layout {
+            let half = map.w / 2.0;
+            let mut items = vec![item(1, 0, map, ItemKind::FolderTitled)];
+            let mut folders = Vec::new();
+            if view == 0 {
+                items.push(item(
+                    2,
+                    1,
+                    Rect::new(map.x, map.y, half, map.h),
+                    ItemKind::FolderTitled,
+                ));
+                items.push(item(
+                    3,
+                    1,
+                    Rect::new(map.x + half, map.y, half, map.h),
+                    ItemKind::FolderTitled,
+                ));
+                items.push(item(
+                    4,
+                    2,
+                    Rect::new(map.x + 10.0, map.y + 30.0, 20.0, 20.0),
+                    ItemKind::FileTile,
+                ));
+                folders.push((2, 10));
+                folders.push((3, 20));
+            }
+            Layout {
+                items: Arc::new(items),
+                folders,
+            }
+        }
+        fn parent(&self, view: ViewId) -> Option<ViewId> {
+            (view != 0).then_some(0)
+        }
+    }
+
+    fn app() -> App<Fake> {
+        App::new(Fake, Rect::new(0.0, 0.0, 400.0, 200.0))
+    }
+
+    fn t(ms: u64) -> Duration {
+        Duration::from_millis(ms)
+    }
+
     #[test]
-    fn crate_name_matches() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "bs-ui");
+    fn hover_reports_the_topmost_box_and_only_changes() {
+        let mut a = app();
+        let fx = a.update(InputEvent::PointerMoved { x: 15.0, y: 40.0 }, t(0));
+        assert!(matches!(fx[..], [Effect::SetHover(Some(4))]));
+        assert!(
+            a.update(InputEvent::PointerMoved { x: 16.0, y: 41.0 }, t(1))
+                .is_empty()
+        );
+        let fx = a.update(InputEvent::PointerLeft, t(2));
+        assert!(matches!(fx[..], [Effect::SetHover(None)]));
+    }
+
+    #[test]
+    fn click_selects_and_escape_clears() {
+        let mut a = app();
+        a.update(InputEvent::Click { x: 300.0, y: 100.0 }, t(0));
+        assert_eq!(a.selected(), Some(3));
+        let fx = a.update(InputEvent::Key(Key::Escape), t(1));
+        assert!(matches!(fx[..], [Effect::SetSelected(None)]));
+    }
+
+    #[test]
+    fn wheel_up_zooms_toward_the_pointer_and_wheel_down_returns() {
+        let mut a = app();
+        let fx = a.update(
+            InputEvent::Wheel {
+                x: 300.0,
+                y: 100.0,
+                steps: 1.0,
+            },
+            t(0),
+        );
+        let Effect::Zoom {
+            direction, child, ..
+        } = &fx[0]
+        else {
+            panic!("expected a zoom, got {fx:?}");
+        };
+        assert_eq!(*direction, ZoomDirection::In);
+        assert_eq!(*child, Rect::new(200.0, 0.0, 200.0, 200.0));
+        assert_eq!(a.current_view(), 20);
+        let fx = a.update(
+            InputEvent::Wheel {
+                x: 10.0,
+                y: 10.0,
+                steps: -1.0,
+            },
+            t(500),
+        );
+        let Effect::Zoom {
+            direction, child, ..
+        } = &fx[0]
+        else {
+            panic!("expected a zoom out, got {fx:?}");
+        };
+        assert_eq!(*direction, ZoomDirection::Out);
+        assert_eq!(*child, Rect::new(200.0, 0.0, 200.0, 200.0));
+        assert_eq!(a.current_view(), 0);
+    }
+
+    #[test]
+    fn input_during_an_animation_skips_it() {
+        let mut a = app();
+        a.update(
+            InputEvent::Wheel {
+                x: 300.0,
+                y: 100.0,
+                steps: 1.0,
+            },
+            t(0),
+        );
+        a.set_animating(true);
+        let fx = a.update(
+            InputEvent::Wheel {
+                x: 10.0,
+                y: 10.0,
+                steps: -1.0,
+            },
+            t(50),
+        );
+        assert!(matches!(fx[0], Effect::SkipAnimation));
+        assert!(matches!(
+            fx[1],
+            Effect::Zoom {
+                direction: ZoomDirection::Out,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_renderer_decides_whether_a_skip_is_needed() {
+        let wheel_in = InputEvent::Wheel {
+            x: 300.0,
+            y: 100.0,
+            steps: 1.0,
+        };
+        let wheel_out = InputEvent::Wheel {
+            x: 10.0,
+            y: 10.0,
+            steps: -1.0,
+        };
+        // Long after the nominal 150 ms the renderer may still be animating
+        // (it has not painted its last frame yet): the app must skip.
+        let mut a = app();
+        a.update(wheel_in, t(0));
+        a.set_animating(true);
+        let fx = a.update(wheel_out, t(400));
+        assert!(matches!(fx[0], Effect::SkipAnimation));
+        // When the renderer says it has finished, no skip is sent, however
+        // little time has passed.
+        let mut b = app();
+        b.update(wheel_in, t(0));
+        b.set_animating(false);
+        let fx = b.update(wheel_out, t(10));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::SkipAnimation)));
+    }
+
+    #[test]
+    fn wheel_at_the_root_does_nothing_downward() {
+        let mut a = app();
+        assert!(
+            a.update(
+                InputEvent::Wheel {
+                    x: 1.0,
+                    y: 1.0,
+                    steps: -1.0
+                },
+                t(0)
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn history_walks_back_and_forward() {
+        let mut a = app();
+        a.update(InputEvent::DoubleClick { x: 10.0, y: 10.0 }, t(0));
+        assert_eq!(a.current_view(), 10);
+        a.update(InputEvent::Key(Key::AltLeft), t(1000));
+        assert_eq!(a.current_view(), 0);
+        a.update(InputEvent::Key(Key::AltRight), t(2000));
+        assert_eq!(a.current_view(), 10);
+        a.update(InputEvent::Key(Key::Home), t(3000));
+        assert_eq!(a.current_view(), 0);
+        assert_eq!(a.depth(), 1);
+    }
+
+    #[test]
+    fn enter_opens_the_selected_folder() {
+        let mut a = app();
+        a.update(InputEvent::Click { x: 300.0, y: 100.0 }, t(0));
+        let fx = a.update(InputEvent::Key(Key::Enter), t(1));
+        assert!(matches!(
+            fx[0],
+            Effect::Zoom {
+                direction: ZoomDirection::In,
+                ..
+            }
+        ));
+        assert_eq!(a.current_view(), 20);
+    }
+
+    #[test]
+    fn resize_relays_out_the_current_view_without_restarting() {
+        let mut a = app();
+        a.update(InputEvent::DoubleClick { x: 10.0, y: 10.0 }, t(0));
+        let fx = a.update(
+            InputEvent::Resized {
+                map: Rect::new(0.0, 0.0, 800.0, 400.0),
+            },
+            t(10),
+        );
+        assert!(matches!(fx[..], [Effect::SetView(_)]));
+        assert_eq!(a.current_view(), 10);
+        assert_eq!(a.items()[0].rect.w, 800.0);
     }
 }

@@ -11,3 +11,14 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+tiny-skia = { workspace = true }
+softbuffer = { workspace = true }
+raw-window-handle = { workspace = true }
+cosmic-text = { workspace = true }
+
+# System font discovery through fontconfig on Linux; Windows reads its font
+# directory directly.
+[target.'cfg(unix)'.dependencies]
+cosmic-text = { workspace = true, features = ["fontconfig"] }

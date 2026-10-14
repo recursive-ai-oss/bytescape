@@ -30,3 +30,12 @@ unimplemented = "deny"
 lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
+
+# Shared versions for the windowing and drawing stack (bs-render, bs-ui and
+# the bytescape binary).
+[workspace.dependencies]
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd", "png-format"] }
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
+raw-window-handle = "0.6"

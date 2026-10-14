@@ -1,10 +1,27 @@
 //! The narrow drawing interface and its software backend, with the glyph cache
 //! and hatch patterns.
+//!
+//! * [`canvas`]: the [`Canvas`] trait and a recording implementation for tests.
+//! * [`skia`]: the `tiny-skia` backend.
+//! * [`text`]: font discovery, shaping and the label cache.
+//! * [`scene`]: palettes and the painter for a flat list of boxes.
+//! * [`renderer`]: the retained picture, dirty regions, tiled repaints and the
+//!   cached-image zoom.
+//! * [`present`]: presenting a frame through `softbuffer`.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_name_matches() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "bs-render");
-    }
-}
+pub mod canvas;
+pub mod geom;
+pub mod pixel;
+pub mod present;
+pub mod renderer;
+pub mod scene;
+pub mod skia;
+pub mod text;
+pub mod warm;
+pub mod zoom;
+
+pub use canvas::{Canvas, Hatch, HatchAngle, RecordingCanvas, Stroke, TextStyle};
+pub use geom::{Color, IRect, Rect};
+pub use renderer::{PaintTimings, Painted, Renderer, ZOOM_DURATION, ZoomDirection};
+pub use scene::{Bar, Flags, Item, ItemKind, ItemLabel, Palette, SceneStyle};
+pub use text::TextEngine;

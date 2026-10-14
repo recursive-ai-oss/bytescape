@@ -1,0 +1,13 @@
+[package]
+name = "bs-gate"
+description = "Measures first-frame time and zoom frame times of the Bytescape binary and writes the results."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
