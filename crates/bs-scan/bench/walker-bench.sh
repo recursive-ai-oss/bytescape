@@ -41,6 +41,8 @@
 #   bs-scan (tree)  the walker, applier thread and final snapshot: what the
 #                   application does
 #   bs-scan (walk)  the walker alone, batches discarded
+#   the same two with `--no-categories`, which skip the per-file category
+#   lookup, so that the cost of classifying while reading shows
 #   diskus          multi-threaded, hard links counted once
 #   dua             `dua aggregate`, multi-threaded, hard links counted once
 #   du              GNU coreutils `du -s`, single-threaded
@@ -130,12 +132,14 @@ drop_caches() {
   if [ "$(id -u)" = 0 ]; then echo 3 > /proc/sys/vm/drop_caches; else echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null; fi
 }
 
-tool_names=(bs-scan-tree bs-scan-walk diskus dua du)
+tool_names=(bs-scan-tree bs-scan-walk bs-scan-tree-plain bs-scan-walk-plain diskus dua du)
 tool_cmd() { # name path -> prints the command line
   local p="$2"
   case "$1" in
     bs-scan-tree) echo "$walk --threads $threads --sink tree $p" ;;
     bs-scan-walk) echo "$walk --threads $threads --sink drop $p" ;;
+    bs-scan-tree-plain) echo "$walk --threads $threads --sink tree --no-categories $p" ;;
+    bs-scan-walk-plain) echo "$walk --threads $threads --sink drop --no-categories $p" ;;
     diskus) echo "$diskus -j $threads $p" ;;
     dua) echo "$dua -f bytes -x -t $threads aggregate --no-sort --no-total $p" ;;
     du) echo "$gnu_du -s -B1 -x $p" ;;
@@ -145,7 +149,7 @@ tool_cmd() { # name path -> prints the command line
 # Prints the byte total a tool reported, from its output.
 tool_bytes() { # name path output
   case "$1" in
-    bs-scan-tree|bs-scan-walk) sed -n 's/.*allocated=\([0-9]*\).*/\1/p' <<<"$3" ;;
+    bs-scan-tree*|bs-scan-walk*) sed -n 's/.*allocated=\([0-9]*\).*/\1/p' <<<"$3" ;;
     diskus) awk '{print $1; exit}' <<<"$3" ;;
     # dua lists the entries of a directory; the directory's own blocks are not
     # in the list, so they are added back.
@@ -218,6 +222,7 @@ mismatch=0
   echo "- protocol: $runs timed runs per tool and dataset, tools interleaved run by run; median with min and max; wall-clock around the whole process"
   echo "- tools:"
   echo "  - bs-scan: \`walk --threads $threads --sink tree|drop PATH\` (walker, applier and snapshot / walker only)"
+  echo "  - bs-scan, categories off: the same with \`--no-categories\` (rows ending in -plain)"
   echo "  - $("$diskus" --version): \`diskus -j $threads PATH\` (disk usage, directories included)"
   echo "  - $("$dua" --version): \`dua -f bytes -x -t $threads aggregate --no-sort --no-total PATH\`"
   echo "  - $("$gnu_du" --version | head -1): \`du -s -B1 -x PATH\`"
@@ -270,14 +275,20 @@ mismatch=0
       if [ "$bytes" != "$ours" ]; then
         verdict="differs by $(( bytes - ours ))"
         # Timings of tools that disagree about the total are not a comparison.
-        [ "$name" = bs-scan-walk ] || mismatch=1
+        case "$name" in bs-scan-walk*) ;; *) mismatch=1 ;; esac
       fi
-      [ "$name" = bs-scan-walk ] && verdict="counts every name of a hard link: $(( bytes - ours )) more"
+      case "$name" in bs-scan-walk*) verdict="counts every name of a hard link: $(( bytes - ours )) more" ;; esac
       if [ "$distinct" != 1 ]; then
         verdict="$verdict; the tree changed between runs ($distinct different totals)"
         mismatch=1
       fi
       echo "| $name | $med | $mn | $mx | $bytes | $verdict |"
+    done
+    echo
+    for pair in tree walk; do
+      with="$(awk -F'\t' -v d="$ds" -v t="bs-scan-$pair" '$1==d && $2==t {print $4}' "$runs_tsv" | median)"
+      without="$(awk -F'\t' -v d="$ds" -v t="bs-scan-$pair-plain" '$1==d && $2==t {print $4}' "$runs_tsv" | median)"
+      awk -v w="$with" -v p="$without" -v n="$pair" 'BEGIN {printf "Classifying while reading (%s): median %.1f ms with, %.1f ms without, %+.1f%%\n", n, w, p, (w - p) / p * 100}'
     done
     echo
   done

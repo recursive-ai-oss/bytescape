@@ -322,3 +322,196 @@ fn random_marks_and_undos_keep_the_invariants_and_return_to_the_start() {
         assert_eq!(fingerprint(&agg.publish()), base, "seed {seed}");
     }
 }
+
+/// root / { dir / { guess (estimated), exact }, solo (exact), other (estimated) }
+///
+/// `guess` is the only estimated entry under `dir`; `other` sits next to it.
+fn with_estimates() -> Aggregator {
+    let estimate = |logical, allocated| Meta {
+        flags: bs_tree::NodeFlags::ESTIMATED_SIZE,
+        ..sized(logical, allocated)
+    };
+    let mut agg = Aggregator::new();
+    let mut b = Batch::new();
+    b.dir(DirKey(0), DirKey::NONE, b"r", &sized(0, 4096))
+        .unwrap();
+    b.dir(DirKey(1), DirKey(0), b"dir", &sized(0, 4096))
+        .unwrap();
+    b.file(NodeKind::File, DirKey(1), b"guess", &estimate(1, 4096))
+        .unwrap();
+    b.file(NodeKind::File, DirKey(1), b"exact", &sized(10, 8192))
+        .unwrap();
+    b.file(NodeKind::File, DirKey(0), b"solo", &sized(5, 4096))
+        .unwrap();
+    b.file(NodeKind::File, DirKey(0), b"other", &estimate(2, 4096))
+        .unwrap();
+    b.listing_done(DirKey(1));
+    b.listing_done(DirKey(0));
+    agg.apply(&b);
+    agg
+}
+
+#[test]
+fn deleting_an_estimated_file_says_estimated_on_it_and_every_ancestor() {
+    let mut agg = with_estimates();
+    let snap = agg.publish();
+    let guess = find(&snap, b"guess");
+    let moved = agg.mark_deleted(guess, DeleteState::InBin).unwrap();
+    assert!(moved.estimated);
+    assert!(!moved.lower_bound, "an estimate is not a lower bound");
+    let after = agg.publish();
+    after.verify().unwrap();
+    for name in [&b"guess"[..], b"dir", b"r"] {
+        let totals = after.node(find(&after, name)).unwrap().delete_totals();
+        assert!(totals.is_estimated(), "{name:?}");
+        assert!(!totals.is_lower_bound(), "{name:?}");
+    }
+    // Siblings and the estimated entry nobody moved are untouched.
+    for name in [&b"exact"[..], b"solo", b"other"] {
+        let totals = after.node(find(&after, name)).unwrap().delete_totals();
+        assert!(!totals.is_estimated(), "{name:?}");
+    }
+    // Undo says the same thing and removes it.
+    assert_eq!(agg.unmark_deleted(guess).unwrap(), moved);
+    let undone = agg.publish();
+    assert_eq!(undone.root().unwrap().delete_totals(), Default::default());
+    assert!(!undone.root().unwrap().delete_totals().is_estimated());
+}
+
+#[test]
+fn deleting_an_exact_file_is_exact_even_beside_an_estimate() {
+    let mut agg = with_estimates();
+    let snap = agg.publish();
+    // `exact` shares its folder with an estimated file, and `solo` shares the
+    // root with one; neither mark moves an estimated byte.
+    for name in [&b"exact"[..], b"solo"] {
+        let moved = agg
+            .mark_deleted(find(&snap, name), DeleteState::Deleted)
+            .unwrap();
+        assert!(!moved.estimated, "{name:?}");
+    }
+    let after = agg.publish();
+    after.verify().unwrap();
+    for name in [&b"exact"[..], b"dir", b"solo", b"r"] {
+        let totals = after.node(find(&after, name)).unwrap().delete_totals();
+        assert!(!totals.is_estimated(), "{name:?}");
+    }
+    // The folder's own size still says it contains a guess.
+    assert!(
+        after
+            .node(find(&after, b"dir"))
+            .unwrap()
+            .size_is_estimated()
+    );
+}
+
+#[test]
+fn mixed_deletes_are_estimated_only_while_an_estimated_mark_stands() {
+    let mut agg = with_estimates();
+    let snap = agg.publish();
+    let (exact, guess, solo) = (
+        find(&snap, b"exact"),
+        find(&snap, b"guess"),
+        find(&snap, b"solo"),
+    );
+    let base = fingerprint(&snap);
+    agg.mark_deleted(solo, DeleteState::InBin).unwrap();
+    agg.mark_deleted(exact, DeleteState::Deleted).unwrap();
+    let both_exact = agg.publish();
+    assert!(!both_exact.root().unwrap().delete_totals().is_estimated());
+
+    agg.mark_deleted(guess, DeleteState::InBin).unwrap();
+    let mixed = agg.publish();
+    mixed.verify().unwrap();
+    let root = mixed.root().unwrap().delete_totals();
+    assert!(root.is_estimated(), "one estimated mark among exact ones");
+    let dir = mixed.node(find(&mixed, b"dir")).unwrap().delete_totals();
+    assert!(dir.is_estimated());
+    // The bytes of each state are still the plain sums.
+    assert_eq!(root.in_bin.allocated, 4096 + 4096);
+    assert_eq!(root.deleted.allocated, 8192);
+    // The guess is in the bin; what was deleted is exact.
+    assert!(root.in_bin_is_estimated());
+    assert!(!root.deleted_is_estimated());
+
+    // Undo the estimated mark: what is left is exact again.
+    agg.unmark_deleted(guess).unwrap();
+    let after_undo = agg.publish();
+    assert!(!after_undo.root().unwrap().delete_totals().is_estimated());
+    assert_eq!(
+        after_undo.root().unwrap().delete_totals().total().allocated,
+        4096 + 8192
+    );
+    agg.unmark_deleted(exact).unwrap();
+    agg.unmark_deleted(solo).unwrap();
+    assert_eq!(fingerprint(&agg.publish()), base);
+}
+
+#[test]
+fn marking_a_folder_over_an_already_marked_estimate_stays_on_the_safe_side() {
+    // The folder's flag says it holds a guess, and the guess was moved by an
+    // earlier mark of its own, so the folder's mark covers exact bytes only.
+    // The answer is still "estimated": it may say so for exact bytes but never
+    // the reverse. Undoing both leaves nothing behind.
+    let mut agg = with_estimates();
+    let snap = agg.publish();
+    let (dir, guess) = (find(&snap, b"dir"), find(&snap, b"guess"));
+    agg.mark_deleted(guess, DeleteState::InBin).unwrap();
+    let outer = agg.mark_deleted(dir, DeleteState::InBin).unwrap();
+    assert!(outer.estimated);
+    let both = agg.publish();
+    both.verify().unwrap();
+    assert!(both.root().unwrap().delete_totals().is_estimated());
+    agg.unmark_deleted(dir).unwrap();
+    agg.unmark_deleted(guess).unwrap();
+    let restored = agg.publish();
+    assert_eq!(restored.root().unwrap().delete_totals(), Default::default());
+}
+
+#[test]
+fn an_estimate_and_a_lower_bound_are_tracked_apart() {
+    // `bad` could not be read (a lower bound, exact as far as it goes);
+    // `guess` was read but its allocated size is an estimate.
+    let mut agg = Aggregator::new();
+    let mut b = Batch::new();
+    b.dir(DirKey(0), DirKey::NONE, b"r", &sized(0, 4096))
+        .unwrap();
+    b.dir(DirKey(1), DirKey(0), b"bad", &sized(0, 4096))
+        .unwrap();
+    b.unreadable(
+        DirKey(1),
+        bs_tree::ReadFailure {
+            kind: bs_tree::ReadErrorKind::PermissionDenied,
+            code: 13,
+        },
+    );
+    b.file(
+        NodeKind::File,
+        DirKey(0),
+        b"guess",
+        &Meta {
+            flags: bs_tree::NodeFlags::ESTIMATED_SIZE,
+            ..sized(1, 4096)
+        },
+    )
+    .unwrap();
+    b.listing_done(DirKey(0));
+    agg.apply(&b);
+    let snap = agg.publish();
+    let bad = agg
+        .mark_deleted(find(&snap, b"bad"), DeleteState::InBin)
+        .unwrap();
+    assert!(bad.lower_bound && !bad.estimated);
+    let guess = agg
+        .mark_deleted(find(&snap, b"guess"), DeleteState::InBin)
+        .unwrap();
+    assert!(guess.estimated && !guess.lower_bound);
+    let after = agg.publish();
+    after.verify().unwrap();
+    let root = after.root().unwrap().delete_totals();
+    assert!(root.is_lower_bound() && root.is_estimated());
+    let only_bad = after.node(find(&after, b"bad")).unwrap().delete_totals();
+    assert!(only_bad.is_lower_bound() && !only_bad.is_estimated());
+    let only_guess = after.node(find(&after, b"guess")).unwrap().delete_totals();
+    assert!(only_guess.is_estimated() && !only_guess.is_lower_bound());
+}

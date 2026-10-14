@@ -88,10 +88,29 @@ pub struct Layout {
     epoch: u64,
     node_count: u32,
     items: Vec<DrawItem>,
+    /// `(item id << 32) | position in items`, sorted: finds an item by id
+    /// without a scan. Empty only when there are no items (or, in theory,
+    /// more than 2^32 of them, when lookups fall back to a scan).
+    index: Vec<u64>,
     enterable: Vec<(u32, ViewTarget)>,
     groups: Vec<Arc<GroupSpec>>,
     truncated: bool,
 }
+
+// A layout is made on a worker thread and handed to the interface thread, and
+// its inputs are shared between them. Keep it that way: this stops compiling
+// if any of these types gains something that cannot cross threads.
+const _: () = {
+    const fn send_and_sync<T: Send + Sync>() {}
+    send_and_sync::<Layout>();
+    send_and_sync::<DrawItem>();
+    send_and_sync::<ViewTarget>();
+    send_and_sync::<GroupSpec>();
+    send_and_sync::<Options>();
+    send_and_sync::<Metrics>();
+    send_and_sync::<Rect>();
+    send_and_sync::<Snapshot>();
+};
 
 /// Lays out `target` to fill `viewport` (device pixels).
 ///
@@ -134,6 +153,7 @@ pub fn layout_with(
         epoch: snapshot.epoch(),
         node_count: snapshot.len(),
         items: Vec::new(),
+        index: Vec::new(),
         enterable: Vec::new(),
         groups: Vec::new(),
         truncated: false,
@@ -162,7 +182,24 @@ pub fn layout_with(
         },
     };
     b.run(root_rect);
-    b.out
+    let mut out = b.out;
+    out.index = item_index(&out.items);
+    out
+}
+
+/// The sorted `(id, position)` keys of `items`. Equal ids (there are none in
+/// a layout) sort by position, so a lookup finds the first, as a scan would.
+fn item_index(items: &[DrawItem]) -> Vec<u64> {
+    if u32::try_from(items.len()).is_err() {
+        return Vec::new();
+    }
+    let mut keys: Vec<u64> = items
+        .iter()
+        .enumerate()
+        .map(|(position, item)| (u64::from(item.id) << 32) | position as u64)
+        .collect();
+    keys.sort_unstable();
+    keys
 }
 
 impl Layout {
@@ -203,9 +240,26 @@ impl Layout {
         self.truncated
     }
 
-    /// The item with this id (see [`DrawItem::id`]).
+    /// The item with this id (see [`DrawItem::id`]). A lookup costs a binary
+    /// search over the items, so it is cheap enough to call for every
+    /// pointer move.
     pub fn item(&self, id: u32) -> Option<&DrawItem> {
-        self.items.iter().find(|i| i.id == id)
+        if self.index.is_empty() {
+            return self.items.iter().find(|i| i.id == id);
+        }
+        let key = u64::from(id) << 32;
+        let at = self.index.partition_point(|&k| k < key);
+        let found = *self.index.get(at)?;
+        if found >> 32 != u64::from(id) {
+            return None;
+        }
+        self.items.get(usize::try_from(found & 0xFFFF_FFFF).ok()?)
+    }
+
+    /// The rectangle of the item with this id, in device pixels, if it is
+    /// drawn. Same cost as [`Layout::item`].
+    pub fn rect_of(&self, id: u32) -> Option<Rect> {
+        self.item(id).map(|item| item.rect)
     }
 
     /// What an item id stands for.
@@ -722,17 +776,17 @@ fn write_node_size(out: &mut String, node: &NodeRef<'_>, eff: DeleteState, bin: 
             out.push_str(mark);
             write_size(out, node.current_allocated());
             let totals = node.delete_totals();
-            let moved_mark = if totals.is_lower_bound() { "≥ " } else { "" };
+            let lower = totals.is_lower_bound();
             if totals.in_bin.allocated > 0 || totals.in_bin.files > 0 {
                 out.push_str(" · ");
-                out.push_str(moved_mark);
+                out.push_str(size_mark(lower, totals.in_bin_is_estimated()));
                 write_size(out, totals.in_bin.allocated);
                 out.push_str(" moved to ");
                 out.push_str(bin.as_str());
             }
             if totals.deleted.allocated > 0 || totals.deleted.files > 0 {
                 out.push_str(" · ");
-                out.push_str(moved_mark);
+                out.push_str(size_mark(lower, totals.deleted_is_estimated()));
                 write_size(out, totals.deleted.allocated);
                 out.push_str(" deleted");
             }
@@ -752,6 +806,8 @@ fn summarize(members: &[Cand], inherited: DeleteState) -> GroupInfo {
         deleted: 0,
         lower_bound: false,
         estimated: false,
+        in_bin_estimated: false,
+        deleted_estimated: false,
         in_progress: false,
         all_marked: !members.is_empty(),
         dominant: CategoryId::NEUTRAL,
@@ -762,7 +818,11 @@ fn summarize(members: &[Cand], inherited: DeleteState) -> GroupInfo {
         info.has_folder |= c.is_dir();
         let flags = c.flags();
         info.in_progress |= !flags.contains(NodeFlags::COMPLETE);
-        info.estimated |= flags.contains(NodeFlags::ESTIMATED_SIZE);
+        // No amounts are written from this summary, so one flag serves both.
+        let estimated = flags.contains(NodeFlags::ESTIMATED_SIZE);
+        info.estimated |= estimated;
+        info.in_bin_estimated |= estimated;
+        info.deleted_estimated |= estimated;
         info.lower_bound |= !flags.contains(NodeFlags::COMPLETE)
             || flags.intersects(
                 NodeFlags::UNREADABLE | NodeFlags::UNREADABLE_BELOW | NodeFlags::RECORDS_LOST_BELOW,
@@ -807,7 +867,12 @@ struct GroupInfo {
     in_bin: u64,
     deleted: u64,
     lower_bound: bool,
+    /// What is still on disk includes an estimated size.
     estimated: bool,
+    /// What was moved to the bin, and what was deleted, include an estimated
+    /// size.
+    in_bin_estimated: bool,
+    deleted_estimated: bool,
     in_progress: bool,
     all_marked: bool,
     dominant: CategoryId,
@@ -824,6 +889,8 @@ fn group_info(snap: &Snapshot, spec: &GroupSpec) -> Option<GroupInfo> {
         deleted: 0,
         lower_bound: false,
         estimated: false,
+        in_bin_estimated: false,
+        deleted_estimated: false,
         in_progress: false,
         all_marked: !spec.members.is_empty(),
         dominant: CategoryId::NEUTRAL,
@@ -838,18 +905,27 @@ fn group_info(snap: &Snapshot, spec: &GroupSpec) -> Option<GroupInfo> {
         let is_dir = node.kind() == NodeKind::Dir;
         info.has_folder |= is_dir;
         info.lower_bound |= node.bytes_are_lower_bound();
-        info.estimated |= node.size_is_estimated();
         info.in_progress |= node.is_in_progress();
         let own = match node.delete_state() {
             DeleteState::None => inherited,
             own => own,
         };
         match own {
-            DeleteState::InBin => info.in_bin = info.in_bin.saturating_add(allocated),
-            DeleteState::Deleted => info.deleted = info.deleted.saturating_add(allocated),
+            DeleteState::InBin | DeleteState::Deleted => {
+                if own == DeleteState::InBin {
+                    info.in_bin = info.in_bin.saturating_add(allocated);
+                    info.in_bin_estimated |= node.size_is_estimated();
+                } else {
+                    info.deleted = info.deleted.saturating_add(allocated);
+                    info.deleted_estimated |= node.size_is_estimated();
+                }
+            }
             DeleteState::None => {
                 info.all_marked = false;
                 let totals = node.delete_totals();
+                info.estimated |= node.size_is_estimated();
+                info.in_bin_estimated |= totals.in_bin_is_estimated();
+                info.deleted_estimated |= totals.deleted_is_estimated();
                 info.current = info.current.saturating_add(node.current_allocated());
                 info.in_bin = info.in_bin.saturating_add(totals.in_bin.allocated);
                 info.deleted = info.deleted.saturating_add(totals.deleted.allocated);
@@ -876,27 +952,34 @@ impl GroupInfo {
 
     fn size_text(&self, bin: BinName) -> String {
         let bin = bin.as_str();
-        let mark = size_mark(self.lower_bound, self.estimated);
+        // The bytes still on disk, the bytes in the bin and the bytes deleted
+        // are three figures: a guess among one says nothing about the others.
+        let left = size_mark(self.lower_bound, self.estimated);
+        let in_bin = size_mark(self.lower_bound, self.in_bin_estimated);
+        let deleted = size_mark(self.lower_bound, self.deleted_estimated);
         if self.all_marked {
             return match (self.in_bin > 0, self.deleted > 0) {
                 (true, true) => format!(
-                    "{mark}{} moved to {bin} · {mark}{} deleted",
+                    "{in_bin}{} moved to {bin} · {deleted}{} deleted",
                     format_size(self.in_bin),
                     format_size(self.deleted)
                 ),
-                (false, true) => format!("Deleted · {mark}{}", format_size(self.deleted)),
-                _ => format!("Moved to {bin} · {mark}{}", format_size(self.in_bin)),
+                (false, true) => format!("Deleted · {deleted}{}", format_size(self.deleted)),
+                _ => format!("Moved to {bin} · {in_bin}{}", format_size(self.in_bin)),
             };
         }
-        let mut text = format!("{mark}{}", format_size(self.current));
+        let mut text = format!("{left}{}", format_size(self.current));
         if self.in_bin > 0 {
             text.push_str(&format!(
-                " · {mark}{} moved to {bin}",
+                " · {in_bin}{} moved to {bin}",
                 format_size(self.in_bin)
             ));
         }
         if self.deleted > 0 {
-            text.push_str(&format!(" · {mark}{} deleted", format_size(self.deleted)));
+            text.push_str(&format!(
+                " · {deleted}{} deleted",
+                format_size(self.deleted)
+            ));
         }
         text
     }

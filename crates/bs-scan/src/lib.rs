@@ -9,6 +9,9 @@
 //!   crossing into another drive, never following links, never opening cloud
 //!   placeholders, recording what it cannot read instead of failing.
 //! * [`Boundary`] says which mounts count as the same drive.
+//! * Each file gets its category (what colors it on the map) while it is read:
+//!   by its extension, or by the place it lies in when the category tables
+//!   give that place a category. [`ScanOptions::categories`] turns this off.
 //! * [`VolumeInfo`] gives the system's used-bytes figure that progress is
 //!   measured against.
 //!
@@ -28,6 +31,8 @@
 //! ```
 
 mod boundary;
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+mod classify;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod dirent;
 mod pool;

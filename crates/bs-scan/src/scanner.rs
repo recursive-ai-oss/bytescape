@@ -90,6 +90,11 @@ pub struct ScanOptions {
     pub os_used_bytes: Option<u64>,
     /// The shortest time between published snapshots.
     pub publish_interval: Duration,
+    /// Whether the walker sets each file's category (what colors it on the
+    /// map) while it reads the tree. On by default. Turning it off leaves every
+    /// entry unclassified, which only helps to measure what classification
+    /// costs.
+    pub categories: bool,
 }
 
 impl Default for ScanOptions {
@@ -99,6 +104,7 @@ impl Default for ScanOptions {
             threads: None,
             os_used_bytes: None,
             publish_interval: Duration::from_millis(100),
+            categories: true,
         }
     }
 }

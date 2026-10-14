@@ -2,7 +2,7 @@
 //! handy for trying a scan by hand.
 //!
 //! ```text
-//! walk [--threads N] [--sink tree|drop] [--drive] PATH
+//! walk [--threads N] [--sink tree|drop] [--drive] [--no-categories] PATH
 //! ```
 //!
 //! * `--sink tree` (the default) runs the whole pipeline: walker, applier
@@ -10,6 +10,8 @@
 //! * `--sink drop` runs only the walker and discards its batches, to show how
 //!   fast the directory reads alone go.
 //!
+//! * `--no-categories` leaves every entry unclassified, to measure what
+//!   classifying files while reading costs.
 //! * `--drive` asks the platform crate which drive holds `PATH`, enters the
 //!   other mounts of that drive and measures progress against its used bytes,
 //!   the way the application starts a scan.
@@ -24,6 +26,7 @@ fn main() {
     let mut threads = None;
     let mut sink = "tree".to_string();
     let mut use_drive = false;
+    let mut categories = true;
     let mut path = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -31,6 +34,7 @@ fn main() {
             "--threads" => threads = args.next().and_then(|v| v.parse().ok()),
             "--sink" => sink = args.next().unwrap_or_default(),
             "--drive" => use_drive = true,
+            "--no-categories" => categories = false,
             other if !other.starts_with("--") => path = Some(PathBuf::from(other)),
             other => {
                 eprintln!("unknown option {other}");
@@ -39,11 +43,12 @@ fn main() {
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: walk [--threads N] [--sink tree|drop] PATH");
+        eprintln!("usage: walk [--threads N] [--sink tree|drop] [--drive] [--no-categories] PATH");
         std::process::exit(2);
     };
     let mut options = ScanOptions {
         threads,
+        categories,
         ..ScanOptions::default()
     };
     if use_drive {

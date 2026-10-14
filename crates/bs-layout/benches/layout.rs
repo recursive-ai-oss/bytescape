@@ -190,6 +190,33 @@ fn main() {
         row(&mut out, "  layout", &st);
         let st = time(31, || l.refresh(&snap));
         row(&mut out, "  refresh", &st);
+        // Finding a box by id, as hit testing does for every pointer move:
+        // by the layout's index, and by scanning the list for a sample.
+        let ids: Vec<u32> = l.items().iter().map(|i| i.id).collect();
+        let st = time(31, || {
+            ids.iter().filter(|&&id| l.item(id).is_some()).count()
+        });
+        row(&mut out, "  item(id) for every box", &st);
+        let _ = writeln!(
+            out,
+            "    = {:.0} ns per lookup",
+            st.median * 1.0e6 / ids.len().max(1) as f64
+        );
+        let step = (ids.len() / 200).max(1);
+        let sample: Vec<u32> = ids.iter().copied().step_by(step).collect();
+        let st = time(31, || {
+            sample
+                .iter()
+                .filter(|&&id| l.items().iter().any(|i| i.id == id))
+                .count()
+        });
+        row(&mut out, "  scanning the list for a sample of ids", &st);
+        let _ = writeln!(
+            out,
+            "    = {:.0} ns per lookup ({} lookups)",
+            st.median * 1.0e6 / sample.len().max(1) as f64,
+            sample.len()
+        );
     }
 
     // One directory with a million children.

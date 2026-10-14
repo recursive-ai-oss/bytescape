@@ -270,3 +270,37 @@ fn a_volume_root_is_walked_and_its_children_are_listed() {
         assert!(!child.name().contains(&b'\\'));
     }
 }
+
+#[test]
+fn files_are_colored_by_extension_and_by_place() {
+    use bs_knowledge::{Category as Known, Environment, Knowledge};
+    let fx = Fixture::new("categories");
+    fx.file("clip.mp4", 100);
+    fx.file("Photo.JPG", 100);
+    fx.file("README", 10);
+    fx.file("proj/node_modules/pkg/lib.mp3", 10);
+    fx.file("proj/src/main.rs", 10);
+    let result = scan(&fx.0);
+    let snap = &result.snapshot;
+
+    // The build directory is normally in no place of the tables; when it is,
+    // everything in the scan takes that place's category.
+    let env = Environment::from_lookup(|name| std::env::var_os(name));
+    let canonical = std::fs::canonicalize(&fx.0).unwrap();
+    let ambient = Knowledge::new(&env).place(&canonical);
+    let expect = |rel: &str, by_extension: Known| {
+        let want = ambient.unwrap_or(by_extension);
+        assert_eq!(find(snap, rel).category().0, want.number(), "{rel}");
+    };
+    expect("clip.mp4", Known::Video);
+    expect("Photo.JPG", Known::Images);
+    expect("README", Known::Other);
+    expect("proj/src/main.rs", Known::CodeDev);
+    expect("proj/node_modules/pkg/lib.mp3", Known::CodeDev);
+    // Folders keep the unclassified category.
+    assert_eq!(find(snap, "proj").category(), bs_tree::Category::OTHER);
+    assert_eq!(
+        find(snap, "proj/node_modules").category(),
+        bs_tree::Category::OTHER
+    );
+}

@@ -22,10 +22,15 @@
 //! * Files with several links are keyed by `(device, inode)` so the tree counts
 //!   them once, and are flagged as hard links even when only one of their names
 //!   lies inside the scan.
+//! * Each file gets its category as it is read: the directory's place in the
+//!   category tables is looked up once, from the directory's full path, and the
+//!   files in it take that answer or else are told by their extension. The path
+//!   is only ever used as text for that lookup; nothing is opened by it.
 
 pub(crate) mod sys;
 
 use crate::boundary::{Boundary, Placement};
+use crate::classify::{Classifier, Here, join};
 use crate::dirent;
 use crate::pool::{self, Worker};
 use crate::scanner::{ScanContext, ScanEnd, ScanError, Scanner};
@@ -139,10 +144,24 @@ impl Scanner for Walker {
             threads::auto_threads(rotational, cores)
         });
 
-        let shared = Shared { boundary };
+        // Read once, here, before any worker exists.
+        let classifier = ctx
+            .options()
+            .categories
+            .then(Classifier::from_process_environment);
+        let root_path: Box<[u8]> = if classifier.is_some() {
+            canonical.as_os_str().as_bytes().into()
+        } else {
+            Box::default()
+        };
+        let shared = Shared {
+            boundary,
+            classifier,
+        };
         let roots = vec![Task {
             at: At::Open(Arc::new(fd)),
             key,
+            path: root_path,
         }];
         pool::run(ctx, threads, roots, |worker, task| {
             process_dir(&shared, worker, task);
@@ -152,6 +171,8 @@ impl Scanner for Walker {
 
 struct Shared {
     boundary: Boundary,
+    /// `None` when the caller turned categories off.
+    classifier: Option<Classifier>,
 }
 
 enum At {
@@ -167,6 +188,9 @@ enum At {
 struct Task {
     at: At,
     key: DirKey,
+    /// The directory's full path, for the category lookup. Empty when
+    /// nothing is being classified.
+    path: Box<[u8]>,
 }
 
 fn failure_of(err: &io::Error) -> ReadFailure {
@@ -237,7 +261,7 @@ fn meta_for(st: &sys::Stat, kind: NodeKind, mut flags: NodeFlags) -> Meta {
 }
 
 fn process_dir(shared: &Shared, worker: &mut Worker<'_, '_, Task>, task: Task) {
-    let Task { at, key } = task;
+    let Task { at, key, path } = task;
     let dir: Arc<OwnedFd> = match at {
         At::Open(fd) => fd,
         At::Child { parent, name } => {
@@ -263,7 +287,14 @@ fn process_dir(shared: &Shared, worker: &mut Worker<'_, '_, Task>, task: Task) {
     if buf.len() < READ_BUFFER {
         buf.resize(READ_BUFFER, 0);
     }
-    let outcome = list_dir(shared, worker, &dir, key, &mut buf);
+    let here = Here {
+        place: shared
+            .classifier
+            .as_ref()
+            .and_then(|classifier| classifier.place(&path)),
+        path: &path,
+    };
+    let outcome = list_dir(shared, worker, &dir, key, &here, &mut buf);
     READ_BUF.set(buf);
 
     match outcome {
@@ -311,10 +342,11 @@ fn list_dir(
     worker: &mut Worker<'_, '_, Task>,
     dir: &Arc<OwnedFd>,
     key: DirKey,
+    here: &Here<'_>,
     buf: &mut [u8],
 ) -> Listing {
     let mut used = 0usize;
-    let outcome = list_dir_into(shared, worker, dir, key, buf, &mut used);
+    let outcome = list_dir_into(shared, worker, dir, key, here, buf, &mut used);
     if let Some(dirty) = buf.get_mut(..used) {
         dirty.fill(0);
     }
@@ -326,6 +358,7 @@ fn list_dir_into(
     worker: &mut Worker<'_, '_, Task>,
     dir: &Arc<OwnedFd>,
     key: DirKey,
+    here: &Here<'_>,
     buf: &mut [u8],
     used: &mut usize,
 ) -> Listing {
@@ -355,7 +388,7 @@ fn list_dir_into(
             if entry.is_dot_or_dotdot() {
                 continue;
             }
-            handle_entry(shared, worker, dir, key, &entry);
+            handle_entry(shared, worker, dir, key, here, &entry);
             seen += 1;
             if seen.is_multiple_of(FLUSH_CHECK_EVERY) {
                 worker.flush_if_due();
@@ -372,6 +405,7 @@ fn handle_entry(
     worker: &mut Worker<'_, '_, Task>,
     dir: &Arc<OwnedFd>,
     parent_key: DirKey,
+    here: &Here<'_>,
     entry: &dirent::RawEntry<'_>,
 ) {
     let Ok(name_c) = CStr::from_bytes_with_nul(entry.name_with_nul) else {
@@ -415,7 +449,10 @@ fn handle_entry(
 
     let kind = kind_of_mode(st.mode);
     if kind != NodeKind::Dir {
-        let meta = meta_for(&st, kind, NodeFlags::EMPTY);
+        let mut meta = meta_for(&st, kind, NodeFlags::EMPTY);
+        if let Some(classifier) = &shared.classifier {
+            meta.category = classifier.category(here.place, kind, name);
+        }
         worker.tally.files += 1;
         worker.tally.add_bytes(meta.allocated, meta.logical);
         worker.batch().file(kind, parent_key, name, &meta).ok();
@@ -448,12 +485,18 @@ fn handle_entry(
         let meta = meta_for(&st, NodeKind::Dir, NodeFlags::EMPTY);
         worker.tally.add_bytes(meta.allocated, meta.logical);
         worker.batch().dir(child_key, parent_key, name, &meta).ok();
+        let path = if shared.classifier.is_some() {
+            join(here.path, name, b'/')
+        } else {
+            Box::default()
+        };
         worker.spawn(Task {
             at: At::Child {
                 parent: Arc::clone(dir),
                 name: entry.name_with_nul.into(),
             },
             key: child_key,
+            path,
         });
     } else {
         // Another drive's mount. The numbers describe its root, not an entry

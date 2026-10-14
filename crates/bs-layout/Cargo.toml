@@ -13,6 +13,8 @@ publish = false
 bs-tree = { path = "../bs-tree" }
 
 [dev-dependencies]
+# The category numbers the tree stores come from these tables.
+bs-knowledge = { path = "../bs-knowledge" }
 proptest = { version = "1", default-features = false, features = ["std"] }
 
 [[bench]]

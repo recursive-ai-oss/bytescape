@@ -53,6 +53,10 @@
 //!   with the error kind, and the scan carries on.
 //! * A listed name that is not a single path component (it holds a NUL or a
 //!   separator) is recorded as damaged and never opened.
+//! * Each file gets its category as it is read: the directory's place in the
+//!   category tables is looked up once from the directory's full path, and the
+//!   files in it take that answer or else are told by their extension. The path
+//!   is only text for that lookup; nothing is opened by it.
 //! * Every file with a file ID is keyed so the tree can count hard links once
 //!   (the listing has no link count). Names are converted from UTF-16 to WTF-8
 //!   without loss.
@@ -60,6 +64,7 @@
 pub(crate) mod sys;
 
 use crate::OpenHook;
+use crate::classify::{Classifier, Here, join};
 use crate::pool::{self, Worker};
 use crate::scanner::{ScanContext, ScanEnd, ScanError, Scanner};
 use crate::threads;
@@ -133,10 +138,15 @@ enum At {
 struct Task {
     at: At,
     key: DirKey,
+    /// The directory's full path as WTF-8, for the category lookup. Empty
+    /// when nothing is being classified.
+    path: Box<[u8]>,
 }
 
 struct Shared {
     volume_serial: u64,
+    /// `None` when the caller turned categories off.
+    classifier: Option<Classifier>,
 }
 
 impl Scanner for Walker {
@@ -177,14 +187,26 @@ impl Scanner for Walker {
             let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
             threads::auto_threads(None, cores)
         });
+        // Read once, here, before any worker exists.
+        let classifier = ctx
+            .options()
+            .categories
+            .then(Classifier::from_process_environment);
+        let root_path: Box<[u8]> = if classifier.is_some() {
+            name.as_slice().into()
+        } else {
+            Box::default()
+        };
         let shared = Shared {
             volume_serial: info.volume_serial,
+            classifier,
         };
         // The root's handle is the one the walk starts from; it is not
         // opened a second time by path.
         let roots = vec![Task {
             at: At::Open(Arc::new(handle)),
             key,
+            path: root_path,
         }];
         pool::run(ctx, threads, roots, |worker, task| {
             process_dir(&shared, worker, task);
@@ -234,7 +256,7 @@ fn changed_since_listed() -> ReadFailure {
 }
 
 fn process_dir(shared: &Shared, worker: &mut Worker<'_, '_, Task>, task: Task) {
-    let Task { at, key } = task;
+    let Task { at, key, path } = task;
     let handle: Arc<OwnedHandle> = match at {
         At::Open(handle) => handle,
         At::Child { parent, name } => {
@@ -272,7 +294,14 @@ fn process_dir(shared: &Shared, worker: &mut Worker<'_, '_, Task>, task: Task) {
         }
     }
 
-    match list_dir(shared, worker, &handle, key) {
+    let here = Here {
+        place: shared
+            .classifier
+            .as_ref()
+            .and_then(|classifier| classifier.place(&path)),
+        path: &path,
+    };
+    match list_dir(shared, worker, &handle, key, &here) {
         Listing::Complete => worker.batch().listing_done(key),
         Listing::Failed(failure) => {
             worker.batch().unreadable(key, failure);
@@ -293,6 +322,7 @@ fn list_dir(
     worker: &mut Worker<'_, '_, Task>,
     handle: &Arc<OwnedHandle>,
     key: DirKey,
+    here: &Here<'_>,
 ) -> Listing {
     let mut buf = sys::ListBuffer::new(LIST_BUFFER);
     let mut layout = Layout::Extended;
@@ -310,7 +340,7 @@ fn list_dir(
                     layout = Layout::Both;
                     continue;
                 }
-                Layout::Both => return list_with_find(shared, worker, handle, key),
+                Layout::Both => return list_with_find(shared, worker, handle, key, here),
             },
             sys::Listed::Records => {}
         }
@@ -340,7 +370,7 @@ fn list_dir(
                 mtime: rec.mtime,
                 file_id: rec.file_id,
             };
-            handle_item(shared, worker, handle, key, item);
+            handle_item(shared, worker, handle, key, here, item);
             seen += 1;
             if seen.is_multiple_of(256) {
                 worker.flush_if_due();
@@ -361,6 +391,7 @@ fn list_with_find(
     worker: &mut Worker<'_, '_, Task>,
     handle: &Arc<OwnedHandle>,
     key: DirKey,
+    here: &Here<'_>,
 ) -> Listing {
     let path = match sys::final_path(handle) {
         Ok(path) => path,
@@ -394,7 +425,7 @@ fn list_with_find(
             mtime: wininfo::filetime_to_unix(entry.last_write_ticks),
             file_id: None,
         };
-        handle_item(shared, worker, handle, key, item);
+        handle_item(shared, worker, handle, key, here, item);
         if worker.cancelled() {
             return Listing::Cancelled;
         }
@@ -423,6 +454,7 @@ fn handle_item(
     worker: &mut Worker<'_, '_, Task>,
     dir: &Arc<OwnedHandle>,
     parent_key: DirKey,
+    here: &Here<'_>,
     item: Item,
 ) {
     if !wininfo::is_plain_component(&item.name_units) {
@@ -477,12 +509,18 @@ fn handle_item(
                     .batch()
                     .dir(child_key, parent_key, &item.name, &meta)
                     .ok();
+                let path = if shared.classifier.is_some() {
+                    join(here.path, &item.name, b'\\')
+                } else {
+                    Box::default()
+                };
                 worker.spawn(Task {
                     at: At::Child {
                         parent: Arc::clone(dir),
                         name: item.name_units.into_boxed_slice(),
                     },
                     key: child_key,
+                    path,
                 });
             } else {
                 // A placeholder folder: not listed, so what is in it is not
@@ -516,6 +554,11 @@ fn handle_item(
                     volume: shared.volume_serial,
                     id,
                 });
+            }
+            if let Some(classifier) = &shared.classifier {
+                // A cloud placeholder is only named, never opened: its
+                // category comes from its name like any other file's.
+                meta.category = classifier.category(here.place, kind, &item.name);
             }
             worker.tally.files += 1;
             worker.tally.add_bytes(meta.allocated, meta.logical);

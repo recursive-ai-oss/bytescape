@@ -156,6 +156,8 @@ pub(crate) struct Mark {
     pub moved: ByteCount,
     /// The marked subtree's totals were a lower bound (now, or when marked).
     pub lower_bound: bool,
+    /// The marked subtree's allocated size includes an estimate.
+    pub estimated: bool,
 }
 
 /// Facts about the scan as a whole, published with every snapshot.

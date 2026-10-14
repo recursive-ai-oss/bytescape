@@ -357,9 +357,22 @@ pub struct DeleteTotals {
     /// How many of the marks counted here covered a subtree whose totals
     /// were only a lower bound (see [`DeleteTotals::is_lower_bound`]).
     pub(crate) lower_bound_marks: u32,
+    /// How many of the marks counted in `in_bin`, and in `deleted`, covered a
+    /// subtree whose allocated size includes an estimate (see
+    /// [`DeleteTotals::in_bin_is_estimated`]).
+    pub(crate) estimated_in_bin: u32,
+    pub(crate) estimated_deleted: u32,
 }
 
 impl DeleteTotals {
+    pub(crate) fn estimated_mut(&mut self, state: DeleteState) -> Option<&mut u32> {
+        match state {
+            DeleteState::InBin => Some(&mut self.estimated_in_bin),
+            DeleteState::Deleted => Some(&mut self.estimated_deleted),
+            DeleteState::None => None,
+        }
+    }
+
     pub(crate) fn field_mut(&mut self, state: DeleteState) -> Option<&mut ByteCount> {
         match state {
             DeleteState::InBin => Some(&mut self.in_bin),
@@ -369,7 +382,11 @@ impl DeleteTotals {
     }
 
     pub(crate) fn is_zero(&self) -> bool {
-        self.in_bin.is_zero() && self.deleted.is_zero() && self.lower_bound_marks == 0
+        self.in_bin.is_zero()
+            && self.deleted.is_zero()
+            && self.lower_bound_marks == 0
+            && self.estimated_in_bin == 0
+            && self.estimated_deleted == 0
     }
 
     /// Whether these byte counts are only a lower bound: some marked subtree
@@ -377,6 +394,27 @@ impl DeleteTotals {
     /// counted. A confirmation should say "at least".
     pub fn is_lower_bound(&self) -> bool {
         self.lower_bound_marks > 0
+    }
+
+    /// Whether the allocated bytes moved to the bin include an estimate: some
+    /// marked subtree held an entry whose allocated size the filesystem did
+    /// not give (see [`NodeFlags::ESTIMATED_SIZE`]). Show them with "≈". The
+    /// answer is per marked subtree, so a mark over a folder whose estimated
+    /// entry was marked earlier by itself may say "estimated" for bytes that
+    /// are exact; it never says "exact" for an estimate.
+    pub fn in_bin_is_estimated(&self) -> bool {
+        self.estimated_in_bin > 0
+    }
+
+    /// Like [`DeleteTotals::in_bin_is_estimated`], for the permanently
+    /// deleted bytes.
+    pub fn deleted_is_estimated(&self) -> bool {
+        self.estimated_deleted > 0
+    }
+
+    /// Whether either of the two amounts includes an estimate.
+    pub fn is_estimated(&self) -> bool {
+        self.in_bin_is_estimated() || self.deleted_is_estimated()
     }
 }
 
@@ -388,4 +426,7 @@ pub struct Moved {
     /// The bytes are only a lower bound: the subtree had unreadable parts or
     /// lost records. Say "at least" when showing them.
     pub lower_bound: bool,
+    /// The bytes include an estimated allocated size (see
+    /// [`DeleteTotals::is_estimated`]). Say "about" when showing them.
+    pub estimated: bool,
 }

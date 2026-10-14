@@ -11,6 +11,8 @@ publish = false
 
 [dependencies]
 bs-tree = { path = "../bs-tree" }
+# The category tables. No dependencies of its own.
+bs-knowledge = { path = "../bs-knowledge" }
 
 # Directory handles, getdents64 and statx.
 [target.'cfg(target_os = "linux")'.dependencies]

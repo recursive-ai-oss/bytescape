@@ -848,6 +848,10 @@ impl Aggregator {
         let lower_bound = self.store.flags(node).intersects(
             NodeFlags::UNREADABLE | NodeFlags::UNREADABLE_BELOW | NodeFlags::RECORDS_LOST_BELOW,
         );
+        // Every estimated entry sets the flag on the directories above it.
+        // Nothing is added to a complete subtree afterwards, so what is true
+        // now stays true.
+        let estimated = self.store.flags(node).contains(NodeFlags::ESTIMATED_SIZE);
         let mut updated = Vec::new();
         for at in self.chain(node) {
             let mut totals = self.store.delete_totals_of(at);
@@ -859,6 +863,12 @@ impl Aggregator {
                 .ok_or(DeleteError::Inconsistent(id))?;
             if lower_bound {
                 totals.lower_bound_marks = totals.lower_bound_marks.saturating_add(1);
+            }
+            if estimated {
+                let count = totals
+                    .estimated_mut(state)
+                    .ok_or(DeleteError::Inconsistent(id))?;
+                *count = count.saturating_add(1);
             }
             updated.push((at, totals));
         }
@@ -872,12 +882,14 @@ impl Aggregator {
                 state,
                 moved,
                 lower_bound,
+                estimated,
             },
         );
         self.store.set_delete_state(node, state);
         Ok(Moved {
             bytes: moved,
             lower_bound,
+            estimated,
         })
     }
 
@@ -912,6 +924,12 @@ impl Aggregator {
                     .checked_sub(1)
                     .ok_or(DeleteError::Inconsistent(id))?;
             }
+            if mark.estimated {
+                let count = totals
+                    .estimated_mut(mark.state)
+                    .ok_or(DeleteError::Inconsistent(id))?;
+                *count = count.checked_sub(1).ok_or(DeleteError::Inconsistent(id))?;
+            }
             updated.push((at, totals));
         }
         let table = Arc::make_mut(&mut self.store.delete_totals);
@@ -927,6 +945,7 @@ impl Aggregator {
         Ok(Moved {
             bytes: mark.moved,
             lower_bound: mark.lower_bound,
+            estimated: mark.estimated,
         })
     }
 
