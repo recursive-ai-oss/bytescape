@@ -6,9 +6,13 @@
 //! benchmark harness feed the same events in directly, so a scripted zoom takes
 //! exactly the path a user's wheel takes.
 
+pub mod capacity;
 pub mod chrome;
+pub mod info;
+pub mod shell;
 pub mod tree;
 
+use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +30,29 @@ pub struct Layout {
     pub folders: Vec<(u32, ViewId)>,
 }
 
+/// What a source prepared on another thread: the finished layout of a view,
+/// in a form only the source that made it understands.
+pub type Prepared = Box<dyn Any + Send>;
+
+/// Work a source can do on a worker thread.
+pub type RelayoutJob = Box<dyn FnOnce() -> Prepared + Send>;
+
+/// What the info bar says about one box.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemInfo {
+    /// The name, converted for display.
+    pub name: String,
+    /// Allocated bytes the box stands for, as counted so far.
+    pub bytes: u64,
+    /// Allocated bytes of the folder that holds it, when it has one.
+    pub parent_bytes: Option<u64>,
+    /// Files inside (a file counts as one).
+    pub files: u64,
+    /// Still being counted: `bytes` is a lower bound.
+    pub in_progress: bool,
+    pub is_folder: bool,
+}
+
 /// Where views come from. The real implementation sits on the size tree and
 /// the layout code; tests and the benchmark use a synthetic one.
 pub trait ViewSource {
@@ -39,6 +66,35 @@ pub trait ViewSource {
     /// Navigation moved on. Only the views in `keep` (the current stack and
     /// the history) still matter; the source may forget the rest.
     fn prune(&mut self, _keep: &[ViewId]) {}
+    /// The breadcrumb text of a view.
+    fn breadcrumb(&self, _view: ViewId) -> String {
+        String::new()
+    }
+    /// What to tell about box `id` of `view`.
+    fn describe(&self, _view: ViewId, _id: u32) -> Option<ItemInfo> {
+        None
+    }
+    /// Starts laying `view` out again with the data as it is now, on another
+    /// thread. `None` when the source can only lay out in place.
+    fn begin_relayout(&mut self, _view: ViewId, _map: Rect) -> Option<RelayoutJob> {
+        None
+    }
+    /// Takes what the job returned and makes it the view's layout.
+    fn finish_relayout(
+        &mut self,
+        _view: ViewId,
+        _map: Rect,
+        _prepared: Prepared,
+    ) -> Option<Layout> {
+        None
+    }
+}
+
+/// Keys that were held while a button was pressed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Modifiers {
+    pub ctrl: bool,
+    pub shift: bool,
 }
 
 /// A keyboard key the map reacts to.
@@ -47,6 +103,7 @@ pub enum Key {
     Enter,
     Backspace,
     Home,
+    Refresh,
     Escape,
     AltLeft,
     AltRight,
@@ -71,6 +128,13 @@ pub enum InputEvent {
         x: f32,
         y: f32,
     },
+    /// A click with Ctrl or Shift held: Ctrl toggles a box in the selection,
+    /// Shift adds the boxes between the last click and this one.
+    ClickWith {
+        x: f32,
+        y: f32,
+        mods: Modifiers,
+    },
     DoubleClick {
         x: f32,
         y: f32,
@@ -91,6 +155,8 @@ pub enum InputEvent {
 pub enum Effect {
     SetHover(Option<u32>),
     SetSelected(Option<u32>),
+    /// The selection holds several boxes.
+    SetSelection(Vec<u32>),
     /// Show a new view without animation.
     SetView(Arc<Vec<Item>>),
     /// Animate to a new view. `child` is the folder's box in the larger view.
@@ -113,6 +179,34 @@ struct Level {
     stale: bool,
 }
 
+/// A layout to make on a worker thread. See [`App::begin_relayout`].
+pub struct PendingRelayout {
+    token: u64,
+    view: ViewId,
+    map: Rect,
+    job: RelayoutJob,
+}
+
+impl PendingRelayout {
+    /// Does the layout work. Call it on a worker thread.
+    pub fn run(self) -> FinishedRelayout {
+        FinishedRelayout {
+            token: self.token,
+            view: self.view,
+            map: self.map,
+            prepared: (self.job)(),
+        }
+    }
+}
+
+/// The result of a [`PendingRelayout`].
+pub struct FinishedRelayout {
+    token: u64,
+    view: ViewId,
+    map: Rect,
+    prepared: Prepared,
+}
+
 /// History keeps this many entries on each side.
 const HISTORY_LIMIT: usize = 256;
 
@@ -122,7 +216,14 @@ pub struct App<S: ViewSource> {
     map: Rect,
     stack: Vec<Level>,
     hover: Option<u32>,
-    selected: Option<u32>,
+    /// Selected boxes in the order they were picked; the last is the primary
+    /// one, which Enter opens and the info bar describes.
+    selected: Vec<u32>,
+    /// Where a Shift-click range starts.
+    anchor: Option<u32>,
+    /// Changes with every navigation, so work prepared for an earlier view is
+    /// recognized and dropped.
+    nav_token: u64,
     /// Whether the renderer is still running a zoom. The renderer owns the
     /// animation clock; the host copies its answer here before each event.
     animating: bool,
@@ -143,7 +244,9 @@ impl<S: ViewSource> App<S> {
                 stale: false,
             }],
             hover: None,
-            selected: None,
+            selected: Vec::new(),
+            anchor: None,
+            nav_token: 0,
             animating: false,
             history_back: Vec::new(),
             history_forward: Vec::new(),
@@ -191,8 +294,50 @@ impl<S: ViewSource> App<S> {
         self.hover
     }
 
+    /// The primary selected box.
     pub fn selected(&self) -> Option<u32> {
-        self.selected
+        self.selected.last().copied()
+    }
+
+    /// Every selected box.
+    pub fn selection(&self) -> &[u32] {
+        &self.selected
+    }
+
+    /// Whether there is a view to go back to.
+    pub fn can_go_back(&self) -> bool {
+        !self.history_back.is_empty()
+    }
+
+    /// Whether there is a view to go forward to.
+    pub fn can_go_forward(&self) -> bool {
+        !self.history_forward.is_empty()
+    }
+
+    /// Whether there is a folder above this view.
+    pub fn can_go_up(&self) -> bool {
+        self.stack.len() > 1
+    }
+
+    /// What the info bar tells about the box under the pointer, or else about
+    /// the selection. `None` when there is neither.
+    pub fn info(&self) -> Option<Vec<ItemInfo>> {
+        let view = self.current_view();
+        let ids: Vec<u32> = match self.hover {
+            Some(h) => vec![h],
+            None => self.selected.clone(),
+        };
+        let infos: Vec<ItemInfo> = ids
+            .iter()
+            .filter_map(|&id| self.source.describe(view, id))
+            .collect();
+        (!infos.is_empty()).then_some(infos)
+    }
+
+    /// Whether the info bar is describing the pointer rather than the
+    /// selection.
+    pub fn hovering(&self) -> bool {
+        self.hover.is_some()
     }
 
     fn top(&self) -> Option<&Level> {
@@ -243,13 +388,8 @@ impl<S: ViewSource> App<S> {
                     fx.push(Effect::SetHover(None));
                 }
             }
-            InputEvent::Click { x, y } => {
-                let id = self.hit(x, y).map(|i| i.id);
-                if id != self.selected {
-                    self.selected = id;
-                    fx.push(Effect::SetSelected(id));
-                }
-            }
+            InputEvent::Click { x, y } => self.click(x, y, Modifiers::default(), &mut fx),
+            InputEvent::ClickWith { x, y, mods } => self.click(x, y, mods, &mut fx),
             InputEvent::Wheel { x, y, steps } => {
                 self.skip_running_animation(&mut fx);
                 if steps > 0.0 {
@@ -264,7 +404,7 @@ impl<S: ViewSource> App<S> {
             }
             InputEvent::Key(Key::Enter) => {
                 self.skip_running_animation(&mut fx);
-                if let Some(sel) = self.selected {
+                if let Some(sel) = self.selected() {
                     let target = self.top().and_then(|l| {
                         let it = l.layout.items.iter().find(|i| i.id == sel)?;
                         let view = l.layout.folders.iter().find(|(id, _)| *id == sel)?.1;
@@ -292,9 +432,20 @@ impl<S: ViewSource> App<S> {
                 self.after_set_view(&mut fx);
             }
             InputEvent::Key(Key::Escape) => {
-                if self.selected.take().is_some() {
+                if !self.selected.is_empty() {
+                    self.selected.clear();
+                    self.anchor = None;
                     fx.push(Effect::SetSelected(None));
                 }
+            }
+            InputEvent::Key(Key::Refresh) => {
+                self.nav_token += 1;
+                let top = self.stack.len().saturating_sub(1);
+                for (i, level) in self.stack.iter_mut().enumerate() {
+                    level.stale = i != top;
+                }
+                self.refresh_top_now();
+                self.restore_after_relayout(&mut fx);
             }
             InputEvent::Key(Key::AltLeft) => {
                 self.skip_running_animation(&mut fx);
@@ -313,28 +464,12 @@ impl<S: ViewSource> App<S> {
                 }
             }
             InputEvent::DataChanged => {
-                let last = self.stack.len().saturating_sub(1);
+                let top = self.stack.len().saturating_sub(1);
                 for (i, level) in self.stack.iter_mut().enumerate() {
-                    if i == last {
-                        level.layout = self.source.layout(level.view, self.map);
-                        level.stale = false;
-                    } else {
-                        level.stale = true;
-                    }
+                    level.stale = i != top;
                 }
-                fx.push(Effect::SetView(self.items()));
-                // The renderer forgets hover and selection with the old view;
-                // give them back when their boxes are still there.
-                let present = |id: u32, items: &[Item]| items.iter().any(|i| i.id == id);
-                let items = self.items();
-                self.hover = self.hover.filter(|&id| present(id, &items));
-                self.selected = self.selected.filter(|&id| present(id, &items));
-                if let Some(id) = self.hover {
-                    fx.push(Effect::SetHover(Some(id)));
-                }
-                if let Some(id) = self.selected {
-                    fx.push(Effect::SetSelected(Some(id)));
-                }
+                self.refresh_top_now();
+                self.restore_after_relayout(&mut fx);
             }
             InputEvent::Resized { map } => {
                 self.map = map;
@@ -355,11 +490,153 @@ impl<S: ViewSource> App<S> {
                     })
                     .collect();
                 self.hover = None;
-                self.selected = None;
+                self.selected.clear();
+                self.anchor = None;
+                self.nav_token += 1;
                 self.animating = false;
                 fx.push(Effect::SetView(self.items()));
             }
         }
+        fx
+    }
+
+    /// Lays the top of the stack out again, here and now.
+    fn refresh_top_now(&mut self) {
+        let map = self.map;
+        if let Some(level) = self.stack.last_mut() {
+            level.layout = self.source.layout(level.view, map);
+            level.stale = false;
+        }
+    }
+
+    /// After the top view got a new layout for the same folder: show it and
+    /// give hover and selection back to the boxes that are still there. The
+    /// renderer forgets both with the old view.
+    fn restore_after_relayout(&mut self, fx: &mut Vec<Effect>) {
+        fx.push(Effect::SetView(self.items()));
+        let items = self.items();
+        let present = |id: u32| items.iter().any(|i| i.id == id);
+        self.hover = self.hover.filter(|&id| present(id));
+        self.selected.retain(|&id| present(id));
+        if let Some(id) = self.hover {
+            fx.push(Effect::SetHover(Some(id)));
+        }
+        if !self.selected.is_empty() {
+            fx.push(self.selection_effect());
+        }
+    }
+
+    fn selection_effect(&self) -> Effect {
+        match self.selected.as_slice() {
+            [] => Effect::SetSelected(None),
+            [one] => Effect::SetSelected(Some(*one)),
+            many => Effect::SetSelection(many.to_vec()),
+        }
+    }
+
+    fn click(&mut self, x: f32, y: f32, mods: Modifiers, fx: &mut Vec<Effect>) {
+        let Some(id) = self.hit(x, y).map(|i| i.id) else {
+            return;
+        };
+        let next: Vec<u32> = if mods.shift {
+            let from = self.anchor.unwrap_or(id);
+            let mut range = self.range_between(from, id);
+            // A range adds to what was selected before it.
+            let mut all = self.selected.clone();
+            all.retain(|i| !range.contains(i));
+            all.append(&mut range);
+            // The clicked box is the primary one.
+            all.retain(|&i| i != id);
+            all.push(id);
+            all
+        } else if mods.ctrl {
+            let mut all = self.selected.clone();
+            if let Some(at) = all.iter().position(|&i| i == id) {
+                all.remove(at);
+            } else {
+                all.push(id);
+            }
+            self.anchor = Some(id);
+            all
+        } else {
+            self.anchor = Some(id);
+            vec![id]
+        };
+        if next != self.selected {
+            self.selected = next;
+            fx.push(self.selection_effect());
+        }
+    }
+
+    /// The boxes from `a` to `b` in layout order that share a parent and a
+    /// depth. When the two do not, only `b`.
+    fn range_between(&self, a: u32, b: u32) -> Vec<u32> {
+        let Some(level) = self.top() else {
+            return vec![b];
+        };
+        let items = &level.layout.items;
+        let at = |id: u32| items.iter().position(|i| i.id == id);
+        let (Some(ia), Some(ib)) = (at(a), at(b)) else {
+            return vec![b];
+        };
+        let depth = items[ia].depth;
+        let parent_of = |i: usize| (0..i).rev().find(|&p| items[p].depth + 1 == items[i].depth);
+        if items[ib].depth != depth || depth == 0 || parent_of(ia) != parent_of(ib) {
+            return vec![b];
+        }
+        let parent = parent_of(ia);
+        let (lo, hi) = (ia.min(ib), ia.max(ib));
+        (lo..=hi)
+            .filter(|&i| items[i].depth == depth && parent_of(i) == parent)
+            .map(|i| items[i].id)
+            .collect()
+    }
+
+    /// Starts laying the current view out again on another thread, for sources
+    /// that can (the data behind the view changed). The window runs the job
+    /// and hands the result to [`App::finish_relayout`]; until then the old
+    /// layout stays on screen. `None` when the source lays out in place; use
+    /// [`InputEvent::DataChanged`] then.
+    pub fn begin_relayout(&mut self) -> Option<PendingRelayout> {
+        let view = self.current_view();
+        let map = self.map;
+        let job = self.source.begin_relayout(view, map)?;
+        let top = self.stack.len().saturating_sub(1);
+        for (i, level) in self.stack.iter_mut().enumerate() {
+            level.stale = i != top;
+        }
+        Some(PendingRelayout {
+            token: self.nav_token,
+            view,
+            map,
+            job,
+        })
+    }
+
+    /// Whether a finished layout still fits the view on screen. When it does
+    /// not (the user navigated or resized meanwhile) the window starts another.
+    pub fn relayout_is_current(&self, done: &FinishedRelayout) -> bool {
+        done.token == self.nav_token && done.view == self.current_view() && done.map == self.map
+    }
+
+    /// Shows a layout prepared by [`App::begin_relayout`]. A result that no
+    /// longer fits (the user navigated or resized meanwhile) is dropped.
+    pub fn finish_relayout(&mut self, done: FinishedRelayout) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        if !self.relayout_is_current(&done) {
+            return fx;
+        }
+        let Some(layout) = self
+            .source
+            .finish_relayout(done.view, done.map, done.prepared)
+        else {
+            return fx;
+        };
+        if let Some(level) = self.stack.last_mut() {
+            level.layout = layout;
+            level.stale = false;
+        }
+        self.restore_after_relayout(&mut fx);
         fx
     }
 
@@ -389,7 +666,9 @@ impl<S: ViewSource> App<S> {
         });
         self.prune_views();
         self.hover = None;
-        self.selected = None;
+        self.selected.clear();
+        self.anchor = None;
+        self.nav_token += 1;
         fx.push(Effect::Zoom {
             direction: ZoomDirection::In,
             items,
@@ -421,7 +700,9 @@ impl<S: ViewSource> App<S> {
             .map(|i| i.rect)
             .unwrap_or(self.map);
         self.hover = None;
-        self.selected = None;
+        self.selected.clear();
+        self.anchor = None;
+        self.nav_token += 1;
         fx.push(Effect::Zoom {
             direction: ZoomDirection::Out,
             items: Arc::clone(&parent.layout.items),
@@ -483,7 +764,9 @@ impl<S: ViewSource> App<S> {
         self.refresh_top();
         self.prune_views();
         self.hover = None;
-        self.selected = None;
+        self.selected.clear();
+        self.anchor = None;
+        self.nav_token += 1;
         fx.push(Effect::SetView(self.items()));
         fx.push(Effect::ViewChanged(self.current_view()));
     }

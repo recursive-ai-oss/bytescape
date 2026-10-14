@@ -181,6 +181,7 @@ name = "bs-ui"
 version = "0.1.0"
 dependencies = [
  "bs-layout",
+ "bs-platform",
  "bs-render",
  "bs-tree",
 ]
@@ -222,6 +223,7 @@ name = "bytescape"
 version = "0.1.0"
 dependencies = [
  "bs-layout",
+ "bs-platform",
  "bs-render",
  "bs-scan",
  "bs-tree",

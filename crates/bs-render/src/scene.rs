@@ -83,9 +83,11 @@ pub const CATEGORY_NAMES: [&str; CATEGORY_COUNT] = [
     "Other",
 ];
 
-/// Base hue of each category.
+/// Base color of each category: the Okabe-Ito set, with a plum for code and a
+/// light gray for other files, chosen so no two categories merge under simulated
+/// colorblindness (see the palette tests).
 pub const CATEGORY_BASES: [u32; CATEGORY_COUNT] = [
-    0xD55E00, 0x009E73, 0xCC79A7, 0x56B4E9, 0xE69F00, 0x0072B2, 0x7F6BB0, 0xF0E442, 0x8C8C93,
+    0xD55E00, 0x009E73, 0xCC79A7, 0x56B4E9, 0xE69F00, 0x0072B2, 0x7B4C80, 0xF0E442, 0xBEBEBE,
 ];
 
 /// One of the two palettes, chosen from the OS light/dark setting.
@@ -210,6 +212,11 @@ pub struct SceneStyle {
     pub em: f32,
     /// Draw labels. Zoom animation frames draw without them.
     pub labels: bool,
+    /// While set, every file and group outside this category is dimmed, and so
+    /// is everything that has no category (the legend is being hovered).
+    pub dim_except: Option<u8>,
+    /// Opacity of the title text of folders still being counted; 1.0 is solid.
+    pub pulse: f32,
 }
 
 impl SceneStyle {
@@ -218,6 +225,19 @@ impl SceneStyle {
             scale,
             em: font_logical_px * scale,
             labels,
+            dim_except: None,
+            pulse: 1.0,
+        }
+    }
+
+    /// Whether the legend hover dims this item.
+    pub fn dims(&self, item: &Item) -> bool {
+        match self.dim_except {
+            None => false,
+            Some(c) => match item.kind {
+                ItemKind::FileTile | ItemKind::Group => item.category != c,
+                _ => true,
+            },
         }
     }
 
@@ -431,9 +451,15 @@ fn finish<C: Canvas>(canvas: &mut C, item: &Item, r: Rect, pal: &Palette, st: &S
             draw_name(canvas, &label.name, style, r, st);
         }
     }
-    if item.flags.contains(Flags::DIMMED) {
+    if item.flags.contains(Flags::DIMMED) || st.dims(item) {
         canvas.fill_rect(r, pal.bg.with_opacity(0.75));
     }
+}
+
+/// The title bar of a nested folder box.
+pub fn title_band(rect: Rect, st: &SceneStyle) -> Rect {
+    let inner = inset(rect.snapped(), 1.0);
+    Rect::new(inner.x, inner.y, inner.w, st.title_height().min(inner.h))
 }
 
 fn draw_title<C: Canvas>(canvas: &mut C, item: &Item, band: Rect, pal: &Palette, st: &SceneStyle) {
@@ -447,10 +473,16 @@ fn draw_title<C: Canvas>(canvas: &mut C, item: &Item, band: Rect, pal: &Palette,
     let ty = band.y + ((band.h - st.em * 1.25) / 2.0).round().max(0.0);
     let mut avail = band.w - 2.0 * pad;
     canvas.push_clip(band);
+    // A folder still being counted breathes once a second in its title text.
+    let fade = if item.flags.contains(Flags::IN_PROGRESS) {
+        st.pulse.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
     let size_style = TextStyle {
         size: st.font(),
         scale: st.scale,
-        color: pal.text_secondary,
+        color: pal.text_secondary.with_opacity(fade),
     };
     let mut size_w = 0.0;
     if !label.size.is_empty()
@@ -462,7 +494,7 @@ fn draw_title<C: Canvas>(canvas: &mut C, item: &Item, band: Rect, pal: &Palette,
     }
     avail -= size_w;
     let name_style = TextStyle {
-        color: pal.text,
+        color: pal.text.with_opacity(fade),
         ..size_style
     };
     canvas.draw_text(&label.name, name_style, band.x + pad, ty, avail.max(1.0));

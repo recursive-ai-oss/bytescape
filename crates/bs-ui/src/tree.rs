@@ -9,11 +9,16 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bs_layout::{DrawItem, ItemKind as LayoutKind, Metrics, ViewId, ViewTable, ViewTarget};
+use bs_layout::{
+    DrawItem, ItemKind as LayoutKind, ItemRef, Metrics, ViewId, ViewTable, ViewTarget,
+};
 use bs_render::{Flags, Item, ItemKind, ItemLabel, Rect};
-use bs_tree::{NodeId, Progress, Snapshot};
+use bs_tree::{NodeId, NodeKind, Progress, Snapshot};
 
-use crate::{Layout, ViewSource};
+use crate::{ItemInfo, Layout, Prepared, RelayoutJob, ViewSource};
+
+/// How many recent layouts are kept so the info bar can describe their boxes.
+const KEPT_LAYOUTS: usize = 8;
 
 /// What the latest layout cost, for the host to throttle and report.
 #[derive(Clone, Copy, Debug, Default)]
@@ -31,6 +36,15 @@ pub struct TreeSource {
     root: ViewId,
     metrics: Metrics,
     last: LayoutStats,
+    /// The latest layouts, newest last. Hover asks them what a box is.
+    laid: Vec<(ViewId, Arc<bs_layout::Layout>)>,
+}
+
+/// A layout made on a worker thread, waiting to be adopted.
+struct Done {
+    laid: bs_layout::Layout,
+    items: Vec<Item>,
+    took: Duration,
 }
 
 impl TreeSource {
@@ -45,6 +59,7 @@ impl TreeSource {
             root,
             metrics,
             last: LayoutStats::default(),
+            laid: Vec::new(),
         })
     }
 
@@ -68,6 +83,14 @@ impl TreeSource {
     /// Cost of the most recent layout.
     pub fn last_layout(&self) -> LayoutStats {
         self.last
+    }
+
+    fn remember(&mut self, view: ViewId, laid: Arc<bs_layout::Layout>) {
+        self.laid.retain(|(v, _)| *v != view);
+        self.laid.push((view, laid));
+        if self.laid.len() > KEPT_LAYOUTS {
+            self.laid.remove(0);
+        }
     }
 
     /// The folder a view shows, or the folder a group view was taken from.
@@ -121,6 +144,7 @@ impl ViewSource for TreeSource {
             items: items.len(),
             took: started.elapsed(),
         };
+        self.remember(view, Arc::new(laid));
         Layout {
             items: Arc::new(items),
             folders,
@@ -137,6 +161,82 @@ impl ViewSource for TreeSource {
 
     fn prune(&mut self, keep: &[ViewId]) {
         self.table.prune(keep);
+        self.laid.retain(|(v, _)| keep.contains(v));
+    }
+
+    fn breadcrumb(&self, view: ViewId) -> String {
+        TreeSource::breadcrumb(self, view)
+    }
+
+    fn describe(&self, view: ViewId, id: u32) -> Option<ItemInfo> {
+        let laid = &self.laid.iter().find(|(v, _)| *v == view)?.1;
+        let bytes = laid.item(id)?.bytes;
+        match laid.item_ref(id)? {
+            ItemRef::Node(node_id) => {
+                let node = self.snapshot.node(node_id)?;
+                let is_folder = node.kind() == NodeKind::Dir;
+                Some(ItemInfo {
+                    name: bs_layout::display_name(node.name()).into_string(),
+                    bytes,
+                    parent_bytes: node.parent().map(|p| p.allocated()),
+                    files: if is_folder {
+                        u64::from(node.file_count())
+                    } else {
+                        1
+                    },
+                    in_progress: node.is_in_progress(),
+                    is_folder,
+                })
+            }
+            ItemRef::Group(spec) => {
+                let folder = self.snapshot.node(spec.folder)?;
+                Some(ItemInfo {
+                    name: format!(
+                        "{} small items",
+                        bs_layout::format_count(spec.members.len() as u64)
+                    ),
+                    bytes,
+                    parent_bytes: Some(folder.allocated()),
+                    files: spec.members.len() as u64,
+                    in_progress: folder.is_in_progress(),
+                    is_folder: false,
+                })
+            }
+        }
+    }
+
+    fn begin_relayout(&mut self, view: ViewId, map: Rect) -> Option<RelayoutJob> {
+        let target = self.table.target(view).cloned()?;
+        let snapshot = Arc::clone(&self.snapshot);
+        let metrics = self.metrics;
+        Some(Box::new(move || {
+            let started = Instant::now();
+            let area = bs_layout::Rect::new(map.x, map.y, map.w, map.h);
+            let laid = bs_layout::layout(&snapshot, &target, area, metrics);
+            let items: Vec<Item> = laid.items().iter().map(to_item).collect();
+            let done: Prepared = Box::new(Done {
+                laid,
+                items,
+                took: started.elapsed(),
+            });
+            done
+        }))
+    }
+
+    fn finish_relayout(&mut self, view: ViewId, _map: Rect, prepared: Prepared) -> Option<Layout> {
+        let done = prepared.downcast::<Done>().ok()?;
+        let Done { laid, items, took } = *done;
+        // Offers are valid until this view is registered again.
+        let folders = self.table.register(view, &laid);
+        self.last = LayoutStats {
+            items: items.len(),
+            took,
+        };
+        self.remember(view, Arc::new(laid));
+        Some(Layout {
+            items: Arc::new(items),
+            folders,
+        })
     }
 }
 

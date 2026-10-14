@@ -9,9 +9,13 @@ use std::time::Duration;
 use tiny_skia::{Pixmap, PixmapMut};
 
 use crate::canvas::Canvas;
+use crate::chrome::{Chrome, draw_chrome};
 use crate::geom::{IRect, Rect};
 use crate::pixel;
-use crate::scene::{Bar, Item, Palette, SceneStyle, draw_bars, draw_items, draw_overlay};
+use crate::scene::{
+    Bar, Flags, Item, ItemKind, Palette, SceneStyle, draw_bars, draw_items, draw_overlay,
+    title_band,
+};
 use crate::skia::{HatchTiles, SkiaCanvas};
 use crate::text::TextEngine;
 use crate::zoom::{ZoomFrame, compose_zoom, parallel_bands, zoom_geometry};
@@ -60,14 +64,16 @@ pub struct Renderer {
     hatches: HatchTiles,
     threads: usize,
     items: Arc<Vec<Item>>,
-    bars: Vec<Bar>,
+    chrome: Chrome,
     index: HashMap<u32, usize>,
     front: Pixmap,
     stub: Pixmap,
     pool: Vec<Pixmap>,
     labels_drawn: bool,
     hover: Option<u32>,
-    selected: Option<u32>,
+    selected: Vec<u32>,
+    dim: Option<u8>,
+    pulse: f32,
     dirty: Option<IRect>,
     full_dirty: bool,
     anim: Option<Anim>,
@@ -109,14 +115,16 @@ impl Renderer {
             hatches: HatchTiles::default(),
             threads,
             items: Arc::new(Vec::new()),
-            bars: Vec::new(),
+            chrome: Chrome::default(),
             index: HashMap::new(),
             front,
             stub: Pixmap::new(1, 1)?,
             pool: Vec::new(),
             labels_drawn: false,
             hover: None,
-            selected: None,
+            selected: Vec::new(),
+            dim: None,
+            pulse: 1.0,
             dirty: None,
             full_dirty: true,
             anim: None,
@@ -182,7 +190,10 @@ impl Renderer {
     }
 
     pub fn style(&self, labels: bool) -> SceneStyle {
-        SceneStyle::new(self.scale, self.font_px, labels)
+        let mut st = SceneStyle::new(self.scale, self.font_px, labels);
+        st.dim_except = self.dim;
+        st.pulse = self.pulse;
+        st
     }
 
     /// Jumps a running zoom to its end, rendering the new view at full quality.
@@ -215,13 +226,87 @@ impl Renderer {
         self.index = items.iter().enumerate().map(|(i, it)| (it.id, i)).collect();
         self.items = items;
         self.hover = None;
-        self.selected = None;
+        self.selected.clear();
     }
 
     /// Sets the chrome bars drawn over the map and repaints everything.
     pub fn set_bars(&mut self, bars: Vec<Bar>) {
-        self.bars = bars;
+        self.chrome = Chrome {
+            bars,
+            widgets: Vec::new(),
+        };
         self.invalidate();
+    }
+
+    /// Replaces the window chrome. When only some widgets differ from the
+    /// current ones, only their rectangles are repainted.
+    /// Returns whether anything changed.
+    pub fn set_chrome(&mut self, chrome: Chrome) -> bool {
+        if self.chrome == chrome {
+            return false;
+        }
+        let regions = self.chrome.changed_regions(&chrome);
+        self.chrome = chrome;
+        let partial = regions.filter(|_| !self.full_dirty && self.anim.is_none());
+        match partial {
+            Some(regions) => {
+                for r in regions {
+                    self.repaint_region(r);
+                }
+            }
+            None => self.invalidate(),
+        }
+        true
+    }
+
+    /// The chrome on screen.
+    pub fn chrome(&self) -> &Chrome {
+        &self.chrome
+    }
+
+    /// Dims every file and group outside `category` (the legend is hovered),
+    /// or clears the dimming. Repaints the map without laying anything out
+    /// again.
+    pub fn set_dim(&mut self, category: Option<u8>) {
+        if self.dim == category {
+            return;
+        }
+        self.dim = category;
+        if self.anim.is_some() || self.full_dirty {
+            // The picture is painted again anyway.
+            self.invalidate();
+            return;
+        }
+        let Some(region) = self.items.iter().map(|i| i.rect).reduce(|a, b| a.union(&b)) else {
+            return;
+        };
+        self.repaint_region(region);
+    }
+
+    /// Sets how solid the title text of folders still being counted is, and
+    /// repaints just those title bars.
+    pub fn set_pulse(&mut self, pulse: f32) {
+        if (self.pulse - pulse).abs() < 0.001 {
+            return;
+        }
+        self.pulse = pulse;
+        if self.anim.is_some() || self.full_dirty {
+            return;
+        }
+        let st = self.style(self.labels_drawn);
+        let bands: Vec<Rect> = self
+            .items
+            .iter()
+            .filter(|i| {
+                i.kind == ItemKind::FolderTitled
+                    && i.label.is_some()
+                    && i.flags.contains(Flags::IN_PROGRESS)
+            })
+            .map(|i| title_band(i.rect, &st))
+            .collect();
+        for band in bands {
+            self.repaint_region(band);
+        }
     }
 
     /// Replaces the view without animation and repaints everything.
@@ -238,7 +323,7 @@ impl Renderer {
         let stride = w as usize * 4;
         let band_rows = (h as usize / (self.threads * 4)).clamp(16, 256);
         let pal = &self.palette;
-        let bars = &self.bars;
+        let chrome = &self.chrome;
         parallel_bands(
             pixmap.data_mut(),
             stride,
@@ -259,7 +344,7 @@ impl Renderer {
                 let region = Rect::new(0.0, row0 as f32, w as f32, rows as f32);
                 canvas_fill_bg(&mut canvas, region, pal);
                 draw_items(&mut canvas, items, pal, &style, Some(region));
-                draw_bars(&mut canvas, bars, pal, &style, Some(region));
+                draw_chrome(&mut canvas, chrome, pal, &style, Some(region));
             },
         );
     }
@@ -276,20 +361,21 @@ impl Renderer {
         self.paint_overlays(None);
     }
 
-    fn overlay_rects(&self) -> [Option<(Rect, bool, bool)>; 2] {
-        let rect_of = |id: Option<u32>| {
-            id.and_then(|id| self.index.get(&id))
-                .and_then(|&i| self.items.get(i))
-                .map(|it| it.rect)
-        };
-        let hover = rect_of(self.hover);
-        let sel = rect_of(self.selected);
-        [
-            sel.map(|r| (r, self.hover.is_some() && self.hover == self.selected, true)),
-            hover
-                .filter(|_| self.hover != self.selected)
-                .map(|r| (r, true, false)),
-        ]
+    /// Outlines to draw: `(rect, hovered, selected)`.
+    fn overlay_rects(&self) -> Vec<(Rect, bool, bool)> {
+        let mut out = Vec::new();
+        for &id in &self.selected {
+            if let Some(r) = self.rect_of(Some(id)) {
+                out.push((r, self.hover == Some(id), true));
+            }
+        }
+        if let Some(id) = self.hover
+            && !self.selected.contains(&id)
+            && let Some(r) = self.rect_of(Some(id))
+        {
+            out.push((r, true, false));
+        }
+        out
     }
 
     fn paint_overlays(&mut self, region: Option<Rect>) {
@@ -301,7 +387,7 @@ impl Renderer {
         if let Some(r) = region {
             canvas.push_clip(r);
         }
-        for (rect, hover, selected) in overlays.into_iter().flatten() {
+        for (rect, hover, selected) in overlays {
             if region.is_none_or(|r| r.intersects(&rect.inflate(2.0 * scale))) {
                 draw_overlay(&mut canvas, rect, &pal, hover, selected, scale);
             }
@@ -330,7 +416,13 @@ impl Renderer {
                 &style,
                 Some(region),
             );
-            draw_bars(&mut canvas, &self.bars, &self.palette, &style, Some(region));
+            draw_chrome(
+                &mut canvas,
+                &self.chrome,
+                &self.palette,
+                &style,
+                Some(region),
+            );
         }
         self.paint_overlays(Some(region));
         let ir = region.outer_pixels();
@@ -376,11 +468,12 @@ impl Renderer {
             self.hover = id;
             return;
         }
+        let selected = |s: &Self, id: Option<u32>| id.is_some_and(|i| s.selected.contains(&i));
         let old = self.rect_of(self.hover);
-        let old_selected = self.hover.is_some() && self.hover == self.selected;
+        let old_selected = selected(self, self.hover);
         self.hover = id;
         let new = self.rect_of(id);
-        let new_selected = id.is_some() && id == self.selected;
+        let new_selected = selected(self, id);
         if let Some(r) = old {
             self.repaint_outline(r, old_selected);
         }
@@ -389,20 +482,31 @@ impl Renderer {
         }
     }
 
-    /// Moves the selection outline. Only the old and new boxes repaint.
+    /// Moves the selection outline to one box, or to none.
     pub fn set_selected(&mut self, id: Option<u32>) {
-        if self.selected == id {
+        let ids: Vec<u32> = id.into_iter().collect();
+        self.set_selection(&ids);
+    }
+
+    /// Selects the boxes in `ids`. Only the boxes whose state changed repaint.
+    pub fn set_selection(&mut self, ids: &[u32]) {
+        if self.selected == ids {
             return;
         }
+        let old = std::mem::replace(&mut self.selected, ids.to_vec());
         if self.anim.is_some() {
-            self.selected = id;
             return;
         }
-        let old = self.rect_of(self.selected);
-        self.selected = id;
-        let new = self.rect_of(id);
-        for r in [old, new].into_iter().flatten() {
-            self.repaint_outline(r, true);
+        let changed: Vec<u32> = old
+            .iter()
+            .filter(|i| !ids.contains(i))
+            .chain(ids.iter().filter(|i| !old.contains(i)))
+            .copied()
+            .collect();
+        for id in changed {
+            if let Some(r) = self.rect_of(Some(id)) {
+                self.repaint_outline(r, true);
+            }
         }
     }
 

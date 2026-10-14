@@ -4,22 +4,31 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use bs_layout::Metrics;
+use bs_platform::appearance::{Appearance, ColorScheme};
+use bs_platform::drives::Capacity;
 use bs_render::present::Presenter;
-use bs_render::{Flags, Item, ItemKind, ItemLabel, Painted, Palette, Rect, Renderer, TextEngine};
+use bs_render::{
+    Chrome, Flags, Item, ItemKind, ItemLabel, Painted, Palette, Rect, Renderer, TextEngine,
+};
+use bs_tree::Snapshot;
+use bs_ui::capacity::{Breakdown, FakeRecycleBin, RecycleBinSource};
+use bs_ui::shell::{Look, Shell, ShellEffect};
 use bs_ui::tree::{TreeSource, scan_status};
-use bs_ui::{App, Effect, InputEvent, Key, chrome};
+use bs_ui::{App, Effect, FinishedRelayout, InputEvent, Key, Modifiers, PendingRelayout, chrome};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
-use winit::window::{Theme, Window, WindowId};
+use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 use crate::bench::{self, FrameSink, Offscreen, Script};
 use crate::live::{ScanDriver, Tick};
+use crate::open;
 use crate::synth::{LayoutParams, SynthSource, format_size};
 use crate::{Mode, ShotOptions, ZoomOptions, font_px, real};
 
@@ -54,8 +63,7 @@ fn build_scene(
     scale: f32,
     boxes: Option<usize>,
 ) -> (Scene, Option<(f32, usize)>) {
-    let (bars, map) = chrome::layout(size.0 as f32, size.1 as f32, scale, "", "");
-    drop(bars);
+    let map = chrome::map_rect(size.0 as f32, size.1 as f32, scale);
     let params = LayoutParams {
         scale,
         em: font_px() * scale,
@@ -99,6 +107,80 @@ pub(crate) fn make_renderer(
         r.set_reduced_motion(true);
     }
     Ok(r)
+}
+
+/// The chrome of a window that shows no scan: for benchmarks and pictures. A
+/// capacity bar with made-up figures stands in for a drive, and `hot` is a
+/// legend swatch the pointer rests on.
+pub(crate) struct ChromeSpec<'a> {
+    pub size: (u32, u32),
+    pub scale: f32,
+    pub dark: bool,
+    pub crumb: &'a str,
+    pub status: &'a str,
+    pub hot: Option<u8>,
+    pub capacity: Option<Breakdown>,
+}
+
+pub(crate) fn static_chrome(text: &TextEngine, spec: ChromeSpec<'_>) -> (Chrome, Rect) {
+    let ChromeSpec {
+        size,
+        scale,
+        dark,
+        crumb,
+        status,
+        hot,
+        capacity,
+    } = spec;
+    let mut shell: Shell<TreeSource> = Shell::new(
+        size,
+        scale,
+        font_px(),
+        text.clone(),
+        Look { dark, accent: None },
+    );
+    shell.set_crumb(crumb.into());
+    shell.set_status(status.into(), false);
+    if let Some(b) = capacity {
+        shell.set_capacity(b, Duration::ZERO);
+    }
+    if let Some(c) = hot {
+        let g = shell.geometry().clone();
+        if let Some(s) = g.swatches.iter().find(|s| s.category == c) {
+            let (x, y) = (s.rect.x + s.rect.w / 2.0, s.rect.y + s.rect.h / 2.0);
+            shell.update(InputEvent::PointerMoved { x, y }, Duration::ZERO);
+        }
+    }
+    (shell.chrome(Duration::ZERO), shell.map_rect())
+}
+
+/// Made-up drive figures for pictures and benchmarks: 1 TB, 14.1 GB of it in
+/// the Recycle Bin, and a gap of unreadable bytes.
+pub(crate) fn sample_breakdown() -> Breakdown {
+    let cap = Capacity::from_bytes(
+        1_000_000_000_000,
+        360_000_000_000,
+        330_000_000_000,
+        bs_platform::drives::ReservedKind::FilesystemReserve,
+    );
+    Breakdown::new(&cap, 560_000_000_000, true, 14_100_000_000)
+}
+
+/// The sizes of the drive under `path`, split for the capacity bar, when the
+/// platform can tell. The gap only shows when `path` is the whole drive.
+pub(crate) fn drive_breakdown(path: &Path, snapshot: &Snapshot) -> Option<Breakdown> {
+    let drive = bs_platform::drives::volume_for_path(path).ok()?;
+    let capacity = drive.capacity?;
+    let whole = match (
+        std::fs::canonicalize(path),
+        std::fs::canonicalize(&drive.mount_point),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    let counted = snapshot.root().map_or(0, |r| r.allocated());
+    let complete = whole && snapshot.scan_complete() && !snapshot.scan_stopped();
+    Some(Breakdown::new(&capacity, counted, complete, 0))
 }
 
 pub(crate) fn print_env(label: &str, renderer: &Renderer, size: (u32, u32)) {
@@ -196,8 +278,21 @@ fn prepare_synthetic_zoom(
     };
     let renderer = {
         let mut r = make_renderer(size, opts.scale, opts.dark, text.clone())?;
-        let (bars, _) = chrome::layout(size.0 as f32, size.1 as f32, opts.scale, "C:", "");
-        r.set_bars(bars);
+        r.set_chrome(
+            static_chrome(
+                text,
+                ChromeSpec {
+                    size,
+                    scale: opts.scale,
+                    dark: opts.dark,
+                    crumb: "C:",
+                    status: "",
+                    hot: None,
+                    capacity: Some(sample_breakdown()),
+                },
+            )
+            .0,
+        );
         r
     };
     // Folders to zoom into for the cold series: every nested folder of the
@@ -341,7 +436,7 @@ fn screenshots(opts: &ShotOptions) -> Result<(), String> {
     text.load_fonts();
     let states: Vec<String> = match (opts.states.is_empty(), &opts.path) {
         (true, Some(_)) => vec!["midscan".into(), "complete".into()],
-        (true, None) => vec!["map20k".into(), "showcase".into()],
+        (true, None) => vec!["map20k".into(), "showcase".into(), "swatch".into()],
         (false, _) => opts.states.clone(),
     };
     let (real_states, states): (Vec<String>, Vec<String>) = states
@@ -360,18 +455,25 @@ fn screenshots(opts: &ShotOptions) -> Result<(), String> {
         for dark in [false, true] {
             let boxes = (state == "map20k").then_some(opts.boxes);
             let (mut scene, cal) = build_scene(opts.size, scale, boxes);
-            if state == "showcase" {
+            if state == "showcase" || state == "swatch" {
                 scene.source.set_min_area(900.0 * scale * scale);
             }
             let mut renderer = make_renderer(opts.size, scale, dark, text.clone())?;
-            let (bars, _) = chrome::layout(
-                opts.size.0 as f32,
-                opts.size.1 as f32,
-                scale,
-                "C:  ›  Users  ›  alex  ›  Videos",
-                "Videos · 41.2 GB · 12% of drive",
+            let hot = (state == "swatch").then_some(1);
+            let (chrome, _) = static_chrome(
+                &text,
+                ChromeSpec {
+                    size: opts.size,
+                    scale,
+                    dark,
+                    crumb: "C:  ›  Users  ›  alex  ›  Videos",
+                    status: "Videos · 41.2 GB · 12% of drive",
+                    hot,
+                    capacity: Some(sample_breakdown()),
+                },
             );
-            renderer.set_bars(bars);
+            renderer.set_chrome(chrome);
+            renderer.set_dim(hot);
             match state.as_str() {
                 "showcase" => {
                     let (items, hover, selected) = showcase(&mut scene, scale, font_px() * scale);
@@ -408,23 +510,42 @@ struct Live {
     window: Arc<Window>,
     presenter: Gfx,
     renderer: Renderer,
-    /// The map of a real scan, once the first snapshot has arrived.
-    app: Option<App<TreeSource>>,
+    /// Chrome, info bar, legend and the map once the first snapshot has
+    /// arrived.
+    shell: Shell<TreeSource>,
     /// The scripted run of a zoom measurement.
     bench: Option<(BenchApp, Script)>,
     scan: Option<ScanDriver>,
-    crumb: String,
-    status: String,
+    /// A layout being made on a worker thread.
+    relayout: Option<Receiver<FinishedRelayout>>,
+    /// The latest snapshot the status text and capacity bar were made from.
+    snapshot: Option<Arc<Snapshot>>,
+    /// The drive's sizes, once the platform has answered.
+    drive: Option<DriveState>,
+    drive_rx: Option<Receiver<Option<DriveState>>>,
+    appearance_rx: Option<Receiver<Appearance>>,
+    next_pulse: Instant,
+}
+
+/// What is known about the drive under the scanned folder.
+#[derive(Clone)]
+struct DriveState {
+    capacity: Capacity,
+    root: PathBuf,
+    /// The scan covers the whole drive, so the gap between what was counted
+    /// and what the system reports as used is a real unreadable part.
+    whole_drive: bool,
 }
 
 /// What the live map cost while a scan ran, for the `--bench-live` report.
 #[derive(Default)]
 struct LiveStats {
+    /// Laying a view out and converting it, on the worker thread.
     layouts_us: Vec<u64>,
     layout_boxes: Vec<u64>,
-    /// Everything the window did for one data update: layout, conversion and
-    /// handing the picture to the renderer. This is the longest the event loop
-    /// stayed busy for new data.
+    /// What the UI thread spent for one data update: starting the worker, and
+    /// later adopting its result. This is the longest the event loop stayed
+    /// busy for new data; the layout itself is not in it.
     updates_us: Vec<u64>,
     paints_us: Vec<u64>,
     /// The part of a paint spent redrawing the picture, and the part spent
@@ -455,6 +576,8 @@ struct WinApp {
     map_pending: bool,
     /// The scan ended and no frame has shown its final layout yet.
     finish_pending: bool,
+    /// The scan ended and the layout of its final tree is still to come.
+    final_requested: bool,
     stats: LiveStats,
 }
 
@@ -504,6 +627,7 @@ fn run_window(mode: Mode, t0: Instant) -> Result<(), String> {
         map_seen: false,
         map_pending: false,
         finish_pending: false,
+        final_requested: false,
         stats: LiveStats::default(),
     };
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -522,6 +646,7 @@ fn apply(renderer: &mut Renderer, fx: Vec<Effect>, now: Duration) -> bool {
         match e {
             Effect::SetHover(id) => renderer.set_hover(id),
             Effect::SetSelected(id) => renderer.set_selected(id),
+            Effect::SetSelection(ids) => renderer.set_selection(&ids),
             Effect::SetView(items) => renderer.set_items(items),
             Effect::Zoom {
                 direction,
@@ -535,26 +660,117 @@ fn apply(renderer: &mut Renderer, fx: Vec<Effect>, now: Duration) -> bool {
     view_changed
 }
 
-/// Rebuilds the navigation and status bars from the current view and scan
-/// status, and returns the map rectangle they leave.
-fn refresh_bars(live: &mut Live) -> Rect {
-    let (w, h) = live.renderer.size();
-    let scale = live.renderer.scale();
-    if let Some(app) = &live.app {
-        live.crumb = app.source().breadcrumb(app.current_view());
+/// Applies the shell's effects: the map's, the legend dimming and the link.
+fn apply_shell(renderer: &mut Renderer, fx: Vec<ShellEffect>, now: Duration) {
+    for e in fx {
+        match e {
+            ShellEffect::Map(e) => {
+                apply(renderer, vec![e], now);
+            }
+            ShellEffect::Dim(category) => renderer.set_dim(category),
+            ShellEffect::OpenLink(url) => {
+                // Nothing to do if the system has no opener.
+                let _ = open::open_url(url);
+            }
+        }
     }
-    let (bars, map) = chrome::layout(w as f32, h as f32, scale, &live.crumb, &live.status);
-    live.renderer.set_bars(bars);
-    map
+}
+
+/// Hands the renderer the chrome for `now`. Returns whether it changed.
+fn refresh_chrome(live: &mut Live, now: Duration) -> bool {
+    let chrome = live.shell.chrome(now);
+    live.renderer.set_chrome(chrome)
+}
+
+/// The look from the system, with `BYTESCAPE_THEME` as an override for
+/// pictures and tests.
+fn look_from(appearance: &Appearance) -> Look {
+    Look {
+        dark: appearance.scheme == ColorScheme::Dark,
+        accent: appearance
+            .accent
+            .map(|c| bs_render::Color::rgb(c.r, c.g, c.b)),
+    }
+}
+
+fn theme_override() -> Option<bool> {
+    match std::env::var("BYTESCAPE_THEME").as_deref() {
+        Ok("dark") => Some(true),
+        Ok("light") => Some(false),
+        _ => None,
+    }
+}
+
+/// Asks the platform for the light/dark setting on a worker thread, because
+/// reading it can start a program. The answer comes back through `appearance_rx`.
+fn poll_appearance(live: &mut Live) {
+    if theme_override().is_some() || live.appearance_rx.is_some() {
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    live.appearance_rx = Some(rx);
+    let _ = std::thread::Builder::new()
+        .name("appearance".into())
+        .spawn(move || {
+            let _ = tx.send(bs_platform::appearance::current());
+        });
+}
+
+/// Looks up the drive under `path` on a worker thread.
+fn query_drive(live: &mut Live, path: PathBuf) {
+    let (tx, rx) = mpsc::channel();
+    live.drive_rx = Some(rx);
+    let _ = std::thread::Builder::new()
+        .name("drive".into())
+        .spawn(move || {
+            let state = bs_platform::drives::volume_for_path(&path)
+                .ok()
+                .and_then(|drive| {
+                    let capacity = drive.capacity?;
+                    let same = |a: &Path, b: &Path| match (
+                        std::fs::canonicalize(a),
+                        std::fs::canonicalize(b),
+                    ) {
+                        (Ok(a), Ok(b)) => a == b,
+                        _ => a == b,
+                    };
+                    Some(DriveState {
+                        capacity,
+                        whole_drive: same(&path, &drive.mount_point),
+                        root: drive.mount_point,
+                    })
+                });
+            let _ = tx.send(state);
+        });
+}
+
+/// Feeds the capacity bar from the drive's sizes and what the scan counted.
+fn update_capacity(live: &mut Live, now: Duration) {
+    let (Some(drive), Some(snapshot)) = (&live.drive, &live.snapshot) else {
+        return;
+    };
+    let counted = snapshot.root().map_or(0, |r| r.allocated());
+    let complete = drive.whole_drive && snapshot.scan_complete() && !snapshot.scan_stopped();
+    // The bin's size comes from a stand-in until the platform measures it.
+    let bin = FakeRecycleBin(0).bytes(&drive.root);
+    live.shell
+        .set_capacity(Breakdown::new(&drive.capacity, counted, complete, bin), now);
+}
+
+/// Starts laying the current view out on a worker thread.
+fn spawn_relayout(live: &mut Live, pending: PendingRelayout) {
+    let (tx, rx) = mpsc::channel();
+    live.relayout = Some(rx);
+    let _ = std::thread::Builder::new()
+        .name("layout".into())
+        .spawn(move || {
+            let _ = tx.send(pending.run());
+        });
 }
 
 impl WinApp {
-    fn dark_theme(window: &Window) -> bool {
-        match std::env::var("BYTESCAPE_THEME").as_deref() {
-            Ok("dark") => true,
-            Ok("light") => false,
-            _ => window.theme() == Some(Theme::Dark),
-        }
+    fn initial_dark(window: &Window) -> bool {
+        theme_override().unwrap_or_else(|| window.theme() == Some(Theme::Dark))
     }
 
     fn ms(&self) -> f64 {
@@ -587,7 +803,7 @@ impl WinApp {
         self.timeline.push(("surface_created", at));
         let dark = match &self.mode {
             Mode::Zoom(z) => z.dark,
-            _ => Self::dark_theme(&window),
+            _ => Self::initial_dark(&window),
         };
         let mut renderer =
             make_renderer((size.width, size.height), scale, dark, self.text.clone())?;
@@ -602,14 +818,18 @@ impl WinApp {
         } else {
             String::new()
         };
-        let (bars, map) = chrome::layout(
-            size.width as f32,
-            size.height as f32,
+        let mut shell: Shell<TreeSource> = Shell::new(
+            (size.width, size.height),
             scale,
-            &crumb,
-            &status,
+            font_px(),
+            self.text.clone(),
+            Look { dark, accent: None },
         );
-        renderer.set_bars(bars);
+        shell.set_reduced_motion(reduced_motion());
+        shell.set_crumb(crumb);
+        shell.set_status(status, self.scan_path.is_some());
+        let map = shell.map_rect();
+        renderer.set_chrome(shell.chrome(Duration::ZERO));
         let at = self.ms();
         self.timeline.push(("renderer_created", at));
         let mut bench = None;
@@ -628,11 +848,15 @@ impl WinApp {
             window: window.clone(),
             presenter,
             renderer,
-            app: None,
+            shell,
             bench,
             scan: None,
-            crumb,
-            status,
+            relayout: None,
+            snapshot: None,
+            drive: None,
+            drive_rx: None,
+            appearance_rx: None,
+            next_pulse: Instant::now(),
         });
         window.request_redraw();
         Ok(())
@@ -700,11 +924,13 @@ impl WinApp {
                     return;
                 }
             }
-            // The scan starts after the first frame is on screen, so nothing
-            // it does can delay that frame.
+            // Everything below starts after the first frame is on screen, so
+            // nothing it does can delay that frame.
             if let Some(path) = &self.scan_path {
                 live.scan = Some(ScanDriver::start(path.clone()));
+                query_drive(live, path.clone());
             }
+            poll_appearance(live);
         }
         if self.map_pending && !painted.damage.is_empty() {
             self.map_pending = false;
@@ -769,14 +995,97 @@ impl WinApp {
         flush_stdout();
     }
 
-    /// Takes new data from a running scan, if the throttle allows, and lays
-    /// the current view out again.
+    /// Takes a layout the worker finished.
+    fn adopt_relayout(&mut self, done: Option<FinishedRelayout>) {
+        let t0 = self.t0;
+        let began = Instant::now();
+        let now = t0.elapsed();
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let outcome = {
+            let Some(app) = live.shell.app_mut() else {
+                return;
+            };
+            match done {
+                Some(done) if app.relayout_is_current(&done) => Ok(app.finish_relayout(done)),
+                // The worker could not deliver, or the view moved on while it
+                // worked. Lay out again from the data as it is now.
+                Some(_) => match app.begin_relayout() {
+                    Some(pending) => Err(pending),
+                    None => Ok(app.update(InputEvent::DataChanged, now)),
+                },
+                None => Ok(app.update(InputEvent::DataChanged, now)),
+            }
+        };
+        let fx = match outcome {
+            Ok(fx) => fx,
+            Err(pending) => {
+                spawn_relayout(live, pending);
+                return;
+            }
+        };
+        let stats = live
+            .shell
+            .app()
+            .map(|a| a.source().last_layout())
+            .unwrap_or_default();
+        apply(&mut live.renderer, fx, now);
+        refresh_chrome(live, now);
+        self.stats.layouts_us.push(stats.took.as_micros() as u64);
+        self.stats.layout_boxes.push(stats.items as u64);
+        if stats.items >= 2 && !self.map_seen {
+            self.map_seen = true;
+            self.map_pending = true;
+        }
+        if let Some(scan) = live.scan.as_mut() {
+            scan.note_layout_cost(stats.took);
+        }
+        if std::mem::take(&mut self.final_requested) {
+            self.finish_pending = true;
+        }
+        self.stats
+            .updates_us
+            .push(began.elapsed().as_micros() as u64);
+        live.window.request_redraw();
+    }
+
+    /// Takes new data from a running scan, if the throttle allows, and starts
+    /// laying the current view out again on a worker thread. The window never
+    /// waits for the layout: the previous picture stays until it is ready.
     fn pump_scan(&mut self) {
         let t0 = self.t0;
         let Some(live) = self.live.as_mut() else {
             return;
         };
-        if live.scan.is_none() {
+        // Results of worker threads.
+        if let Some(rx) = live.relayout.as_ref() {
+            match rx.try_recv() {
+                Ok(done) => {
+                    live.relayout = None;
+                    self.adopt_relayout(Some(done));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    live.relayout = None;
+                    self.adopt_relayout(None);
+                }
+                Err(TryRecvError::Empty) => return,
+            }
+        }
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let now = t0.elapsed();
+        if let Some(rx) = live.drive_rx.as_ref()
+            && let Ok(state) = rx.try_recv()
+        {
+            live.drive_rx = None;
+            live.drive = state;
+            update_capacity(live, now);
+            refresh_chrome(live, now);
+            live.window.request_redraw();
+        }
+        if live.scan.is_none() || live.relayout.is_some() {
             return;
         }
         // A zoom in flight finishes first; the data stays published.
@@ -793,57 +1102,110 @@ impl WinApp {
             Tick::Finished(s, p) => (s, true, p),
         };
         let began = Instant::now();
-        let now = t0.elapsed();
         let metrics = Metrics::from_logical(font_px(), live.renderer.scale());
-        let mut boxes = 0usize;
-        let mut layout_us = 0u64;
-        match live.app.as_mut() {
-            Some(app) => {
-                app.source_mut().set_snapshot(Arc::clone(&snapshot));
-                let fx = app.update(InputEvent::DataChanged, now);
-                let stats = app.source().last_layout();
-                boxes = stats.items;
-                layout_us = stats.took.as_micros() as u64;
-                apply(&mut live.renderer, fx, now);
-            }
-            None => {
-                if let Some(source) = TreeSource::new(Arc::clone(&snapshot), metrics) {
-                    let (w, h) = live.renderer.size();
-                    let (_, map) =
-                        chrome::layout(w as f32, h as f32, live.renderer.scale(), "", "");
-                    let app = App::new(source, map);
-                    let stats = app.source().last_layout();
-                    boxes = stats.items;
-                    layout_us = stats.took.as_micros() as u64;
-                    live.renderer.set_items(app.items());
-                    live.app = Some(app);
-                }
-            }
-        }
-        // The first snapshot is often just the root, which lays out as one
-        // empty box. The first frame that shows the folder's contents is the
-        // one worth timing.
-        if boxes >= 2 && !self.map_seen {
-            self.map_seen = true;
-            self.map_pending = true;
-        }
-        live.status = match problem {
+        let status = match problem {
             Some(p) => p,
             None => scan_status(&snapshot),
         };
-        refresh_bars(live);
-        let cost = began.elapsed();
-        if let Some(scan) = live.scan.as_mut() {
-            scan.note_layout_cost(cost);
-        }
-        self.stats.layouts_us.push(layout_us);
-        self.stats.layout_boxes.push(boxes as u64);
-        self.stats.updates_us.push(cost.as_micros() as u64);
+        live.shell.set_status(status, !done);
+        live.snapshot = Some(Arc::clone(&snapshot));
+        update_capacity(live, now);
         if done {
             self.stats.scan_done_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
-            self.finish_pending = true;
         }
+        match live.shell.app_mut() {
+            Some(app) => {
+                app.source_mut().set_snapshot(Arc::clone(&snapshot));
+                match app.begin_relayout() {
+                    Some(pending) => {
+                        spawn_relayout(live, pending);
+                        self.final_requested |= done;
+                    }
+                    None => {
+                        self.final_requested |= done;
+                        self.adopt_relayout(None);
+                        return;
+                    }
+                }
+            }
+            None => {
+                if let Some(source) = TreeSource::new(Arc::clone(&snapshot), metrics) {
+                    let map = live.shell.map_rect();
+                    let app = App::new(source, map);
+                    let stats = app.source().last_layout();
+                    live.renderer.set_items(app.items());
+                    live.shell.set_app(app);
+                    self.stats.layouts_us.push(stats.took.as_micros() as u64);
+                    self.stats.layout_boxes.push(stats.items as u64);
+                    if stats.items >= 2 && !self.map_seen {
+                        self.map_seen = true;
+                        self.map_pending = true;
+                    }
+                    if done {
+                        self.finish_pending = true;
+                    }
+                }
+            }
+        }
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        refresh_chrome(live, now);
+        let cost = began.elapsed();
+        self.stats.updates_us.push(cost.as_micros() as u64);
         live.window.request_redraw();
+    }
+
+    /// Timers for the pulse, the capacity glide and the answers of worker
+    /// threads. Returns how soon the loop must wake again.
+    fn pump_timers(&mut self) -> Option<Duration> {
+        let t0 = self.t0;
+        let live = self.live.as_mut()?;
+        let now = t0.elapsed();
+        let mut wake: Option<Duration> = None;
+        let mut soonest = |d: Duration| wake = Some(wake.map_or(d, |w| w.min(d)));
+        let mut redraw = false;
+        if let Some(rx) = live.appearance_rx.as_ref()
+            && let Ok(appearance) = rx.try_recv()
+        {
+            live.appearance_rx = None;
+            if live.shell.set_look(look_from(&appearance)) {
+                live.renderer.set_palette(live.shell.palette());
+                redraw = true;
+            }
+        } else if live.appearance_rx.is_some() {
+            soonest(Duration::from_millis(20));
+        }
+        if live.shell.capacity_changing(now) {
+            refresh_chrome(live, now);
+            redraw = true;
+            soonest(Duration::from_millis(8));
+        } else if live
+            .shell
+            .capacity_changing(now.saturating_sub(Duration::from_millis(20)))
+        {
+            // One last refresh to land exactly on the final figures.
+            refresh_chrome(live, now);
+            redraw = true;
+        }
+        if live.shell.pulsing() {
+            let tick = Instant::now();
+            if tick >= live.next_pulse {
+                live.next_pulse = tick + Duration::from_millis(100);
+                live.renderer.set_pulse(live.shell.pulse(now));
+                redraw = true;
+            }
+            soonest(live.next_pulse.saturating_duration_since(Instant::now()));
+        } else {
+            live.renderer.set_pulse(1.0);
+        }
+        if live.relayout.is_some() {
+            soonest(Duration::from_millis(4));
+        }
+        if redraw {
+            live.window.request_redraw();
+        }
+        wake
     }
 
     fn feed(&mut self, event: InputEvent) {
@@ -851,21 +1213,28 @@ impl WinApp {
         let Some(live) = self.live.as_mut() else {
             return;
         };
-        let Some(app) = live.app.as_mut() else {
-            return;
-        };
-        app.set_animating(live.renderer.is_animating());
-        let fx = app.update(event, now);
-        if fx.is_empty() {
-            return;
+        if let Some(app) = live.shell.app_mut() {
+            app.set_animating(live.renderer.is_animating());
         }
-        if apply(&mut live.renderer, fx, now) {
-            refresh_bars(live);
+        let fx = live.shell.update(event, now);
+        let changed = !fx.is_empty();
+        apply_shell(&mut live.renderer, fx, now);
+        let chrome_changed = refresh_chrome(live, now);
+        if matches!(event, InputEvent::PointerMoved { .. }) {
+            live.window
+                .set_cursor(if live.shell.wants_pointer_cursor() {
+                    CursorIcon::Pointer
+                } else {
+                    CursorIcon::Default
+                });
         }
-        live.window.request_redraw();
+        if changed || chrome_changed {
+            live.window.request_redraw();
+        }
     }
 
     fn resize(&mut self) {
+        let now = self.t0.elapsed();
         let Some(live) = self.live.as_mut() else {
             return;
         };
@@ -878,21 +1247,31 @@ impl WinApp {
             return;
         }
         live.renderer.resize(size.width, size.height, scale);
-        let map = refresh_bars(live);
-        match live.app.as_mut() {
-            Some(app) => {
-                app.source_mut()
-                    .set_metrics(Metrics::from_logical(font_px(), scale));
-                let fx = app.update(InputEvent::Resized { map }, Duration::ZERO);
-                apply(&mut live.renderer, fx, Duration::ZERO);
-            }
-            None if self.scan_path.is_some() => live
-                .renderer
-                .set_items(Arc::new(vec![scan_placeholder(map)])),
-            None => live.renderer.set_items(Arc::new(placeholders(map, scale))),
+        // A layout still being made is for the old size; it is dropped when it
+        // arrives.
+        if let Some(app) = live.shell.app_mut() {
+            app.source_mut()
+                .set_metrics(Metrics::from_logical(font_px(), scale));
         }
+        let fx = live.shell.resize((size.width, size.height), scale, now);
+        let had_app = live.shell.app().is_some();
+        apply_shell(&mut live.renderer, fx, now);
+        let map = live.shell.map_rect();
+        if !had_app {
+            if self.scan_path.is_some() {
+                live.renderer
+                    .set_items(Arc::new(vec![scan_placeholder(map)]));
+            } else {
+                live.renderer.set_items(Arc::new(placeholders(map, scale)));
+            }
+        }
+        refresh_chrome(live, now);
         live.window.request_redraw();
     }
+}
+
+fn reduced_motion() -> bool {
+    std::env::var_os("BYTESCAPE_REDUCED_MOTION").is_some()
 }
 
 fn flush_stdout() {
@@ -955,10 +1334,25 @@ impl ApplicationHandler for WinApp {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::RedrawRequested => self.redraw(el),
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => self.resize(),
-            WindowEvent::ThemeChanged(theme) => {
+            WindowEvent::Focused(true) => {
+                // The system setting may have changed while another window was
+                // in front.
                 if let Some(live) = self.live.as_mut() {
-                    live.renderer.set_palette(palette_for(theme == Theme::Dark));
-                    live.window.request_redraw();
+                    poll_appearance(live);
+                }
+            }
+            WindowEvent::ThemeChanged(theme) => {
+                if theme_override().is_none()
+                    && let Some(live) = self.live.as_mut()
+                {
+                    let look = Look {
+                        dark: theme == Theme::Dark,
+                        accent: live.shell.look().accent,
+                    };
+                    if live.shell.set_look(look) {
+                        live.renderer.set_palette(live.shell.palette());
+                        live.window.request_redraw();
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
@@ -994,8 +1388,14 @@ impl ApplicationHandler for WinApp {
                                 && (ly - y).abs() < 5.0
                         });
                         self.last_click = if double { None } else { Some((now, (x, y))) };
+                        let mods = Modifiers {
+                            ctrl: self.modifiers.control_key(),
+                            shift: self.modifiers.shift_key(),
+                        };
                         if double {
                             self.feed(InputEvent::DoubleClick { x, y });
+                        } else if mods.ctrl || mods.shift {
+                            self.feed(InputEvent::ClickWith { x, y, mods });
                         } else {
                             self.feed(InputEvent::Click { x, y });
                         }
@@ -1007,11 +1407,16 @@ impl ApplicationHandler for WinApp {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let alt = self.modifiers.alt_key();
+                let ctrl = self.modifiers.control_key();
                 let key = match event.logical_key {
                     WKey::Named(NamedKey::Enter) => Some(Key::Enter),
                     WKey::Named(NamedKey::Backspace) => Some(Key::Backspace),
                     WKey::Named(NamedKey::Home) => Some(Key::Home),
                     WKey::Named(NamedKey::Escape) => Some(Key::Escape),
+                    WKey::Named(NamedKey::F5) => Some(Key::Refresh),
+                    WKey::Character(ref c) if ctrl && c.eq_ignore_ascii_case("r") => {
+                        Some(Key::Refresh)
+                    }
                     WKey::Named(NamedKey::ArrowLeft) if alt => Some(Key::AltLeft),
                     WKey::Named(NamedKey::ArrowRight) if alt => Some(Key::AltRight),
                     WKey::Named(NamedKey::ArrowUp) if alt => Some(Key::AltUp),
@@ -1030,18 +1435,25 @@ impl ApplicationHandler for WinApp {
         if matches!(self.mode, Mode::Zoom(_)) {
             return;
         }
+        let timer_wake = self.pump_timers();
         // Fonts load on a worker thread; redraw once when they arrive so labels
         // appear, polling lightly until then. A running scan is polled for new
         // data at a steady, light rate; nothing else keeps the loop awake.
-        let mut poll: Option<Duration> = None;
+        let mut poll: Option<Duration> = timer_wake;
+        let sooner = |poll: &mut Option<Duration>, d: Duration| {
+            *poll = Some(poll.map_or(d, |p| p.min(d)));
+        };
         if !self.fonts_announced {
             if self.text.is_ready() {
                 self.fonts_announced = true;
-                if let Some(live) = self.live.as_ref() {
+                let now = self.t0.elapsed();
+                if let Some(live) = self.live.as_mut() {
+                    // The chrome was laid out with estimated text widths.
+                    refresh_chrome(live, now);
                     live.window.request_redraw();
                 }
             } else {
-                poll = Some(Duration::from_millis(16));
+                sooner(&mut poll, Duration::from_millis(16));
             }
         }
         let scanning = self
@@ -1051,8 +1463,10 @@ impl ApplicationHandler for WinApp {
         // The scan starts after the first present, so until then the loop
         // must come back by itself too.
         if scanning || (self.scan_path.is_some() && self.frames == 0) {
-            let scan_poll = Duration::from_millis(25);
-            poll = Some(poll.map_or(scan_poll, |p| p.min(scan_poll)));
+            sooner(&mut poll, Duration::from_millis(25));
+        }
+        if self.live.as_ref().is_some_and(|l| l.drive_rx.is_some()) {
+            sooner(&mut poll, Duration::from_millis(25));
         }
         match poll {
             Some(d) => el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + d)),

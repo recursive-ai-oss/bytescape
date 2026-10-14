@@ -4,6 +4,7 @@
 
 mod bench;
 mod live;
+mod open;
 mod real;
 mod synth;
 mod window;

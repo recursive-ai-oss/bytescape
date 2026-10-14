@@ -59,6 +59,7 @@ fn apply(r: &mut Renderer, fx: Vec<Effect>, now: Duration) {
         match e {
             Effect::SetHover(id) => r.set_hover(id),
             Effect::SetSelected(id) => r.set_selected(id),
+            Effect::SetSelection(ids) => r.set_selection(&ids),
             Effect::SetView(items) => r.set_items(items),
             Effect::Zoom {
                 direction,

@@ -7,11 +7,11 @@ use std::time::Instant;
 use bs_layout::Metrics;
 use bs_render::{ItemKind, Rect, Renderer, TextEngine};
 use bs_ui::tree::{TreeSource, scan_status};
-use bs_ui::{App, ViewId, ViewSource, chrome};
+use bs_ui::{App, ViewId, ViewSource};
 
 use crate::bench::Script;
 use crate::live::{scan_to_end, scan_until};
-use crate::window::make_renderer;
+use crate::window::{ChromeSpec, drive_breakdown, make_renderer, static_chrome};
 use crate::{ShotOptions, ZoomOptions, font_px};
 
 /// How many of the biggest folders are laid out to find the busiest view.
@@ -34,12 +34,17 @@ pub fn prepare_zoom(
     let started = Instant::now();
     let (snapshot, stats) = scan_to_end(path.to_path_buf())?;
     let scan_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let (bars, map) = chrome::layout(
-        size.0 as f32,
-        size.1 as f32,
-        opts.scale,
-        &path.to_string_lossy(),
-        &scan_status(&snapshot),
+    let (chrome, map) = static_chrome(
+        text,
+        ChromeSpec {
+            size,
+            scale: opts.scale,
+            dark: opts.dark,
+            crumb: &path.to_string_lossy(),
+            status: &scan_status(&snapshot),
+            hot: None,
+            capacity: drive_breakdown(path, &snapshot),
+        },
     );
     let metrics = Metrics::from_logical(font_px(), opts.scale);
     let mut source = TreeSource::new(snapshot.clone(), metrics).ok_or("the scan found nothing")?;
@@ -98,7 +103,7 @@ pub fn prepare_zoom(
     println!("{tag}.scene.cold_folders_available={}", cold_aims.len());
 
     let mut renderer = make_renderer(size, opts.scale, opts.dark, text.clone())?;
-    renderer.set_bars(bars);
+    renderer.set_chrome(chrome);
     let app = App::new(source, map);
     Ok((
         app,
@@ -138,12 +143,17 @@ pub fn screenshots(opts: &ShotOptions, states: &[String], text: &TextEngine) -> 
         let status = scan_status(&snapshot);
         for dark in [false, true] {
             let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
-            let (bars, map) = chrome::layout(
-                opts.size.0 as f32,
-                opts.size.1 as f32,
-                scale,
-                &abs.to_string_lossy(),
-                &status,
+            let (chrome, map) = static_chrome(
+                text,
+                ChromeSpec {
+                    size: opts.size,
+                    scale,
+                    dark,
+                    crumb: &abs.to_string_lossy(),
+                    status: &status,
+                    hot: None,
+                    capacity: drive_breakdown(&path, &snapshot),
+                },
             );
             let mut source =
                 TreeSource::new(snapshot.clone(), metrics).ok_or("the scan found nothing")?;
@@ -155,7 +165,7 @@ pub fn screenshots(opts: &ShotOptions, states: &[String], text: &TextEngine) -> 
                 snapshot.len()
             );
             let mut renderer = make_renderer(opts.size, scale, dark, text.clone())?;
-            renderer.set_bars(bars);
+            renderer.set_chrome(chrome);
             renderer.set_items(layout.items);
             let name = format!(
                 "{state}-{}-{scale_name}x.png",
