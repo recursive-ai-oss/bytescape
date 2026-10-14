@@ -9,5 +9,15 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[dependencies]
+bs-tree = { path = "../bs-tree" }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[[bench]]
+name = "layout"
+harness = false
+
 [lints]
 workspace = true
