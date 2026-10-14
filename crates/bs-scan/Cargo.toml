@@ -9,5 +9,32 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[dependencies]
+bs-tree = { path = "../bs-tree" }
+
+# Directory handles, getdents64 and statx.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# Directory enumeration by handle. No networking feature is enabled.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", default-features = false, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+# Examples and tests build the boundary and the progress figure from the
+# platform's drive list, as the application does.
+bs-platform = { path = "../bs-platform" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

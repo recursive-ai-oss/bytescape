@@ -139,6 +139,13 @@ dependencies = [
 [[package]]
 name = "bs-scan"
 version = "0.1.0"
+dependencies = [
+ "bs-platform",
+ "bs-tree",
+ "libc",
+ "proptest",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "bs-scan-btrfs"
