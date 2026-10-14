@@ -398,12 +398,6 @@ impl SynthSource {
         self.cache.clear();
     }
 
-    pub fn set_geometry(&mut self, scale: f32, em: f32) {
-        self.params.scale = scale;
-        self.params.em = em;
-        self.cache.clear();
-    }
-
     /// Lays out `view` without caching, returning the items and the folders
     /// one level down.
     fn layout_uncached(&mut self, view: ViewId, map: Rect) -> Layout {

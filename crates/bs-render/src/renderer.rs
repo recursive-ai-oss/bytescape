@@ -452,6 +452,8 @@ impl Renderer {
 
     /// Shapes the new view's labels on a worker thread while the animation
     /// runs, so the full-quality frame at the end only blits cached labels.
+    /// One thread, on purpose: on a four-core machine more threads slowed the
+    /// animation frames running beside them more than they sped the shaping up.
     fn prewarm_labels(&self) {
         if !self.text.is_ready() {
             return;
@@ -556,10 +558,11 @@ impl Renderer {
     }
 
     /// Ends a running animation, if any, and puts a real picture back in
-    /// `front`. This is the only place the animation state is cleared, so the
-    /// placeholder swapped in while the images were animating never outlives it.
-    /// The new view is repainted at full quality, with labels, on the next
-    /// `paint`.
+    /// `front`. Every path that keeps the renderer's size ends a zoom here, so
+    /// the placeholder swapped in while the images were animating never outlives
+    /// it. The one exception is `resize`, which replaces `front` and drops the
+    /// animation's images together, because they have the old size. The new view
+    /// is repainted at full quality, with labels, on the next `paint`.
     fn finish_zoom(&mut self) {
         let Some(anim) = self.anim.take() else {
             return;

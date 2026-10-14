@@ -14,3 +14,5 @@ workspace = true
 
 [dependencies]
 bs-render = { path = "../bs-render" }
+bs-layout = { path = "../bs-layout" }
+bs-tree = { path = "../bs-tree" }

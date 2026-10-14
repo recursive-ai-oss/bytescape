@@ -10,6 +10,12 @@
 #   EXTRA_CPUS        more core lists to measure, space separated, for example
 #                     "0 0-1" for one-core and two-core stress runs
 #   WRAP              a command prefix for every step, for example a memory cap
+#   REAL_PATH         a big real folder to scan for the real-data series: the
+#                     first frame of `bytescape <path>`, the zoom on the
+#                     finished scan and the live map while it scans (default:
+#                     your home folder; pick a folder with a million or more
+#                     entries for a meaningful run). Set it to an empty string
+#                     to measure only the synthetic scene.
 #
 # Windowed runs go through Xvfb, never the desktop session. Xvfb runs with
 # -noreset: without it the server restarts when a client exits, and the next
@@ -22,6 +28,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}"
 PROXY_CPUS="${PROXY_CPUS:-0-3}"
 EXTRA_CPUS="${EXTRA_CPUS:-}"
 WRAP="${WRAP:-}"
+REAL_PATH="${REAL_PATH-$HOME}"
 
 (cd "$REPO" && $WRAP cargo build --release -j "${JOBS:-8}" -p bytescape -p bs-gate)
 BIN="$CARGO_TARGET_DIR/release/bytescape"
@@ -36,7 +43,8 @@ measure() {
   local label=$1
   shift
   env -u WAYLAND_DISPLAY $WRAP "$@" xvfb-run -a -s "$SCREEN" \
-    "$GATE" run --label "$label" --bytescape "$BIN" --out "$OUT" --repo "$REPO"
+    "$GATE" run --label "$label" --bytescape "$BIN" --out "$OUT" --repo "$REPO" \
+    --real "$REAL_PATH"
 }
 
 measure full

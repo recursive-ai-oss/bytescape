@@ -11,9 +11,7 @@
 use std::time::{Duration, Instant};
 
 use bs_render::{Painted, Renderer};
-use bs_ui::{App, Effect, InputEvent};
-
-use crate::synth::SynthSource;
+use bs_ui::{App, Effect, InputEvent, ViewSource};
 
 /// Where finished frames go: a window or a plain buffer.
 pub trait FrameSink {
@@ -58,6 +56,10 @@ pub struct Series {
 pub struct Samples {
     pub warm: Series,
     pub cold: Series,
+    /// The zoom-outs that follow each cold zoom-in. They return to a view that
+    /// is already laid out, so they are not part of the cold series, but they
+    /// are measured and reported.
+    pub cold_return: Series,
     pub hover: Vec<u64>,
     pub select: Vec<u64>,
 }
@@ -149,8 +151,8 @@ fn apply(renderer: &mut Renderer, fx: Vec<Effect>, now: Duration) {
 }
 
 /// What a zoom step runs against.
-struct Rig<'a> {
-    app: &'a mut App<SynthSource>,
+struct Rig<'a, S: ViewSource> {
+    app: &'a mut App<S>,
     renderer: &'a mut Renderer,
     sink: &'a mut dyn FrameSink,
     clock: Duration,
@@ -160,7 +162,12 @@ struct Rig<'a> {
 /// Runs one wheel step and every frame of its animation. When
 /// `layout_in_first_frame` is set, the time the app spent laying out the new
 /// view is added to the first frame.
-fn zoom_step(rig: &mut Rig<'_>, out: &mut Series, event: InputEvent, layout_in_first_frame: bool) {
+fn zoom_step<S: ViewSource>(
+    rig: &mut Rig<'_, S>,
+    out: &mut Series,
+    event: InputEvent,
+    layout_in_first_frame: bool,
+) {
     rig.app.set_animating(rig.renderer.is_animating());
     let t = Instant::now();
     let fx = rig.app.update(event, rig.clock);
@@ -230,8 +237,8 @@ fn print_series(layer: &str, name: &str, s: &Series) {
 }
 
 /// Runs the full script and prints results as `key=value` lines.
-pub fn run(
-    app: &mut App<SynthSource>,
+pub fn run<S: ViewSource>(
+    app: &mut App<S>,
     renderer: &mut Renderer,
     sink: &mut dyn FrameSink,
     script: &Script,
@@ -250,12 +257,11 @@ pub fn run(
     };
 
     // Cold series first, while no target view has been laid out or shaped.
-    // The way back is not part of it: the parent view is warm by then.
-    let mut way_back = Series::default();
+    // The way back is its own series: the parent view is warm by then.
     let mut cold_run = 0usize;
     for aim in script.cold_aims.iter().take(script.cold_cycles) {
         zoom_step(&mut rig, &mut out.cold, wheel(*aim, 1.0), true);
-        zoom_step(&mut rig, &mut way_back, wheel(*aim, -1.0), false);
+        zoom_step(&mut rig, &mut out.cold_return, wheel(*aim, -1.0), false);
         cold_run += 1;
     }
 
@@ -301,6 +307,7 @@ pub fn run(
     println!("{layer}.zoom.cold.cycles={cold_run}");
     print_series(layer, "warm", &out.warm);
     print_series(layer, "cold", &out.cold);
+    print_series(layer, "cold_return", &out.cold_return);
     print_stats(&format!("{layer}.hover"), &out.hover);
     print_stats(&format!("{layer}.select"), &out.select);
     out

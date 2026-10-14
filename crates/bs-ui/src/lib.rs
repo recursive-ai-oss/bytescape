@@ -7,6 +7,7 @@
 //! exactly the path a user's wheel takes.
 
 pub mod chrome;
+pub mod tree;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +33,12 @@ pub trait ViewSource {
     /// Lays out `view` to fill `map` (device pixels).
     fn layout(&mut self, view: ViewId, map: Rect) -> Layout;
     fn parent(&self, view: ViewId) -> Option<ViewId>;
+    /// The user entered `view`: keep it, and the views above it, available
+    /// until history no longer reaches them.
+    fn enter(&mut self, _view: ViewId) {}
+    /// Navigation moved on. Only the views in `keep` (the current stack and
+    /// the history) still matter; the source may forget the rest.
+    fn prune(&mut self, _keep: &[ViewId]) {}
 }
 
 /// A keyboard key the map reacts to.
@@ -73,6 +80,10 @@ pub enum InputEvent {
     Resized {
         map: Rect,
     },
+    /// The data behind the views changed (a scan published more of the tree).
+    /// The current view is laid out again; the views above it are refreshed
+    /// only when the user goes back to them.
+    DataChanged,
 }
 
 /// What the host should do after an event.
@@ -97,7 +108,13 @@ pub enum Effect {
 struct Level {
     view: ViewId,
     layout: Layout,
+    /// Laid out from older data than the top of the stack; refreshed when it
+    /// is shown again.
+    stale: bool,
 }
+
+/// History keeps this many entries on each side.
+const HISTORY_LIMIT: usize = 256;
 
 /// The state of the map window.
 pub struct App<S: ViewSource> {
@@ -120,7 +137,11 @@ impl<S: ViewSource> App<S> {
         Self {
             source,
             map,
-            stack: vec![Level { view: root, layout }],
+            stack: vec![Level {
+                view: root,
+                layout,
+                stale: false,
+            }],
             hover: None,
             selected: None,
             animating: false,
@@ -139,6 +160,11 @@ impl<S: ViewSource> App<S> {
     /// The map rectangle the views were last laid out for.
     pub fn map(&self) -> Rect {
         self.map
+    }
+
+    /// The view source.
+    pub fn source(&self) -> &S {
+        &self.source
     }
 
     /// The view source, for changing its geometry before a resize.
@@ -255,6 +281,11 @@ impl<S: ViewSource> App<S> {
             }
             InputEvent::Key(Key::Home) => {
                 self.skip_running_animation(&mut fx);
+                if self.stack.len() > 1 {
+                    // Back returns to where the user was.
+                    self.push_history(self.current_view());
+                    self.history_forward.clear();
+                }
                 while self.stack.len() > 1 {
                     self.stack.pop();
                 }
@@ -281,6 +312,30 @@ impl<S: ViewSource> App<S> {
                     self.jump_to(view, &mut fx);
                 }
             }
+            InputEvent::DataChanged => {
+                let last = self.stack.len().saturating_sub(1);
+                for (i, level) in self.stack.iter_mut().enumerate() {
+                    if i == last {
+                        level.layout = self.source.layout(level.view, self.map);
+                        level.stale = false;
+                    } else {
+                        level.stale = true;
+                    }
+                }
+                fx.push(Effect::SetView(self.items()));
+                // The renderer forgets hover and selection with the old view;
+                // give them back when their boxes are still there.
+                let present = |id: u32, items: &[Item]| items.iter().any(|i| i.id == id);
+                let items = self.items();
+                self.hover = self.hover.filter(|&id| present(id, &items));
+                self.selected = self.selected.filter(|&id| present(id, &items));
+                if let Some(id) = self.hover {
+                    fx.push(Effect::SetHover(Some(id)));
+                }
+                if let Some(id) = self.selected {
+                    fx.push(Effect::SetSelected(Some(id)));
+                }
+            }
             InputEvent::Resized { map } => {
                 self.map = map;
                 let view = self.current_view();
@@ -296,6 +351,7 @@ impl<S: ViewSource> App<S> {
                     .map(|view| Level {
                         view,
                         layout: self.source.layout(view, map),
+                        stale: false,
                     })
                     .collect();
                 self.hover = None;
@@ -321,11 +377,17 @@ impl<S: ViewSource> App<S> {
     }
 
     fn enter(&mut self, view: ViewId, child: Rect, fx: &mut Vec<Effect>) {
+        self.source.enter(view);
         let layout = self.source.layout(view, self.map);
         let items = Arc::clone(&layout.items);
-        self.history_back.push(self.current_view());
+        self.push_history(self.current_view());
         self.history_forward.clear();
-        self.stack.push(Level { view, layout });
+        self.stack.push(Level {
+            view,
+            layout,
+            stale: false,
+        });
+        self.prune_views();
         self.hover = None;
         self.selected = None;
         fx.push(Effect::Zoom {
@@ -343,8 +405,10 @@ impl<S: ViewSource> App<S> {
         let Some(gone) = self.stack.pop() else {
             return;
         };
-        self.history_back.push(gone.view);
+        self.push_history(gone.view);
         self.history_forward.clear();
+        self.refresh_top();
+        self.prune_views();
         let Some(parent) = self.stack.last() else {
             return;
         };
@@ -379,12 +443,45 @@ impl<S: ViewSource> App<S> {
             .map(|view| Level {
                 view,
                 layout: self.source.layout(view, self.map),
+                stale: false,
             })
             .collect();
         self.after_set_view(fx);
     }
 
+    /// Lays the top of the stack out again if it was left behind by newer
+    /// data while another view was on top.
+    fn refresh_top(&mut self) {
+        if let Some(level) = self.stack.last_mut()
+            && level.stale
+        {
+            level.layout = self.source.layout(level.view, self.map);
+            level.stale = false;
+        }
+    }
+
+    fn push_history(&mut self, view: ViewId) {
+        self.history_back.push(view);
+        if self.history_back.len() > HISTORY_LIMIT {
+            self.history_back.remove(0);
+        }
+    }
+
+    /// Tells the source which views history can still reach.
+    fn prune_views(&mut self) {
+        let keep: Vec<ViewId> = self
+            .stack
+            .iter()
+            .map(|l| l.view)
+            .chain(self.history_back.iter().copied())
+            .chain(self.history_forward.iter().copied())
+            .collect();
+        self.source.prune(&keep);
+    }
+
     fn after_set_view(&mut self, fx: &mut Vec<Effect>) {
+        self.refresh_top();
+        self.prune_views();
         self.hover = None;
         self.selected = None;
         fx.push(Effect::SetView(self.items()));

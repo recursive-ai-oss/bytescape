@@ -11,9 +11,10 @@
 //! hash lookup.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock, TryLockError};
 
+use cosmic_text::fontdb::Database;
 use cosmic_text::{
     Attrs, Buffer, Ellipsize, EllipsizeHeightLimit, Family, FontSystem, Metrics, Shaping,
     SwashCache, SwashContent, Wrap,
@@ -27,6 +28,9 @@ use crate::pixel;
 const LINE_HEIGHT: f32 = 1.25;
 /// Entries kept before the cache is cleared and refilled by the next frame.
 const CACHE_LIMIT: usize = 30_000;
+
+/// The width part of a cache key for a label that was not shortened.
+const UNCONSTRAINED: u32 = u32::MAX;
 
 /// Text, size bits and scale bits.
 type WidthKey = (Box<str>, u32, u32);
@@ -55,8 +59,25 @@ struct Fonts {
     swash: SwashCache,
 }
 
+/// Most font systems kept for shaping at once.
+const MAX_FONT_SYSTEMS: usize = 8;
+
+static NEXT_THREAD_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// Where this thread starts looking for a free font system, so the band
+    /// threads of a repaint spread over them.
+    static THREAD_SLOT: usize = NEXT_THREAD_SLOT.fetch_add(1, Ordering::Relaxed);
+}
+
 struct Shared {
-    fonts: Mutex<Option<Fonts>>,
+    /// Font systems. Shaping a label needs one exclusively; with several, the
+    /// threads of a repaint shape labels at the same time instead of queueing
+    /// behind one lock. Slot 0 is filled when fonts are discovered; the others
+    /// are made from `template` the first time a thread needs them.
+    slots: Vec<Mutex<Option<Fonts>>>,
+    /// The locale and font database of the first font system.
+    template: Mutex<Option<(String, Database)>>,
     ready: AtomicBool,
     cache: RwLock<HashMap<Key, Option<Arc<Label>>>>,
     widths: RwLock<HashMap<WidthKey, f32>>,
@@ -83,7 +104,12 @@ impl TextEngine {
     pub fn new() -> Self {
         Self {
             shared: Arc::new(Shared {
-                fonts: Mutex::new(None),
+                slots: (0..std::thread::available_parallelism()
+                    .map_or(1, |n| n.get())
+                    .clamp(1, MAX_FONT_SYSTEMS))
+                    .map(|_| Mutex::new(None))
+                    .collect(),
+                template: Mutex::new(None),
                 ready: AtomicBool::new(false),
                 cache: RwLock::new(HashMap::new()),
                 widths: RwLock::new(HashMap::new()),
@@ -105,11 +131,19 @@ impl TextEngine {
         };
         #[cfg(not(windows))]
         let system = FontSystem::new();
+        let template = (system.locale().to_string(), system.db().clone());
         let fonts = Fonts {
             system,
             swash: SwashCache::new(),
         };
-        let mut slot = self.shared.fonts.lock().unwrap_or_else(|e| e.into_inner());
+        *self
+            .shared
+            .template
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(template);
+        let mut slot = self.shared.slots[0]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *slot = Some(fonts);
         self.shared
             .font_init_micros
@@ -161,12 +195,21 @@ impl TextEngine {
         if !self.is_ready() {
             return None;
         }
-        let key = Key {
+        // A text that fits looks the same at any width, so it is cached under
+        // one key. Boxes that move or resize (a scan keeps changing the map)
+        // then reuse the shaped label instead of shaping it again.
+        let natural = self.cached_width(text, style.size, style.scale);
+        let fits = natural.is_some_and(|n| n <= max_width);
+        let mut key = Key {
             text: text.into(),
             size_bits: style.size.to_bits(),
             scale_bits: style.scale.to_bits(),
             color: u32::from_le_bytes([style.color.r, style.color.g, style.color.b, style.color.a]),
-            width: max_width.max(0.0).ceil() as u32,
+            width: if fits {
+                UNCONSTRAINED
+            } else {
+                max_width.max(0.0).ceil() as u32
+            },
         };
         if let Ok(cache) = self.shared.cache.read()
             && let Some(hit) = cache.get(&key)
@@ -175,7 +218,11 @@ impl TextEngine {
             return hit.clone();
         }
         self.shared.misses.fetch_add(1, Ordering::Relaxed);
-        let made = self.shape(text, style, max_width).map(Arc::new);
+        let (made, fitted) = self.shape(text, style, max_width);
+        let made = made.map(Arc::new);
+        if fitted {
+            key.width = UNCONSTRAINED;
+        }
         if let Ok(mut cache) = self.shared.cache.write() {
             if cache.len() >= CACHE_LIMIT {
                 cache.clear();
@@ -185,20 +232,75 @@ impl TextEngine {
         made
     }
 
+    /// Runs `f` with a font system no other thread is using. Tries every
+    /// system starting at this thread's own, and waits for its own only when
+    /// all are busy.
+    fn with_fonts<R>(&self, f: impl FnOnce(&mut Fonts) -> R) -> Option<R> {
+        let slots = &self.shared.slots;
+        let n = slots.len();
+        let start = THREAD_SLOT.with(|s| *s) % n;
+        let mut free = None;
+        for i in 0..n {
+            match slots[(start + i) % n].try_lock() {
+                Ok(guard) => {
+                    free = Some(guard);
+                    break;
+                }
+                Err(TryLockError::Poisoned(p)) => {
+                    free = Some(p.into_inner());
+                    break;
+                }
+                Err(TryLockError::WouldBlock) => {}
+            }
+        }
+        let mut guard = match free {
+            Some(g) => g,
+            None => slots[start].lock().unwrap_or_else(|e| e.into_inner()),
+        };
+        if guard.is_none() {
+            let template = self
+                .shared
+                .template
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (locale, db) = template.as_ref()?;
+            *guard = Some(Fonts {
+                system: FontSystem::new_with_locale_and_db(locale.clone(), db.clone()),
+                swash: SwashCache::new(),
+            });
+        }
+        guard.as_mut().map(f)
+    }
+
+    /// The width of a text if it has been measured or shaped before.
+    fn cached_width(&self, text: &str, size: f32, scale: f32) -> Option<f32> {
+        let key = (Box::<str>::from(text), size.to_bits(), scale.to_bits());
+        self.shared
+            .widths
+            .read()
+            .ok()
+            .and_then(|w| w.get(&key).copied())
+    }
+
+    fn remember_width(&self, text: &str, size: f32, scale: f32, width: f32) {
+        let key = (Box::<str>::from(text), size.to_bits(), scale.to_bits());
+        if let Ok(mut widths) = self.shared.widths.write() {
+            if widths.len() >= CACHE_LIMIT {
+                widths.clear();
+            }
+            widths.insert(key, width);
+        }
+    }
+
     /// Width of the text on one line in device pixels. Results are cached.
     pub fn measure(&self, text: &str, size: f32, scale: f32) -> Option<f32> {
         if !self.is_ready() {
             return None;
         }
-        let key = (Box::<str>::from(text), size.to_bits(), scale.to_bits());
-        if let Ok(widths) = self.shared.widths.read()
-            && let Some(w) = widths.get(&key)
-        {
-            return Some(*w);
+        if let Some(w) = self.cached_width(text, size, scale) {
+            return Some(w);
         }
-        let width = {
-            let mut guard = self.shared.fonts.lock().unwrap_or_else(|e| e.into_inner());
-            let fonts = guard.as_mut()?;
+        let width = self.with_fonts(|fonts| {
             let px = size * scale;
             let mut buffer = Buffer::new(&mut fonts.system, Metrics::new(px, px * LINE_HEIGHT));
             buffer.set_wrap(Wrap::None);
@@ -211,38 +313,55 @@ impl TextEngine {
             );
             buffer.shape_until_scroll(&mut fonts.system, false);
             buffer.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
-        };
-        if let Ok(mut widths) = self.shared.widths.write() {
-            if widths.len() >= CACHE_LIMIT {
-                widths.clear();
-            }
-            widths.insert(key, width);
-        }
+        })?;
+        self.remember_width(text, size, scale, width);
         Some(width)
     }
 
-    fn shape(&self, text: &str, style: TextStyle, max_width: f32) -> Option<Label> {
+    /// Shapes and rasterizes a label. The second value says whether the text
+    /// fit unshortened, which makes the label valid at any larger width.
+    fn shape(&self, text: &str, style: TextStyle, max_width: f32) -> (Option<Label>, bool) {
         if text.is_empty() || max_width < 1.0 {
-            return None;
+            return (None, false);
         }
         // No label is wider than any display; this also keeps the bitmap size
         // arithmetic far from overflow.
         let max_width = max_width.min(16_384.0);
-        let mut guard = self.shared.fonts.lock().unwrap_or_else(|e| e.into_inner());
-        let fonts = guard.as_mut()?;
+        self.with_fonts(|fonts| self.shape_with(fonts, text, style, max_width))
+            .unwrap_or((None, false))
+    }
+
+    fn shape_with(
+        &self,
+        fonts: &mut Fonts,
+        text: &str,
+        style: TextStyle,
+        max_width: f32,
+    ) -> (Option<Label>, bool) {
         let px = (style.size * style.scale).max(1.0);
         let line_h = (px * LINE_HEIGHT).ceil();
+        // First shape the text on one line without shortening. Most labels
+        // fit, and then this is the only shaping they need.
+        let attrs = Attrs::new().family(Family::SansSerif);
         let mut buffer = Buffer::new(&mut fonts.system, Metrics::new(px, line_h));
         buffer.set_wrap(Wrap::None);
-        buffer.set_ellipsize(Ellipsize::Middle(EllipsizeHeightLimit::Lines(1)));
-        buffer.set_size(Some(max_width), Some(line_h * 2.0));
-        buffer.set_text(
-            text,
-            &Attrs::new().family(Family::SansSerif),
-            Shaping::Advanced,
-            None,
-        );
+        buffer.set_size(None, None);
+        buffer.set_text(text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut fonts.system, false);
+        let natural = buffer
+            .layout_runs()
+            .map(|r| r.line_w)
+            .fold(0.0_f32, f32::max);
+        self.remember_width(text, style.size, style.scale, natural);
+        let fitted = natural <= max_width;
+        if !fitted {
+            buffer = Buffer::new(&mut fonts.system, Metrics::new(px, line_h));
+            buffer.set_wrap(Wrap::None);
+            buffer.set_ellipsize(Ellipsize::Middle(EllipsizeHeightLimit::Lines(1)));
+            buffer.set_size(Some(max_width), Some(line_h * 2.0));
+            buffer.set_text(text, &attrs, Shaping::Advanced, None);
+            buffer.shape_until_scroll(&mut fonts.system, false);
+        }
 
         let width = buffer
             .layout_runs()
@@ -253,6 +372,19 @@ impl TextEngine {
             .saturating_add(2)
             .min((max_width.ceil() as u32).saturating_add(2));
         let h = (line_h as u32).saturating_add(2);
+        let label = Self::rasterize(fonts, &buffer, style, (w, h), width);
+        (label, fitted)
+    }
+
+    /// Draws the shaped line into a new bitmap of `size`.
+    fn rasterize(
+        fonts: &mut Fonts,
+        buffer: &Buffer,
+        style: TextStyle,
+        size: (u32, u32),
+        width: f32,
+    ) -> Option<Label> {
+        let (w, h) = size;
         let mut pixmap = Pixmap::new(w.max(1), h.max(1))?;
         let color = style.color;
         let stride = pixmap.width() as i32;
@@ -365,6 +497,27 @@ mod tests {
         let (hits, misses) = engine.cache_stats();
         assert!(hits >= 5, "second lookups should hit: {hits}");
         assert!(misses >= 5);
+    }
+
+    #[test]
+    fn a_label_that_fits_is_shared_across_widths() {
+        let engine = TextEngine::new();
+        engine.load_fonts();
+        let text = "Pictures and other things";
+        let natural = engine.measure(text, 13.0, 1.0).expect("fonts loaded");
+        assert!(natural > 40.0, "this test needs a system font");
+        let first = engine.label(text, style(), natural + 50.0).expect("label");
+        let (_, misses) = engine.cache_stats();
+        // A box that grew or shrank but still holds the text reuses the label.
+        let again = engine.label(text, style(), natural + 200.0).expect("label");
+        let (_, after) = engine.cache_stats();
+        assert_eq!(misses, after, "a wider box must not shape again");
+        assert!(Arc::ptr_eq(&first, &again));
+        // A box too narrow for the text gets its own, shortened label.
+        let narrow = engine.label(text, style(), natural * 0.6).expect("label");
+        assert!(!Arc::ptr_eq(&first, &narrow));
+        assert!(narrow.width <= natural * 0.6 + 0.5);
+        assert!(first.width > narrow.width);
     }
 
     #[test]
