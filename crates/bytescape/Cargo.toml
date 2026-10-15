@@ -80,3 +80,6 @@ assets = [
 
 [build-dependencies]
 embed-resource = { workspace = true }
+
+[dev-dependencies]
+tiny-skia = { workspace = true }

@@ -11,9 +11,3 @@ publish = false
 
 [lints]
 workspace = true
-
-# The GPU zoom benchmark draws the same synthetic scene as the software one.
-[dependencies]
-bs-render = { path = "../bs-render" }
-bs-ui = { path = "../bs-ui" }
-winit = { workspace = true }

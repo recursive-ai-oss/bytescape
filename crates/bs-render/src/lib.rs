@@ -1,6 +1,8 @@
 //! The narrow drawing interface and its software backend, with the glyph cache
 //! and hatch patterns.
 //!
+//! * [`any`]: one renderer type over both backends, and the window surface
+//!   that switches to software drawing when the GPU fails.
 //! * [`canvas`]: the [`Canvas`] trait and a recording implementation for tests.
 //! * [`skia`]: the `tiny-skia` backend.
 //! * [`text`]: font discovery, shaping and the label cache.
@@ -13,6 +15,7 @@
 //! * [`gpu`]: the same interface and renderer on the GPU, with a fallback to
 //!   the software path.
 
+pub mod any;
 pub mod canvas;
 pub mod card;
 pub mod chrome;
@@ -27,6 +30,7 @@ pub mod text;
 pub mod warm;
 pub mod zoom;
 
+pub use any::{AnyRenderer, Screen, ScreenOptions, Startup, Wake, drawing_line};
 pub use canvas::{Canvas, Hatch, HatchAngle, RecordingCanvas, Stroke, TextStyle};
 pub use card::{COPIED_TEXT, Card, CardPart, CardRole, Popup};
 pub use chrome::{Chrome, Glyph, SegmentKind, TextRole, Widget};

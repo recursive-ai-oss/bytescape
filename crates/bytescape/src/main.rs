@@ -23,6 +23,17 @@ const DEFAULT_FONT_PX: f32 = 13.0;
 
 static FONT_PX: OnceLock<f32> = OnceLock::new();
 
+static BACKEND: OnceLock<bs_render::gpu::BackendPreference> = OnceLock::new();
+
+/// Which drawing backend to use: `--backend gpu|software|auto`, else the
+/// `BYTESCAPE_BACKEND` variable, else automatic (the GPU when one works).
+pub fn backend_preference() -> bs_render::gpu::BackendPreference {
+    BACKEND
+        .get()
+        .copied()
+        .unwrap_or_else(bs_render::gpu::BackendPreference::from_env)
+}
+
 /// The font size in logical pixels used for chrome, labels and thresholds.
 pub fn font_px() -> f32 {
     FONT_PX.get().copied().unwrap_or(DEFAULT_FONT_PX)
@@ -192,6 +203,14 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
                 }
                 let _ = FONT_PX.set(px);
             }
+            "--backend" => {
+                let _ = BACKEND.set(match value("--backend")?.as_str() {
+                    "gpu" => bs_render::gpu::BackendPreference::Gpu,
+                    "software" => bs_render::gpu::BackendPreference::Software,
+                    "auto" => bs_render::gpu::BackendPreference::Auto,
+                    _ => return Err("--backend is gpu, software or auto".into()),
+                });
+            }
             "--midscan-files" => {
                 shot.midscan_files = value("--midscan-files")?
                     .parse()
@@ -256,6 +275,16 @@ pub(crate) fn about() -> bs_ui::notice::AboutInfo {
         env!("BYTESCAPE_VERSION"),
         env!("BYTESCAPE_BUILD_DATE"),
         env!("BYTESCAPE_TARGET"),
+    )
+}
+
+/// What the About box says about this build, with the drawing backend added
+/// to the target line (for example "Drawing: GPU (name)").
+pub(crate) fn about_with(drawing: &str) -> bs_ui::notice::AboutInfo {
+    bs_ui::notice::AboutInfo::new(
+        env!("BYTESCAPE_VERSION"),
+        env!("BYTESCAPE_BUILD_DATE"),
+        &format!("{} · {drawing}", env!("BYTESCAPE_TARGET")),
     )
 }
 

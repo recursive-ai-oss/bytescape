@@ -437,11 +437,6 @@ dependencies = [
 [[package]]
 name = "bs-gate"
 version = "0.1.0"
-dependencies = [
- "bs-render",
- "bs-ui",
- "winit",
-]
 
 [[package]]
 name = "bs-ipc"
@@ -608,6 +603,7 @@ dependencies = [
  "bs-tree",
  "bs-ui",
  "embed-resource",
+ "tiny-skia 0.12.0",
  "winit",
 ]
 

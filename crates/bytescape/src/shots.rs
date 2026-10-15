@@ -57,6 +57,7 @@ pub fn is_picker_state(state: &str) -> bool {
             | "crash-report-paths"
             | "crash-narrow"
             | "about"
+            | "about-fallback"
             | "app-menu"
             | "card-program"
             | "card-package"
@@ -872,10 +873,18 @@ fn notes_scene(
     shell.set_status("640 GB in 1.2 million files".into(), false);
     shell.set_capabilities(Capabilities { properties: true });
     shell.set_software_center(state != "card-package-nosoftware");
+    let drawing = match state {
+        // A picture of the wording after the GPU failed.
+        "about-fallback" => bs_render::drawing_line(None, Some("forced failure at Device")),
+        _ if crate::backend_preference() == bs_render::gpu::BackendPreference::Gpu => {
+            bs_render::drawing_line(Some("example adapter"), None)
+        }
+        _ => bs_render::drawing_line(None, None),
+    };
     shell.set_about(AboutInfo::new(
         "0.1.0",
         "2025-08-20",
-        "x86_64-unknown-linux-gnu",
+        &format!("x86_64-unknown-linux-gnu · {drawing}"),
     ));
     shell.set_unix_clock(Box::new(|| 1_792_454_400));
     match state {
@@ -904,7 +913,7 @@ fn notes_scene(
             }
             now = at(400);
         }
-        "about" => {
+        "about" | "about-fallback" => {
             shell.update(InputEvent::Key(Key::About), at(200));
             now = at(300);
         }
@@ -964,6 +973,7 @@ pub fn screenshots(opts: &ShotOptions, states: &[String], text: &TextEngine) -> 
                 | "crash-report-paths"
                 | "crash-narrow"
                 | "about"
+                | "about-fallback"
                 | "app-menu"
                 | "card-program"
                 | "card-package"

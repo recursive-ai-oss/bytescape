@@ -7,7 +7,7 @@ use std::time::Instant;
 use std::time::Duration;
 
 use bs_layout::Metrics;
-use bs_render::{ItemKind, Rect, Renderer, TextEngine};
+use bs_render::{AnyRenderer, ItemKind, Rect, TextEngine};
 use bs_ui::shell::{Look, Shell, ShellEffect};
 use bs_ui::tree::{TreeSource, scan_status};
 use bs_ui::{App, Direction, InputEvent, Key, ViewId, ViewSource};
@@ -32,7 +32,7 @@ pub fn prepare_zoom(
     path: &Path,
     size: (u32, u32),
     text: &TextEngine,
-) -> Result<(App<TreeSource>, Renderer, Script), String> {
+) -> Result<(App<TreeSource>, AnyRenderer, Script), String> {
     let tag = &opts.tag;
     let started = Instant::now();
     let (snapshot, stats) = scan_to_end(path.to_path_buf())?;
@@ -191,7 +191,7 @@ pub fn is_nav_state(state: &str) -> bool {
     state.starts_with("card") || matches!(state, "midzoom" | "keysel" | "crumb")
 }
 
-fn apply_shell_effects(renderer: &mut Renderer, fx: Vec<ShellEffect>, now: Duration) {
+fn apply_shell_effects(renderer: &mut AnyRenderer, fx: Vec<ShellEffect>, now: Duration) {
     for e in fx {
         match e {
             ShellEffect::Map(e) => {
@@ -324,8 +324,8 @@ pub fn nav_screenshots(
                 // present it.
                 let (w, h) = renderer.size();
                 let mut words = vec![0u32; (w * h) as usize];
-                renderer.paint(&mut words, clock, true);
-                renderer.paint(&mut words, clock + ms(55), true);
+                renderer.paint_words(&mut words, clock, true);
+                renderer.paint_words(&mut words, clock + ms(55), true);
                 bs_render::pixel::save_words_png(&words, w, h, &file)?;
             } else {
                 renderer.save_png(&file)?;

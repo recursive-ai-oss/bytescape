@@ -14,10 +14,12 @@ use bs_platform::bins::BinControl;
 use bs_platform::crash::Report;
 use bs_platform::drives::{Capacity, Drive};
 use bs_platform::software::Matcher;
-use bs_render::present::Presenter;
+use bs_render::gpu::{Geometry, PresentPacing};
 use bs_render::{
-    Chrome, Flags, Item, ItemKind, ItemLabel, Painted, Palette, Rect, Renderer, TextEngine,
+    AnyRenderer, Chrome, Flags, Item, ItemKind, ItemLabel, Painted, Palette, Rect, Screen,
+    TextEngine,
 };
+use bs_render::{ScreenOptions, Startup};
 use bs_tree::Snapshot;
 use bs_tree::{NodeId, Progress};
 use bs_ui::action::Action;
@@ -47,7 +49,7 @@ use crate::synth::{LayoutParams, SynthSource, format_size};
 use crate::system::{self, Choice, SystemDisposer};
 use crate::{Mode, ShotOptions, ZoomOptions, font_px, real};
 
-type Gfx = Presenter<Arc<Window>, Arc<Window>>;
+type Gfx = Screen<Arc<Window>>;
 
 pub fn run(mode: Mode, t0: Instant) -> Result<(), String> {
     match mode {
@@ -115,9 +117,23 @@ pub(crate) fn make_renderer(
     scale: f32,
     dark: bool,
     text: TextEngine,
-) -> Result<Renderer, String> {
-    let mut r = Renderer::new(size.0, size.1, scale, font_px(), palette_for(dark), text)
-        .ok_or("window has no area")?;
+) -> Result<AnyRenderer, String> {
+    let geometry = Geometry {
+        width: size.0,
+        height: size.1,
+        scale,
+        font_px: font_px(),
+    };
+    let (mut r, why) = AnyRenderer::offscreen(
+        geometry,
+        palette_for(dark),
+        text,
+        crate::backend_preference(),
+    )
+    .ok_or("window has no area")?;
+    if let Some(why) = why {
+        eprintln!("bytescape: GPU drawing is not available ({why}); using software drawing");
+    }
     r.set_reduced_motion(reduced_motion_override());
     Ok(r)
 }
@@ -196,11 +212,26 @@ pub(crate) fn drive_breakdown(path: &Path, snapshot: &Snapshot) -> Option<Breakd
     Some(Breakdown::new(&capacity, counted, complete, 0))
 }
 
-pub(crate) fn print_env(label: &str, renderer: &Renderer, size: (u32, u32)) {
+pub(crate) fn print_env(label: &str, renderer: &AnyRenderer, size: (u32, u32)) {
     println!("{label}.width={}", size.0);
     println!("{label}.height={}", size.1);
     println!("{label}.scale_factor={}", renderer.scale());
     println!("{label}.render_threads={}", renderer.threads());
+    if let AnyRenderer::Gpu(g) = renderer {
+        let gpu = g.gpu();
+        let info = gpu.adapter_info();
+        println!("{label}.adapter={}", info.name);
+        println!("{label}.adapter_type={:?}", info.device_type);
+        println!("{label}.adapter_backend={:?}", info.backend);
+        println!(
+            "{label}.adapter_driver={} {}",
+            info.driver, info.driver_info
+        );
+        println!("{label}.software_adapter={}", gpu.is_software());
+        if gpu.is_software() {
+            println!("{label}.note=software adapter, not a GPU verdict");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +248,7 @@ fn prepare_zoom(
     opts: &ZoomOptions,
     size: (u32, u32),
     text: &TextEngine,
-) -> Result<(BenchApp, Renderer, Script), String> {
+) -> Result<(BenchApp, AnyRenderer, Script), String> {
     match &opts.path {
         Some(path) => {
             let (app, renderer, script) = real::prepare_zoom(opts, path, size, text)?;
@@ -232,16 +263,22 @@ fn prepare_zoom(
 
 /// The name of a measurement layer: the plain name for the synthetic scene,
 /// prefixed with the tag for a real scan.
-fn layer_name(opts: &ZoomOptions, base: &str) -> String {
+fn layer_name(opts: &ZoomOptions, base: &str, renderer: &AnyRenderer) -> String {
+    // The GPU backend's numbers sit in their own layers, next to the software
+    // ones.
+    let base = match renderer {
+        AnyRenderer::Gpu(_) => format!("wgpu_{base}"),
+        AnyRenderer::Software(_) => base.to_string(),
+    };
     match &opts.path {
         Some(_) => format!("{}_{base}", opts.tag),
-        None => base.to_string(),
+        None => base,
     }
 }
 
 fn run_bench(
     app: &mut BenchApp,
-    renderer: &mut Renderer,
+    renderer: &mut AnyRenderer,
     sink: &mut dyn FrameSink,
     script: &Script,
     layer: &str,
@@ -260,7 +297,7 @@ fn prepare_synthetic_zoom(
     opts: &ZoomOptions,
     size: (u32, u32),
     text: &TextEngine,
-) -> Result<(App<SynthSource>, Renderer, Script), String> {
+) -> Result<(App<SynthSource>, AnyRenderer, Script), String> {
     let (mut scene, calibration) = build_scene(size, opts.scale, Some(opts.boxes));
     let (min_area, root_count) = calibration.unwrap_or((0.0, 0));
     let t = Instant::now();
@@ -355,6 +392,7 @@ fn zoom_offscreen(opts: &ZoomOptions) {
         } else {
             "offscreen_unpaced"
         },
+        &renderer,
     );
     print_env(&layer, &renderer, opts.size);
     let mut sink = Offscreen::new(opts.size.0, opts.size.1);
@@ -366,19 +404,8 @@ struct WindowSink<'a> {
 }
 
 impl FrameSink for WindowSink<'_> {
-    fn paint(&mut self, renderer: &mut Renderer, now: Duration) -> Painted {
-        let mut painted = Painted {
-            damage: Vec::new(),
-            animating: false,
-        };
-        let result = self.presenter.present_with(|buf, whole| {
-            painted = renderer.paint(buf, now, whole);
-            painted.damage.clone()
-        });
-        if let Err(e) = result {
-            eprintln!("bytescape: present failed: {e}");
-        }
-        painted
+    fn paint(&mut self, renderer: &mut AnyRenderer, now: Duration) -> Painted {
+        self.presenter.present(renderer, now)
     }
 }
 
@@ -534,7 +561,9 @@ struct Live {
     /// The screen-reader interface, where this build has one.
     access: Option<Access>,
     presenter: Gfx,
-    renderer: Renderer,
+    renderer: AnyRenderer,
+    /// The drawing backend line the About box shows now.
+    drawing: String,
     /// Chrome, info bar, legend and the map once the first snapshot has
     /// arrived.
     shell: Shell<TreeSource>,
@@ -787,7 +816,7 @@ fn run_window(mode: Mode, t0: Instant) -> Result<(), String> {
 
 /// Applies the app's effects to the renderer. Returns whether the view
 /// changed, so the breadcrumb needs rebuilding.
-pub(crate) fn apply(renderer: &mut Renderer, fx: Vec<Effect>, now: Duration) -> bool {
+pub(crate) fn apply(renderer: &mut AnyRenderer, fx: Vec<Effect>, now: Duration) -> bool {
     apply_in(renderer, fx, now, false)
 }
 
@@ -795,7 +824,7 @@ pub(crate) fn apply(renderer: &mut Renderer, fx: Vec<Effect>, now: Duration) -> 
 /// and swapped in when ready, so the event loop is never held up by a repaint
 /// of the whole window (layouts that arrive while a scan runs).
 pub(crate) fn apply_in(
-    renderer: &mut Renderer,
+    renderer: &mut AnyRenderer,
     fx: Vec<Effect>,
     now: Duration,
     background: bool,
@@ -1012,7 +1041,7 @@ fn refresh_chrome(live: &mut Live, now: Duration) -> bool {
 /// Hands `renderer` the chrome and the hover card of `shell`. Returns whether
 /// anything changed.
 pub(crate) fn refresh_shell_chrome(
-    renderer: &mut Renderer,
+    renderer: &mut AnyRenderer,
     shell: &mut Shell<TreeSource>,
     now: Duration,
 ) -> bool {
@@ -1739,16 +1768,49 @@ impl WinApp {
         self.timeline.push(("window_created", at));
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
-        let presenter = Presenter::new(window.clone(), window.clone(), size.width, size.height)
-            .map_err(|e| e.to_string())?;
-        let at = self.ms();
-        self.timeline.push(("surface_created", at));
         let dark = match &self.mode {
             Mode::Zoom(z) => z.dark,
             _ => Self::initial_dark(&window),
         };
-        let mut renderer =
-            make_renderer((size.width, size.height), scale, dark, self.text.clone())?;
+        // A zoom measurement times the work itself, so it presents without
+        // waiting for the display; a person at the window gets vsync.
+        let pacing = if matches!(self.mode, Mode::Zoom(_)) {
+            PresentPacing::Immediate
+        } else {
+            PresentPacing::Vsync
+        };
+        let (presenter, mut renderer) = Screen::open(
+            window.clone(),
+            Geometry {
+                width: size.width,
+                height: size.height,
+                scale,
+                font_px: font_px(),
+            },
+            palette_for(dark),
+            self.text.clone(),
+            ScreenOptions {
+                preference: crate::backend_preference(),
+                pacing,
+                // A person waits for the first frame, not for a GPU to start;
+                // a measurement wants the GPU from the start.
+                startup: if matches!(self.mode, Mode::Zoom(_)) {
+                    Startup::Wait
+                } else {
+                    Startup::Background
+                },
+                wake: Some({
+                    let w = window.clone();
+                    Arc::new(move || w.request_redraw())
+                }),
+            },
+        )?;
+        renderer.set_reduced_motion(reduced_motion_override());
+        if let Some(why) = presenter.fallback_reason() {
+            eprintln!("bytescape: GPU drawing is not available ({why}); using software drawing");
+        }
+        let at = self.ms();
+        self.timeline.push(("surface_created", at));
         let crumb = self
             .scan_path
             .as_ref()
@@ -1773,7 +1835,8 @@ impl WinApp {
         // The offer of a full scan appears once the platform has said whether
         // it can work here.
         shell.set_offer(Offer::Hidden);
-        shell.set_about(crate::about());
+        let drawing = presenter.description(&renderer);
+        shell.set_about(crate::about_with(&drawing));
         shell.set_crumb(crumb);
         shell.set_status(status, self.scan_path.is_some());
         let map = shell.map_rect();
@@ -1784,7 +1847,9 @@ impl WinApp {
         if let Mode::Zoom(z) = &self.mode {
             let opts = z.clone();
             let (a, r, sc) = prepare_zoom(&opts, (size.width, size.height), &self.text)?;
-            renderer = r;
+            // The scene was prepared with its own renderer; the window keeps
+            // the one that matches its surface and takes over the chrome.
+            renderer.set_chrome(r.chrome().clone());
             bench = Some((a, sc));
         } else if self.scan_path.is_some() {
             // One empty block stands in for the map until the first snapshot.
@@ -1800,6 +1865,7 @@ impl WinApp {
             access,
             presenter,
             renderer,
+            drawing,
             shell,
             bench,
             scan: None,
@@ -1862,6 +1928,7 @@ impl WinApp {
                 } else {
                     "windowed_unpaced"
                 },
+                &live.renderer,
             );
             print_env(&layer, &live.renderer, live.renderer.size());
             let mut sink = WindowSink {
@@ -1877,6 +1944,13 @@ impl WinApp {
             presenter: &mut live.presenter,
         };
         let painted = sink.paint(&mut live.renderer, now);
+        let drawing = live.presenter.description(&live.renderer);
+        if drawing != live.drawing {
+            // The GPU stopped and drawing moved to software: say so.
+            eprintln!("bytescape: {drawing}");
+            live.shell.set_about(crate::about_with(&drawing));
+            live.drawing = drawing;
+        }
         if self.scan_path.is_some() {
             self.stats
                 .paints_us
@@ -2505,10 +2579,13 @@ impl WinApp {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        if live.presenter.resize(size.width, size.height).is_err() {
+        if live
+            .presenter
+            .resize(&mut live.renderer, size.width, size.height, scale)
+            .is_err()
+        {
             return;
         }
-        live.renderer.resize(size.width, size.height, scale);
         // A layout still being made is for the old size; it is dropped when it
         // arrives.
         if let Some(app) = live.shell.app_mut() {

@@ -82,7 +82,38 @@ pub struct GpuOptions {
     pub fail_at: Option<FailStage>,
 }
 
+impl FailStage {
+    /// The stage named `name` (`instance`, `adapter`, `device`, `pipeline`,
+    /// `surface`, `renderer`, `first-frame`).
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "instance" => Self::Instance,
+            "adapter" => Self::Adapter,
+            "device" => Self::Device,
+            "pipeline" => Self::Pipeline,
+            "surface" => Self::Surface,
+            "renderer" => Self::Renderer,
+            "first-frame" => Self::FirstFrame,
+            _ => return None,
+        })
+    }
+}
+
 impl GpuOptions {
+    /// Reads two diagnostic variables: `BYTESCAPE_GPU_ADAPTER=software` asks
+    /// for a software adapter, and `BYTESCAPE_GPU_FAIL_AT=<stage>` makes that
+    /// start-up step fail so the fall back to software drawing can be seen.
+    pub fn from_env() -> Self {
+        let adapter = match std::env::var("BYTESCAPE_GPU_ADAPTER").as_deref() {
+            Ok("software") => AdapterChoice::Software,
+            _ => AdapterChoice::Default,
+        };
+        let fail_at = std::env::var("BYTESCAPE_GPU_FAIL_AT")
+            .ok()
+            .and_then(|v| FailStage::parse(&v));
+        Self { adapter, fail_at }
+    }
+
     pub(crate) fn check(&self, stage: FailStage) -> Result<(), GpuError> {
         if self.fail_at == Some(stage) {
             Err(GpuError::Injected(stage))

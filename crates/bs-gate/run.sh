@@ -11,16 +11,18 @@
 #                     "0 0-1" for one-core and two-core stress runs
 #   WRAP              a command prefix for every step, for example a memory cap
 #   BACKEND           "software" (default) measures the software renderer only.
-#                     "wgpu" also measures the GPU backend on the synthetic
-#                     scene: a windowed run inside the virtual display and an
-#                     offscreen one, on the full machine and on the pinned
-#                     cores. Both are paced in real time.
+#                     "wgpu" also measures the GPU backend, through the same
+#                     code the window uses: windowed (render and present) and
+#                     offscreen (render and wait for the GPU), both paced in
+#                     real time, on the synthetic scene and, with REAL_PATH,
+#                     on the real scan. The first-frame runs of the default
+#                     build use the automatic choice of backend, and one more
+#                     series forces software drawing for comparison.
 #   WGPU_ADAPTER      "software" (default) forces a software adapter
-#                     (llvmpipe), which is what a virtual display offers and
-#                     says nothing about a graphics card. "default" lets the
-#                     system choose; the windowed run then needs a display
-#                     server that a graphics driver can present to.
-#   WGPU_SIZE         window size of the GPU runs (default 3840x2160)
+#                     (llvmpipe), which is what a virtual display usually
+#                     offers and says nothing about a graphics card; results
+#                     are labelled "not a GPU verdict". "default" lets the
+#                     system choose the adapter. See docs/gpu-regate.md.
 #   REAL_PATH         a big real folder to scan for the real-data series: the
 #                     first frame of `bytescape <path>`, the zoom on the
 #                     finished scan and the live map while it scans (default:
@@ -41,13 +43,13 @@ EXTRA_CPUS="${EXTRA_CPUS:-}"
 WRAP="${WRAP:-}"
 REAL_PATH="${REAL_PATH-$HOME}"
 BACKEND="${BACKEND:-software}"
+GATE_GPU=""
 WGPU_ADAPTER="${WGPU_ADAPTER:-software}"
-WGPU_SIZE="${WGPU_SIZE:-3840x2160}"
+[ "$BACKEND" = wgpu ] && GATE_GPU="--wgpu --wgpu-adapter $WGPU_ADAPTER"
 
-(cd "$REPO" && $WRAP cargo build --release -j "${JOBS:-8}" -p bytescape -p bs-gate --bins)
+(cd "$REPO" && $WRAP cargo build --release -j "${JOBS:-8}" -p bytescape -p bs-gate)
 BIN="$CARGO_TARGET_DIR/release/bytescape"
 GATE="$CARGO_TARGET_DIR/release/bs-gate"
-GPU_ZOOM="$CARGO_TARGET_DIR/release/gpu_zoom"
 SCREEN="-screen 0 3840x2160x24 -noreset"
 
 mkdir -p "$OUT"
@@ -59,33 +61,13 @@ measure() {
   shift
   env -u WAYLAND_DISPLAY $WRAP "$@" xvfb-run -a -s "$SCREEN" \
     "$GATE" run --label "$label" --bytescape "$BIN" --out "$OUT" --repo "$REPO" \
-    --real "$REAL_PATH"
-}
-
-# Adds the GPU backend's zoom series to the result file of `label`. The
-# windowed run goes through the virtual display; the offscreen one needs no
-# display at all.
-measure_wgpu() {
-  local label=$1
-  shift
-  local adapter=()
-  [ "$WGPU_ADAPTER" = software ] && adapter=(--software-adapter)
-  local part="$OUT/$label.wgpu.out"
-  : >"$part"
-  env -u WAYLAND_DISPLAY $WRAP "$@" xvfb-run -a -s "$SCREEN" \
-    "$GPU_ZOOM" --windowed --paced --size "$WGPU_SIZE" "${adapter[@]}" >>"$part" || true
-  env -u WAYLAND_DISPLAY $WRAP "$@" \
-    "$GPU_ZOOM" --paced --size "$WGPU_SIZE" "${adapter[@]}" >>"$part" || true
-  grep -E '^wgpu[a-z_]*\.[^=]*=' "$part" >>"$OUT/$label.kv" || true
+    --real "$REAL_PATH" $GATE_GPU
 }
 
 measure full
-[ "$BACKEND" = wgpu ] && measure_wgpu full
 measure proxy-taskset-$PROXY_CPUS taskset -c "$PROXY_CPUS"
-[ "$BACKEND" = wgpu ] && measure_wgpu proxy-taskset-$PROXY_CPUS taskset -c "$PROXY_CPUS"
 for cpus in $EXTRA_CPUS; do
   measure stress-taskset-$cpus taskset -c "$cpus"
-  [ "$BACKEND" = wgpu ] && measure_wgpu stress-taskset-$cpus taskset -c "$cpus"
 done
 
 "$GATE" merge --out "$OUT"

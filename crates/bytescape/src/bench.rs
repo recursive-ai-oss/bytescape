@@ -10,12 +10,12 @@
 
 use std::time::{Duration, Instant};
 
-use bs_render::{Painted, Renderer};
+use bs_render::{AnyRenderer, Painted};
 use bs_ui::{App, Effect, InputEvent, ViewSource};
 
 /// Where finished frames go: a window or a plain buffer.
 pub trait FrameSink {
-    fn paint(&mut self, renderer: &mut Renderer, now: Duration) -> Painted;
+    fn paint(&mut self, renderer: &mut AnyRenderer, now: Duration) -> Painted;
 }
 
 /// Renders into memory; measures drawing without presenting.
@@ -34,9 +34,20 @@ impl Offscreen {
 }
 
 impl FrameSink for Offscreen {
-    fn paint(&mut self, renderer: &mut Renderer, now: Duration) -> Painted {
+    fn paint(&mut self, renderer: &mut AnyRenderer, now: Duration) -> Painted {
         let whole = std::mem::take(&mut self.first);
-        renderer.paint(&mut self.buffer, now, whole)
+        match renderer {
+            AnyRenderer::Software(r) => r.paint(&mut self.buffer, now, whole),
+            AnyRenderer::Gpu(g) => {
+                // Wait for the GPU, so the time covers the drawing itself.
+                let painted = g.paint_offscreen(now);
+                g.gpu().wait_idle();
+                painted.unwrap_or(Painted {
+                    damage: Vec::new(),
+                    animating: false,
+                })
+            }
+        }
     }
 }
 
@@ -133,7 +144,7 @@ fn micros(t: Instant) -> u64 {
     t.elapsed().as_micros() as u64
 }
 
-fn apply(renderer: &mut Renderer, fx: Vec<Effect>, now: Duration) {
+fn apply(renderer: &mut AnyRenderer, fx: Vec<Effect>, now: Duration) {
     for e in fx {
         match e {
             Effect::SetHover(id) => renderer.set_hover(id),
@@ -154,7 +165,7 @@ fn apply(renderer: &mut Renderer, fx: Vec<Effect>, now: Duration) {
 /// What a zoom step runs against.
 struct Rig<'a, S: ViewSource> {
     app: &'a mut App<S>,
-    renderer: &'a mut Renderer,
+    renderer: &'a mut AnyRenderer,
     sink: &'a mut dyn FrameSink,
     clock: Duration,
     paced: bool,
@@ -240,7 +251,7 @@ fn print_series(layer: &str, name: &str, s: &Series) {
 /// Runs the full script and prints results as `key=value` lines.
 pub fn run<S: ViewSource>(
     app: &mut App<S>,
-    renderer: &mut Renderer,
+    renderer: &mut AnyRenderer,
     sink: &mut dyn FrameSink,
     script: &Script,
     layer: &str,

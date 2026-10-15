@@ -156,6 +156,39 @@ impl Renderer {
         })
     }
 
+    /// The box the pointer is over.
+    pub fn hover(&self) -> Option<u32> {
+        self.hover
+    }
+
+    /// The selected boxes.
+    pub fn selection(&self) -> &[u32] {
+        &self.selected
+    }
+
+    /// The category everything else is dimmed to, if the legend is hovered.
+    pub fn dim(&self) -> Option<u8> {
+        self.dim
+    }
+
+    /// How solid the title text of folders still being counted is.
+    pub fn pulse(&self) -> f32 {
+        self.pulse
+    }
+
+    pub fn toast(&self) -> Option<&Card> {
+        self.toast.as_ref()
+    }
+
+    pub fn reduced_motion(&self) -> bool {
+        self.reduced_motion
+    }
+
+    /// The UI font size in logical pixels.
+    pub fn font_px(&self) -> f32 {
+        self.font_px
+    }
+
     /// Timing breakdown of the latest `paint`.
     pub fn timings(&self) -> PaintTimings {
         self.timings

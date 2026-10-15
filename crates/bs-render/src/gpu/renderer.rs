@@ -1010,6 +1010,65 @@ impl GpuRenderer {
         pixmap.save_png(path).map_err(|e| e.to_string())
     }
 
+    /// A GPU renderer showing what `software` shows: the view, chrome, hover,
+    /// selection, dimming, card, toast and popup. Used when the GPU becomes
+    /// ready after drawing has started in software.
+    pub fn from_software(
+        gpu: Arc<GpuContext>,
+        software: &crate::Renderer,
+        options: &GpuOptions,
+    ) -> Result<Self, GpuError> {
+        let (width, height) = software.size();
+        let mut r = Self::new(
+            gpu,
+            Geometry {
+                width,
+                height,
+                scale: software.scale(),
+                font_px: software.font_px(),
+            },
+            software.palette().clone(),
+            software.text().clone(),
+            options,
+        )?;
+        r.set_reduced_motion(software.reduced_motion());
+        r.set_chrome(software.chrome().clone());
+        r.set_items(Arc::new(software.items().to_vec()));
+        r.set_dim(software.dim());
+        r.set_pulse(software.pulse());
+        r.set_card(software.card().cloned());
+        r.set_toast(software.toast().cloned());
+        r.set_popup(software.popup().cloned());
+        r.set_selection(software.selection());
+        r.set_hover(software.hover());
+        Ok(r)
+    }
+
+    /// A software renderer showing what this one shows: the view, chrome,
+    /// hover, selection, dimming, card, toast and popup. Used to carry on
+    /// after a GPU error. A zoom in progress is not carried over.
+    pub fn to_software(&self) -> Option<crate::Renderer> {
+        let mut r = crate::Renderer::new(
+            self.width,
+            self.height,
+            self.scale,
+            self.font_px,
+            self.palette.clone(),
+            self.text.clone(),
+        )?;
+        r.set_reduced_motion(self.reduced_motion);
+        r.set_chrome(self.chrome.clone());
+        r.set_items(Arc::clone(&self.items));
+        r.set_dim(self.dim);
+        r.set_pulse(self.pulse);
+        r.set_card(self.card.clone());
+        r.set_toast(self.toast.clone());
+        r.set_popup(self.popup.clone());
+        r.set_selection(&self.selected);
+        r.set_hover(self.hover);
+        Some(r)
+    }
+
     /// Hit test: the topmost item containing the point.
     pub fn item_at(&self, x: f32, y: f32) -> Option<&Item> {
         self.items.iter().rev().find(|it| it.rect.contains(x, y))

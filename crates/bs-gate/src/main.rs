@@ -159,8 +159,13 @@ fn first_frame_once(bin: &Path, extra: &[&str]) -> Result<(f64, Kv), String> {
 }
 
 fn capture(bin: &Path, args: &[&str]) -> Result<String, String> {
+    capture_with(bin, args, &[])
+}
+
+fn capture_with(bin: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
     let out = Command::new(bin)
         .args(args)
+        .envs(env.iter().copied())
         .stderr(Stdio::inherit())
         .output()
         .map_err(|e| format!("cannot start {}: {e}", bin.display()))?;
@@ -412,6 +417,21 @@ fn run(args: &[String]) -> Result<(), String> {
     first_frame_series(&bin, &mut kv, "first_frame", "warm", runs, false, &[])?;
     kv.insert("first_frame.warm.warmup_runs".into(), warmups.to_string());
     first_frame_series(&bin, &mut kv, "first_frame", "cold", cold_runs, true, &[])?;
+    // The same launch with software drawing forced, to show what choosing a
+    // backend costs the first frame.
+    let software = ["--backend", "software"];
+    for _ in 0..warmups {
+        first_frame_once(&bin, &software)?;
+    }
+    first_frame_series(
+        &bin,
+        &mut kv,
+        "first_frame_software",
+        "warm",
+        runs,
+        false,
+        &software,
+    )?;
 
     // Font discovery, which the first frame does not wait for.
     let mut fonts = Vec::new();
@@ -433,7 +453,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // work gets the time it would get live. The unpaced offscreen run draws
     // frames back to back, which is the worst case for that background work.
     for (windowed, paced) in [(false, true), (true, true), (false, false)] {
-        let mut a = vec!["--bench-zoom"];
+        let mut a = vec!["--bench-zoom", "--backend", "software"];
         if !windowed {
             a.push("--offscreen");
         }
@@ -442,6 +462,25 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         a.extend(["--cycles", &c, "--cold-cycles", &cc, "--hover-moves", &h]);
         parse_kv(&capture(&bin, &a)?, &mut kv);
+    }
+    // The GPU backend through the same code the window uses: windowed (render
+    // and present) and offscreen (render and wait for the GPU), both paced.
+    let wgpu = args.iter().any(|a| a == "--wgpu");
+    let adapter = flag(args, "--wgpu-adapter").unwrap_or_else(|| "default".into());
+    let gpu_env: Vec<(&str, &str)> = if adapter == "software" {
+        vec![("BYTESCAPE_GPU_ADAPTER", "software")]
+    } else {
+        Vec::new()
+    };
+    if wgpu {
+        for windowed in [true, false] {
+            let mut a = vec!["--bench-zoom", "--backend", "gpu", "--paced"];
+            if !windowed {
+                a.push("--offscreen");
+            }
+            a.extend(["--cycles", &c, "--cold-cycles", &cc, "--hover-moves", &h]);
+            parse_kv(&capture_with(&bin, &a, &gpu_env)?, &mut kv);
+        }
     }
 
     if let Some(real) = flag(args, "--real").filter(|r| !r.is_empty()) {
@@ -453,7 +492,8 @@ fn run(args: &[String]) -> Result<(), String> {
             cold_cycles,
             hover,
         };
-        real_series(&bin, &mut kv, &real, &sizes)?;
+        let gpu = wgpu.then_some(gpu_env.as_slice());
+        real_series(&bin, &mut kv, &real, &sizes, gpu)?;
     }
 
     let mut text = String::new();
@@ -487,7 +527,13 @@ struct RealSizes {
 /// the zoom on the finished scan (at the normal font size, and at a font small
 /// enough that a real view holds 20,000 boxes or more), and the live map while
 /// the scan runs.
-fn real_series(bin: &Path, kv: &mut Kv, real: &str, z: &RealSizes) -> Result<(), String> {
+fn real_series(
+    bin: &Path,
+    kv: &mut Kv,
+    real: &str,
+    z: &RealSizes,
+    gpu_env: Option<&[(&str, &str)]>,
+) -> Result<(), String> {
     kv.insert("real.path".into(), real.to_string());
     // First frame of a real launch. The binary scans after its first present
     // and reports when the first frame with the folder's contents was shown.
@@ -525,7 +571,15 @@ fn real_series(bin: &Path, kv: &mut Kv, real: &str, z: &RealSizes) -> Result<(),
     ];
     for Variant { tag, extra, layers } in variants {
         for &(windowed, paced) in layers {
-            let mut a = vec!["--bench-zoom", "--path", real, "--tag", tag];
+            let mut a = vec![
+                "--bench-zoom",
+                "--backend",
+                "software",
+                "--path",
+                real,
+                "--tag",
+                tag,
+            ];
             a.extend_from_slice(extra);
             if !windowed {
                 a.push("--offscreen");
@@ -535,6 +589,26 @@ fn real_series(bin: &Path, kv: &mut Kv, real: &str, z: &RealSizes) -> Result<(),
             }
             a.extend(["--cycles", &c, "--cold-cycles", &cc, "--hover-moves", &h]);
             parse_kv(&capture(bin, &a)?, kv);
+        }
+    }
+
+    if let Some(env) = gpu_env {
+        for windowed in [true, false] {
+            let mut a = vec![
+                "--bench-zoom",
+                "--backend",
+                "gpu",
+                "--paced",
+                "--path",
+                real,
+                "--tag",
+                "real",
+            ];
+            if !windowed {
+                a.push("--offscreen");
+            }
+            a.extend(["--cycles", &c, "--cold-cycles", &cc, "--hover-moves", &h]);
+            parse_kv(&capture_with(bin, &a, env)?, kv);
         }
     }
 
@@ -649,6 +723,14 @@ fn verdicts_for(kv: &Kv) -> Vec<(String, Verdict)> {
                 verdict_first_frame(kv, "real_first_frame", series),
             ));
         }
+        if kv.contains_key(&format!(
+            "first_frame_software.{series}.spawn_to_first_present.n"
+        )) {
+            v.push((
+                format!("first_frame_software.{series}"),
+                verdict_first_frame(kv, "first_frame_software", series),
+            ));
+        }
         for (name, layer) in ZOOM_LAYERS {
             if !kv.contains_key(&format!("{layer}.zoom.{series}.all_frames.n")) {
                 continue;
@@ -662,7 +744,9 @@ fn verdicts_for(kv: &Kv) -> Vec<(String, Verdict)> {
 /// Every zoom layer the harness can measure: the synthetic scene, then the
 /// real scan at the normal font and at the dense stress font. A layer that
 /// was not measured has no keys and is skipped.
-const ZOOM_LAYERS: [(&str, &str); 10] = [
+const ZOOM_LAYERS: [(&str, &str); 12] = [
+    ("real_wgpu_zoom_windowed", "real_wgpu_windowed"),
+    ("real_wgpu_zoom_offscreen", "real_wgpu_offscreen"),
     ("wgpu_zoom_windowed", "wgpu_windowed"),
     ("wgpu_zoom_offscreen", "wgpu_offscreen"),
     ("zoom_windowed", "windowed"),
@@ -872,6 +956,14 @@ fn real_sections(md: &mut String, kv: &Kv) {
             "real scan, normal font: render into a 3840x2160 pixmap, paced",
         ),
         (
+            "real_wgpu_windowed",
+            "GPU backend, real scan, normal font: render + present into a 4K window, paced",
+        ),
+        (
+            "real_wgpu_offscreen",
+            "GPU backend, real scan, normal font: render into a 3840x2160 texture and wait for the GPU, paced",
+        ),
+        (
             "real_offscreen_unpaced",
             "real scan, normal font: render into a 3840x2160 pixmap, frames back to back",
         ),
@@ -1022,6 +1114,13 @@ fn merge(args: &[String]) -> Result<(), String> {
             get("scene.cold_folders_available"),
         );
         first_frame_table(&mut md, kv, "first_frame", "synthetic scene", true);
+        first_frame_table(
+            &mut md,
+            kv,
+            "first_frame_software",
+            "synthetic scene, software drawing forced",
+            false,
+        );
         for (layer, title) in ZOOM_TABLES {
             zoom_table(&mut md, kv, layer, title);
         }
