@@ -35,6 +35,7 @@ pub mod places;
 mod plan;
 pub mod scan;
 pub mod session;
+pub mod volume;
 
 #[cfg(all(test, target_os = "linux"))]
 mod testutil;

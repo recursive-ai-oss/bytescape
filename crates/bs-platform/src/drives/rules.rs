@@ -218,18 +218,33 @@ pub(crate) fn is_under(path: &[u8], mount_point: &[u8]) -> bool {
 /// at `/home` hides that folder. The files are reachable only through the
 /// second mount, so a scan has to enter it.
 pub(crate) fn covered_flags(members: &[MountEntry]) -> Vec<bool> {
-    members
-        .iter()
-        .enumerate()
-        .map(|(index, member)| {
-            members.iter().enumerate().any(|(other_index, other)| {
-                other_index != index
-                    && is_under(&member.root, &other.root)
-                    && (member.root != other.root || other_index < index)
-                    && !hides_its_own_folder(member, other)
-            })
-        })
-        .collect()
+    // Only a mount that is entered shows anything, so a mount that is covered
+    // itself covers nothing. Without that, a mount in the way of one covering
+    // mount could be flagged for a second covering mount that is a repeat of
+    // the first: its files would be reached through neither. What shows a
+    // folder has a root above it or equal to it, so the mounts are judged from
+    // the shortest root down, and every coverer is decided before the mounts
+    // it could cover.
+    let depth = |root: &[u8]| root.split(|&b| b == b'/').filter(|s| !s.is_empty()).count();
+    let mut order: Vec<usize> = (0..members.len()).collect();
+    order.sort_by_key(|&index| (members.get(index).map_or(0, |m| depth(&m.root)), index));
+    let mut covered = vec![false; members.len()];
+    for index in order {
+        let Some(member) = members.get(index) else {
+            continue;
+        };
+        let by_another = members.iter().enumerate().any(|(other_index, other)| {
+            other_index != index
+                && !covered.get(other_index).copied().unwrap_or(false)
+                && is_under(&member.root, &other.root)
+                && (member.root != other.root || other_index < index)
+                && !hides_its_own_folder(member, other)
+        });
+        if let Some(slot) = covered.get_mut(index) {
+            *slot = by_another;
+        }
+    }
+    covered
 }
 
 /// Whether `mount` is attached inside the tree that `other` shows, on the
@@ -572,6 +587,74 @@ mod tests {
             .find(|c| c.entry.fs_type == "btrfs")
             .unwrap();
         assert_eq!(covered_flags(&btrfs.members), vec![false, false]);
+    }
+
+    #[test]
+    fn a_mount_in_the_way_is_not_covered_for_a_covering_mount_that_is_covered_itself() {
+        // `/pool` shows the top of the filesystem and `/pool/home` is mounted
+        // on the folder where it shows `home`: in its way, so its files are
+        // reachable only through it. `/pool2` is a second mount of the top; it
+        // is a repeat of `/pool` and is not entered, so it cannot be what
+        // shows `home` for `/pool/home`.
+        let text = "\
+1 0 0:27 / /pool rw - btrfs /dev/sdd1 rw
+2 1 0:27 /home /pool/home rw - btrfs /dev/sdd1 rw
+3 1 0:27 / /pool2 rw - btrfs /dev/sdd1 rw
+";
+        assert_eq!(
+            covered_flags(&parse(text.as_bytes())),
+            vec![false, false, true]
+        );
+        // With the second top-level mount first in the table it is the one
+        // that is entered, `/pool` is the repeat, and `home` is a plain folder
+        // of `/pool2` (it is not in that mount's way): `/pool/home` is covered.
+        let text = "\
+3 0 0:27 / /pool2 rw - btrfs /dev/sdd1 rw
+1 3 0:27 / /pool rw - btrfs /dev/sdd1 rw
+2 1 0:27 /home /pool/home rw - btrfs /dev/sdd1 rw
+";
+        assert_eq!(
+            covered_flags(&parse(text.as_bytes())),
+            vec![false, true, true]
+        );
+        // A subvolume shown again by a covering mount that is entered stays
+        // covered: /data shows @/q at /data/q, mount 2 is elsewhere.
+        let text = "\
+1 0 0:27 /@ /data rw - btrfs /dev/sda3 rw
+2 1 0:27 /@/q /data/elsewhere rw - btrfs /dev/sda3 rw
+3 1 0:27 /@/q/r /data/q/r rw - btrfs /dev/sda3 rw
+";
+        assert_eq!(
+            covered_flags(&parse(text.as_bytes())),
+            vec![false, true, false]
+        );
+    }
+
+    #[test]
+    fn a_subvolume_mounted_on_its_own_folder_is_never_covered_by_the_top_level_or_its_parents() {
+        // The layout of a system installed on the top level of the filesystem:
+        // `/` is subvolume 5, `home` is mounted on `/home`, and a subvolume of
+        // `home` on the folder where `home` shows it, each with the options a
+        // real table carries.
+        let text = "\
+29 1 0:27 / / rw,relatime shared:1 - btrfs /dev/sda3 rw,ssd,subvolid=5,subvol=/
+41 29 0:27 /home /home rw,relatime shared:25 - btrfs /dev/sda3 rw,ssd,subvolid=257,subvol=/home
+57 41 0:27 /home/alice /home/alice rw,relatime shared:31 - btrfs /dev/sda3 rw,ssd,subvolid=300,subvol=/home/alice
+";
+        assert_eq!(
+            covered_flags(&parse(text.as_bytes())),
+            vec![false, false, false]
+        );
+        // Mounted in the opposite order of the table, the answer is the same.
+        let text = "\
+57 41 0:27 /home/alice /home/alice rw - btrfs /dev/sda3 rw,subvol=/home/alice
+41 29 0:27 /home /home rw - btrfs /dev/sda3 rw,subvol=/home
+29 1 0:27 / / rw - btrfs /dev/sda3 rw,subvol=/
+";
+        assert_eq!(
+            covered_flags(&parse(text.as_bytes())),
+            vec![false, false, false]
+        );
     }
 
     #[test]

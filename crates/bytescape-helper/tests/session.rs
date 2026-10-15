@@ -239,3 +239,189 @@ fn a_judge_that_cannot_be_trusted_refuses_the_delete_and_touches_nothing() {
     assert!(frames.read().unwrap().is_none());
     drop(writer);
 }
+
+// ------------------------------------------------------- Network volumes
+
+use bs_ipc::{Backend, ScanRequest};
+use std::path::Path;
+
+/// The mount ID the kernel gives a folder.
+fn mount_id_of(path: &Path) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    let folder = std::fs::File::open(path).unwrap();
+    bs_fsops::remove::fstat(folder.as_raw_fd()).unwrap().mnt
+}
+
+/// Runs a scan of `folder` against a mount table in which `folder`'s mount is
+/// of type `fs_type`, and gives what the helper answered.
+fn scan_with_table(fixture: &common::Fixture, folder: &Path, fs_type: &str) -> Vec<Message> {
+    let Some(id) = mount_id_of(folder) else {
+        println!("NOT RUN: this kernel does not report mount IDs");
+        return Vec::new();
+    };
+    std::fs::write(
+        fixture.p("table"),
+        format!("{id} 1 0:99 / / rw - {fs_type} somewhere rw\n"),
+    )
+    .unwrap();
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    write_message(&mut writer, &hello()).unwrap();
+    write_message(
+        &mut writer,
+        &Message::Scan(ScanRequest {
+            volume: path_to_wire(folder),
+            backend: Backend::Walker,
+            extra_mount_ids: vec![],
+            places: vec![],
+        }),
+    )
+    .unwrap();
+    let mut cfg = config(
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        Box::new(|| {}),
+    );
+    cfg.mode = Mode::Scan;
+    cfg.host = Host {
+        mountinfo: fixture.p("table"),
+    };
+    let mut answer = Vec::new();
+    run(reader, &mut answer, cfg);
+    drop(writer);
+    let mut frames = FrameReader::new(&answer[..], Direction::ToInterface, MAX_FRAME_LEN);
+    let mut messages = Vec::new();
+    while let Some(message) = frames.read().unwrap() {
+        messages.push(message);
+    }
+    messages
+}
+
+#[test]
+fn a_scan_of_a_network_volume_is_refused_with_its_own_code_and_reads_nothing() {
+    let fixture = common::Fixture::new("scan-remote");
+    fixture.write("tree/a", "1");
+    for fs_type in ["nfs4", "cifs", "fuse.sshfs", "9p", "smb3"] {
+        let messages = scan_with_table(&fixture, &fixture.p("tree"), fs_type);
+        if messages.is_empty() {
+            return;
+        }
+        assert!(matches!(messages[0], Message::Hello(_)), "{fs_type}");
+        match &messages[1] {
+            Message::Error(report) => {
+                assert_eq!(report.code, ErrorCode::RemoteVolume, "{fs_type}");
+                // Plain words, and no path.
+                assert!(report.message.contains("network"), "{}", report.message);
+                assert!(
+                    !report.message.contains("scan-remote"),
+                    "{}",
+                    report.message
+                );
+            }
+            other => panic!("{fs_type}: expected an error report, got {other:?}"),
+        }
+        // Nothing was read: no batch, no progress, no completion.
+        assert_eq!(messages.len(), 2, "{fs_type}: {messages:?}");
+    }
+}
+
+#[test]
+fn a_scan_of_a_local_volume_goes_ahead_and_one_the_helper_cannot_place_does_not() {
+    let fixture = common::Fixture::new("scan-local");
+    fixture.write("tree/a", "1");
+    let messages = scan_with_table(&fixture, &fixture.p("tree"), "ext4");
+    if messages.is_empty() {
+        return;
+    }
+    assert!(
+        messages.iter().any(|m| matches!(m, Message::ScanDone(_))),
+        "{messages:?}"
+    );
+    // A mount table that cannot be read cannot say what the folder is on, and
+    // that is not taken for a local disk.
+    let other = common::Fixture::new("scan-local-other");
+    other.write("tree/a", "1");
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    write_message(&mut writer, &hello()).unwrap();
+    write_message(
+        &mut writer,
+        &Message::Scan(ScanRequest {
+            volume: path_to_wire(&other.p("tree")),
+            backend: Backend::Walker,
+            extra_mount_ids: vec![],
+            places: vec![],
+        }),
+    )
+    .unwrap();
+    let mut cfg = config(
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        Box::new(|| {}),
+    );
+    cfg.mode = Mode::Scan;
+    cfg.host = Host {
+        mountinfo: other.p("no-such-table"),
+    };
+    let mut answer = Vec::new();
+    run(reader, &mut answer, cfg);
+    drop(writer);
+    let mut frames = FrameReader::new(&answer[..], Direction::ToInterface, MAX_FRAME_LEN);
+    assert!(matches!(frames.read().unwrap(), Some(Message::Hello(_))));
+    match frames.read().unwrap() {
+        Some(Message::Error(report)) => assert_eq!(report.code, ErrorCode::Refused),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(frames.read().unwrap().is_none());
+}
+
+#[test]
+fn a_delete_on_a_network_volume_is_refused_item_by_item_and_touches_nothing() {
+    use bs_ipc::{ItemOutcome, Refusal};
+    let fixture = common::Fixture::new("delete-remote");
+    fixture.write("keep/file.txt", "still here");
+    let Some(id) = mount_id_of(&fixture.p("keep")) else {
+        return println!("NOT RUN: this kernel does not report mount IDs");
+    };
+    std::fs::write(
+        fixture.p("table"),
+        format!("{id} 1 0:99 / / rw - cifs //server/share rw\n"),
+    )
+    .unwrap();
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    write_message(&mut writer, &hello()).unwrap();
+    write_message(
+        &mut writer,
+        &Message::Delete(DeleteRequest {
+            permanent: true,
+            items: vec![DeleteItem {
+                path: path_to_wire(&fixture.p("keep/file.txt")),
+                confirmed_protected: false,
+                seen: None,
+            }],
+        }),
+    )
+    .unwrap();
+    let mut cfg = config(
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        Box::new(|| {}),
+    );
+    cfg.judge = Judge::new(Knowledge::new(&Environment::new())).with_volume_check(Box::new(
+        bytescape_helper::volume::MountTable::new(fixture.p("table")),
+    ));
+    let mut answer = Vec::new();
+    run(reader, &mut answer, cfg);
+    drop(writer);
+    assert!(fixture.exists("keep/file.txt"));
+    let mut frames = FrameReader::new(&answer[..], Direction::ToInterface, MAX_FRAME_LEN);
+    assert!(matches!(frames.read().unwrap(), Some(Message::Hello(_))));
+    match frames.read().unwrap() {
+        Some(Message::DeleteItem { index: 0, outcome }) => {
+            assert_eq!(outcome, ItemOutcome::Refused(Refusal::RemoteVolume));
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(matches!(
+        frames.read().unwrap(),
+        Some(Message::DeleteDone { items: 1 })
+    ));
+}

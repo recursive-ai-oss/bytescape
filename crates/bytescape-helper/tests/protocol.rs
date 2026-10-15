@@ -124,6 +124,9 @@ fn standard_input_and_output_must_be_pipes() {
 
 #[test]
 fn other_environment_variables_change_nothing() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     // The helper trusts PKEXEC_UID and nothing else: settings that would
     // redirect a program do not reach its work.
     let fx = Fixture::new("env");
@@ -192,6 +195,9 @@ fn another_protocol_version_ends_the_helper_without_an_answer() {
 
 #[test]
 fn a_request_before_the_hello_does_no_work() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("no-hello");
     fx.write("victim", "x");
     let mut helper = Launch::new("delete").spawn();
@@ -205,6 +211,9 @@ fn a_request_before_the_hello_does_no_work() {
 
 #[test]
 fn broken_frames_end_the_helper() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let frames: Vec<(&str, Vec<u8>)> = vec![
         ("length zero", vec![0, 0, 0, 0]),
         ("length one", vec![1, 0, 0, 0, 1]),
@@ -234,6 +243,9 @@ fn broken_frames_end_the_helper() {
 
 #[test]
 fn a_closed_connection_ends_the_helper_at_once() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     // Before anything is said.
     let mut helper = Launch::new("scan").spawn();
     drop(helper.stdin.take());
@@ -253,6 +265,9 @@ fn a_closed_connection_ends_the_helper_at_once() {
 
 #[test]
 fn a_helper_that_hears_nothing_gives_up() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     // The idle limit is 20 seconds; this waits for the real thing.
     let mut helper = Launch::new("scan").spawn();
     let _keep_open = helper.stdin.take();
@@ -270,6 +285,9 @@ fn a_helper_that_hears_nothing_gives_up() {
 
 #[test]
 fn a_run_serves_only_the_kind_of_request_it_was_started_for() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("modes");
     fx.write("victim", "x");
     // A delete asked of a run that the user authorized as a scan.
@@ -297,6 +315,9 @@ fn a_run_serves_only_the_kind_of_request_it_was_started_for() {
 
 #[test]
 fn only_one_request_is_served() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("one-request");
     fx.write("a", "x");
     fx.write("b", "x");
@@ -315,6 +336,9 @@ fn only_one_request_is_served() {
 
 #[test]
 fn goodbye_as_the_request_ends_the_helper_quietly() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let mut helper = Launch::new("delete").spawn();
     let client = helper.client();
     client.finish();
@@ -325,6 +349,9 @@ fn goodbye_as_the_request_ends_the_helper_quietly() {
 
 #[test]
 fn a_delete_reports_each_item_and_partial_results_are_not_success() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("delete");
     fx.write("work/a.txt", "hello");
     fx.write("work/dir/inner/b", "world");
@@ -354,6 +381,9 @@ fn a_delete_reports_each_item_and_partial_results_are_not_success() {
 
 #[test]
 fn a_request_that_is_not_permanent_is_refused_item_by_item() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("not-permanent");
     fx.write("f", "x");
     let mut helper = Launch::new("delete").spawn();
@@ -390,6 +420,9 @@ fn a_request_that_is_not_permanent_is_refused_item_by_item() {
 /// first checks that none of them exists.
 #[test]
 fn the_operating_systems_own_places_are_refused_whatever_the_interface_says() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let candidates = [
         "/usr/bytescape-test-absent",
         "/etc/bytescape-test-absent",
@@ -440,6 +473,9 @@ fn the_operating_systems_own_places_are_refused_whatever_the_interface_says() {
 
 #[test]
 fn paths_with_dot_parts_or_no_root_are_refused_untouched() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("dots");
     fx.write("work/f", "x");
     let base = fx.path().display().to_string();
@@ -463,6 +499,9 @@ fn paths_with_dot_parts_or_no_root_are_refused_untouched() {
 
 #[test]
 fn closing_the_connection_mid_delete_stops_the_delete() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("hangup");
     for i in 0..200 {
         fx.write(&format!("items/i{i:03}/f"), "x");
@@ -567,6 +606,9 @@ fn paths_and_sizes(snapshot: &Snapshot) -> Vec<(Vec<u8>, u64, u64)> {
 
 #[test]
 fn a_scan_streams_the_same_tree_the_walker_builds() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("scan");
     for d in 0..12 {
         for f in 0..25 {
@@ -597,6 +639,9 @@ fn a_scan_streams_the_same_tree_the_walker_builds() {
 
 #[test]
 fn a_volume_that_is_not_a_plain_absolute_folder_is_a_bad_request() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("bad-volume");
     fx.write("file", "x");
     let base = fx.path().display().to_string();
@@ -633,6 +678,9 @@ fn a_volume_that_is_not_a_plain_absolute_folder_is_a_bad_request() {
 
 #[test]
 fn a_reader_that_cannot_serve_the_folder_falls_back_to_the_walker_and_says_so() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("fallback");
     fx.write("tree/a", "x");
     // The reader that exists only on Windows is not here.
@@ -665,6 +713,9 @@ fn a_reader_that_cannot_serve_the_folder_falls_back_to_the_walker_and_says_so() 
 
 #[test]
 fn the_users_places_come_from_the_request_and_never_from_the_helpers_environment() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("places");
     fx.write("home/.local/share/Steam/steamapps/game", "game");
     fx.write("home/Documents/doc", "doc");
@@ -704,6 +755,9 @@ fn the_users_places_come_from_the_request_and_never_from_the_helpers_environment
 
 #[test]
 fn places_that_are_not_what_they_claim_are_a_bad_request() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("bad-places");
     fx.write("tree/a", "x");
     for place in [
@@ -748,6 +802,9 @@ fn big_tree(fx: &Fixture) {
 
 #[test]
 fn goodbye_stops_a_running_scan_and_it_ends_cancelled() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("cancel");
     big_tree(&fx);
     let mut helper = Launch::new("scan").spawn();
@@ -770,6 +827,9 @@ fn goodbye_stops_a_running_scan_and_it_ends_cancelled() {
 
 #[test]
 fn closing_the_connection_mid_scan_ends_the_helper_at_once() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("hangup-scan");
     big_tree(&fx);
     let mut helper = Launch::new("scan").spawn();
@@ -782,6 +842,9 @@ fn closing_the_connection_mid_scan_ends_the_helper_at_once() {
 
 #[test]
 fn a_message_during_a_scan_ends_it() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let fx = Fixture::new("chatter");
     big_tree(&fx);
     let mut helper = Launch::new("scan").spawn();

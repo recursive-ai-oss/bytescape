@@ -204,6 +204,7 @@ fn put_outcome(w: &mut Writer<'_>, outcome: &ItemOutcome) {
                 Refusal::Overlaps { with } => (9, Some(with)),
                 Refusal::NotRealPath => (10, None),
                 Refusal::NotPermanent => (11, None),
+                Refusal::RemoteVolume => (12, None),
             };
             w.u8(code);
             w.u32(extra.unwrap_or(0));
@@ -245,6 +246,7 @@ fn get_outcome(r: &mut Reader<'_>) -> Result<ItemOutcome, DecodeError> {
                 9 => Refusal::Overlaps { with: extra },
                 10 => Refusal::NotRealPath,
                 11 => Refusal::NotPermanent,
+                12 => Refusal::RemoteVolume,
                 _ => return Err(DecodeError::BadValue),
             };
             Ok(ItemOutcome::Refused(refusal))

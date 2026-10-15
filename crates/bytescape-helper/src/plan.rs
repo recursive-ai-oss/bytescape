@@ -370,19 +370,28 @@ fn is_device_number(rdev: u64, expected: (u32, u32)) -> bool {
     (libc::major(rdev), libc::minor(rdev)) == expected
 }
 
-/// The mount ID that `statx` reports for the folder `root`, if the kernel
-/// reports one (Linux 5.8 and later).
+/// Opens the folder `root` of a scan, to ask about it through the descriptor.
+///
+/// `O_DIRECTORY` makes the open fail on anything that is not a folder, so a
+/// name swapped for a pipe or a device is refused rather than opened (opening
+/// one can block, or act on a device). `O_NOFOLLOW` covers the last name.
 #[cfg(target_os = "linux")]
-fn mount_id_of(root: &Path) -> Option<u64> {
-    use std::os::fd::AsRawFd;
+pub(crate) fn open_scan_root(root: &Path) -> Option<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    // The folder is held open while it is asked about, and is not followed if
-    // it has become a link since it was resolved.
-    let folder = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(root)
-        .ok()?;
+        .ok()
+}
+
+/// The mount ID that `statx` reports for the folder `root`, if the kernel
+/// reports one (Linux 5.8 and later).
+#[cfg(target_os = "linux")]
+pub(crate) fn mount_id_of(root: &Path) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    // The folder is held open while it is asked about.
+    let folder = open_scan_root(root)?;
     bs_fsops::remove::fstat(folder.as_raw_fd()).ok()?.mnt
 }
 

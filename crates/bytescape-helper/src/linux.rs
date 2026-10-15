@@ -150,7 +150,8 @@ fn system_judge(uid: u32, passwd: &std::path::Path, mountinfo: &std::path::Path)
     let roots = mounts
         .iter()
         .map(|m| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&m.mount_point)));
-    let judge = Judge::new(Knowledge::new(&env.with_drive_roots(roots)));
+    let judge = Judge::new(Knowledge::new(&env.with_drive_roots(roots)))
+        .with_volume_check(Box::new(crate::volume::MountTable::new(mountinfo)));
     if has_home {
         judge
     } else {

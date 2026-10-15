@@ -39,6 +39,23 @@ impl Target {
         self.inner.on_mount_point()
     }
 
+    /// The mount the item is on, as the kernel numbers it (Linux 5.8 and
+    /// later). The number is the key into the mount table, and unlike the
+    /// item's path it cannot be hidden by a mount placed over a folder
+    /// above. `None` where the system does not say.
+    pub fn mount_id(&self) -> Option<u64> {
+        self.inner.mount_id()
+    }
+
+    /// The kernel's file system number (`f_type` of `statfs`) for the folder
+    /// that holds the item, asked of the folder this target already holds
+    /// open, never of a name looked up again: a name can be swapped for a
+    /// device or a pipe between a check and its use. `None` where the system
+    /// does not say.
+    pub fn filesystem_magic(&self) -> Option<i64> {
+        self.inner.filesystem_magic()
+    }
+
     /// Deletes the item, and everything below it if it is a folder.
     pub fn delete(&self) -> Result<crate::Removed, DeleteError> {
         self.inner.delete()
@@ -66,6 +83,7 @@ mod imp {
         real: PathBuf,
         identity: Identity,
         on_mount_point: bool,
+        mnt: Option<u64>,
     }
 
     fn gone(error: &io::Error) -> bool {
@@ -108,6 +126,7 @@ mod imp {
             real: real_parent.join(OsStr::from_bytes(name.to_bytes())),
             identity: identity_of(&stat),
             on_mount_point,
+            mnt: stat.mnt,
             parent,
             name,
             parent_path: real_parent,
@@ -123,6 +142,12 @@ mod imp {
         }
         pub fn on_mount_point(&self) -> bool {
             self.on_mount_point
+        }
+        pub fn mount_id(&self) -> Option<u64> {
+            self.mnt
+        }
+        pub fn filesystem_magic(&self) -> Option<i64> {
+            crate::remove::fstatfs_type(self.parent.as_raw_fd()).ok()
         }
         pub fn delete(&self) -> Result<crate::Removed, DeleteError> {
             // The checks were made for the place the folder was when it was
@@ -181,6 +206,12 @@ mod imp {
         pub fn on_mount_point(&self) -> bool {
             false
         }
+        pub fn mount_id(&self) -> Option<u64> {
+            None
+        }
+        pub fn filesystem_magic(&self) -> Option<i64> {
+            None
+        }
         pub fn delete(&self) -> Result<crate::Removed, DeleteError> {
             crate::win::delete_item(&self.path, self.real.as_os_str(), self.identity)
         }
@@ -209,6 +240,12 @@ mod imp {
         }
         pub fn on_mount_point(&self) -> bool {
             false
+        }
+        pub fn mount_id(&self) -> Option<u64> {
+            None
+        }
+        pub fn filesystem_magic(&self) -> Option<i64> {
+            None
         }
         pub fn delete(&self) -> Result<crate::Removed, DeleteError> {
             Err(DeleteError::Look(std::io::Error::from(
@@ -248,6 +285,29 @@ mod tests {
             assert_eq!(identity.file >> 64, 0);
         }
         assert!(!target.on_mount_point());
+        // The mount the item is on is the one the kernel reports for it.
+        let own = crate::remove::stat_at(
+            std::os::fd::AsRawFd::as_raw_fd(&fs::File::open(f.path().join("a/b")).unwrap()),
+            c"file",
+        )
+        .unwrap();
+        assert_eq!(target.mount_id(), own.mnt);
+    }
+
+    #[test]
+    fn the_file_system_number_comes_from_the_folder_held_open() {
+        use std::os::fd::AsRawFd;
+        let f = Fixture::new("target-magic");
+        f.write("a/file", "1");
+        let target = Target::open(&f.path().join("a/file")).unwrap();
+        let folder = fs::File::open(f.path().join("a")).unwrap();
+        let expected = crate::remove::fstatfs_type(folder.as_raw_fd()).unwrap();
+        assert_eq!(target.filesystem_magic(), Some(expected));
+        // Swapping the folder's name for something else afterwards changes
+        // nothing: the answer is not a lookup by name.
+        fs::rename(f.path().join("a"), f.path().join("moved")).unwrap();
+        symlink("/dev", f.path().join("a")).unwrap();
+        assert_eq!(target.filesystem_magic(), Some(expected));
     }
 
     #[test]

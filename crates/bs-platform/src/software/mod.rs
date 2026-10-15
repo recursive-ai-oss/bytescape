@@ -76,6 +76,23 @@ pub struct Program {
     pub uninstall: Option<UninstallCommand>,
 }
 
+impl Program {
+    /// A program with the given name and install location, no publisher and no
+    /// uninstaller. For tests of code that shows what the matcher found: the
+    /// matcher is the only source of programs in the product, and the other
+    /// fields can be set on the value afterwards.
+    #[doc(hidden)]
+    pub fn for_tests(name: &str, location: impl Into<PathBuf>, relation: Relation) -> Self {
+        Self {
+            name: name.to_owned(),
+            publisher: None,
+            location: location.into(),
+            relation,
+            uninstall: None,
+        }
+    }
+}
+
 /// The tool that installed a package.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -103,6 +120,24 @@ pub struct Package {
     /// Software, when the package ships exactly one AppStream component. See
     /// [`crate::launch::open_in_software_center`].
     pub software_center_url: Option<String>,
+}
+
+impl Package {
+    /// A package with the given manager and name and nothing else known. For
+    /// tests of code that shows what the matcher found: the matcher is the
+    /// only source of packages in the product, and the other fields can be set
+    /// on the value afterwards.
+    #[doc(hidden)]
+    pub fn for_tests(manager: PackageManager, name: &str) -> Self {
+        Self {
+            manager,
+            name: name.to_owned(),
+            listed_entries: None,
+            other_packages: 0,
+            removal_command: None,
+            software_center_url: None,
+        }
+    }
 }
 
 /// What owns a folder.
@@ -155,6 +190,8 @@ struct Shared {
     /// Only one batch reads the package database at a time.
     one_at_a_time: Mutex<()>,
     cancel: AtomicBool,
+    /// Called when a batch finishes.
+    finished: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Matches big folders to what installed them, in the background, and keeps
@@ -178,9 +215,24 @@ impl Matcher {
                 state: Mutex::new(State::default()),
                 one_at_a_time: Mutex::new(()),
                 cancel: AtomicBool::new(false),
+                finished: Mutex::new(None),
             }),
             backend,
         }
+    }
+
+    /// Sets a function to call whenever a batch of folders has been matched,
+    /// so a caller that shows the answers can redraw when there are new ones
+    /// instead of asking again and again. It replaces an earlier one.
+    ///
+    /// The function runs on the matching thread, after the batch's answers can
+    /// be read with [`Matcher::lookup`] and with no lock held, so it may call
+    /// `lookup` and [`Matcher::is_idle`] (idle says that nothing more is
+    /// pending). It is not called for a batch that was cut short because the
+    /// matcher was dropped. A function that panics is contained: matching
+    /// goes on.
+    pub fn on_finished(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *lock(&self.shared.finished) = Some(Arc::new(hook));
     }
 
     /// Starts matching the folders that are big enough and not already
@@ -221,15 +273,24 @@ impl Matcher {
                 } else {
                     backend.find(&batch, &shared.cancel)
                 };
-                let mut state = lock(&shared.state);
-                for (index, path) in batch.into_iter().enumerate() {
-                    state.pending.remove(&path);
-                    // A batch cut short by cancelling is not an answer.
-                    if !shared.cancel.load(Ordering::Relaxed) {
-                        state
-                            .answered
-                            .insert(path, found.get(index).cloned().flatten());
+                {
+                    let mut state = lock(&shared.state);
+                    for (index, path) in batch.into_iter().enumerate() {
+                        state.pending.remove(&path);
+                        // A batch cut short by cancelling is not an answer.
+                        if !shared.cancel.load(Ordering::Relaxed) {
+                            state
+                                .answered
+                                .insert(path, found.get(index).cloned().flatten());
+                        }
                     }
+                }
+                // Told after the answers are in and the lock is let go.
+                let hook = lock(&shared.finished).clone();
+                if let Some(hook) = hook
+                    && !shared.cancel.load(Ordering::Relaxed)
+                {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()));
                 }
             });
         if spawned.is_err() {
@@ -480,6 +541,105 @@ mod tests {
         assert!(state.pending.is_empty());
         // The batch was cut short, so it left no answer behind.
         assert!(state.answered.is_empty());
+    }
+
+    #[test]
+    fn the_finished_hook_runs_after_each_batch_with_the_answers_readable() {
+        let backend = table(&[("/opt/big", "bigpkg")]);
+        let matcher = Matcher::with_backend(backend);
+        let calls = Arc::new(Mutex::new(Vec::<(Lookup, bool)>::new()));
+        let seen = Arc::clone(&calls);
+        let inner = Arc::clone(&matcher.shared);
+        matcher.on_finished(move || {
+            // The hook may ask the matcher about what it has now.
+            let state = lock(&inner.state);
+            let answer = match state.answered.get(&abs("/opt/big")) {
+                Some(Some(owner)) => Lookup::Found(owner.clone()),
+                Some(None) => Lookup::NoOwner,
+                None => Lookup::NotAsked,
+            };
+            lock(&seen).push((answer, state.pending.is_empty()));
+        });
+        matcher.request(&[candidate("/opt/big", MIN_MATCH_BYTES)]);
+        wait_idle(&matcher);
+        let started = Instant::now();
+        while lock(&calls).is_empty() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            *lock(&calls),
+            vec![(Lookup::Found(package("bigpkg")), true)]
+        );
+        // Nothing new to match, nothing to tell.
+        matcher.request(&[candidate("/opt/big", MIN_MATCH_BYTES)]);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(lock(&calls).len(), 1);
+    }
+
+    #[test]
+    fn a_finished_hook_that_panics_does_not_stop_the_matching() {
+        let backend = table(&[("/opt/a", "apkg"), ("/opt/b", "bpkg")]);
+        let matcher = Matcher::with_backend(backend);
+        matcher.on_finished(|| panic!("a hook that fails"));
+        matcher.request(&[candidate("/opt/a", MIN_MATCH_BYTES)]);
+        wait_idle(&matcher);
+        matcher.request(&[candidate("/opt/b", MIN_MATCH_BYTES)]);
+        wait_idle(&matcher);
+        assert_eq!(
+            matcher.lookup(&abs("/opt/b")),
+            Lookup::Found(package("bpkg"))
+        );
+    }
+
+    #[test]
+    fn the_finished_hook_is_not_told_of_a_batch_cut_short_by_dropping_the_matcher() {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let backend = Arc::new(Table {
+            owners: HashMap::new(),
+            asked: Mutex::new(Vec::new()),
+            batches: AtomicUsize::new(0),
+            gate: Some(gate.clone()),
+        });
+        let matcher = Matcher::with_backend(backend);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        matcher.on_finished(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let shared = Arc::clone(&matcher.shared);
+        matcher.request(&[candidate("/opt/slow", MIN_MATCH_BYTES)]);
+        drop(matcher);
+        *lock(&gate.0) = true;
+        gate.1.notify_all();
+        let started = Instant::now();
+        while !lock(&shared.state).pending.is_empty() && started.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn found_programs_and_packages_can_be_made_for_tests_and_filled_in() {
+        let mut program = Program::for_tests("Tool", abs("/opt/tool"), Relation::Exact);
+        assert_eq!(program.name, "Tool");
+        assert_eq!(program.location, abs("/opt/tool"));
+        assert_eq!(
+            (program.publisher.as_deref(), &program.uninstall),
+            (None, &None)
+        );
+        program.publisher = Some("Acme".into());
+        assert_eq!(program.publisher.as_deref(), Some("Acme"));
+        let mut package = Package::for_tests(PackageManager::Dpkg, "foo");
+        assert_eq!(
+            (package.manager, package.name.as_str()),
+            (PackageManager::Dpkg, "foo")
+        );
+        assert_eq!(package.other_packages, 0);
+        package.removal_command = Some("sudo apt remove foo".into());
+        let owners = [Owner::Program(program), Owner::Package(package)];
+        assert!(matches!(&owners[1], Owner::Package(p) if p.removal_command.is_some()));
     }
 
     #[test]

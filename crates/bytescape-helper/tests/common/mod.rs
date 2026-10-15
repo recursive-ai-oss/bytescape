@@ -93,6 +93,21 @@ pub fn current_uid() -> u32 {
     fs::metadata("/proc/self").unwrap().uid()
 }
 
+/// Whether this test runs as the superuser, which says so when it does.
+///
+/// The helper only serves the user who asked for it through `pkexec`, and
+/// never the superuser, so a test that starts it as the user it runs as has
+/// nothing to try when that user is root (a container, or a namespace that
+/// maps the caller to root). The tests of the helper with root's rights are
+/// in `root.rs`, which starts it for an ordinary account.
+pub fn refuses_the_superuser() -> bool {
+    let root = current_uid() == 0;
+    if root {
+        println!("NOT RUN (euid 0): the helper does not act for the superuser");
+    }
+    root
+}
+
 pub fn helper_path() -> &'static str {
     env!("CARGO_BIN_EXE_bytescape-helper")
 }

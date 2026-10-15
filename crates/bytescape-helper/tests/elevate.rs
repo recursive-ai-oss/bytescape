@@ -56,6 +56,9 @@ fn target(path: &Path) -> DeleteTarget {
 
 #[test]
 fn an_elevated_delete_goes_through_launch_handshake_and_answer() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let _turn = one_at_a_time();
     let fx = Fixture::new("elevate-delete");
     fx.write("work/a", "a");
@@ -78,6 +81,9 @@ fn an_elevated_delete_goes_through_launch_handshake_and_answer() {
 
 #[test]
 fn an_elevated_delete_reports_a_refusal_as_a_refusal() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let _turn = one_at_a_time();
     let fx = Fixture::new("elevate-refuse");
     fx.write("work/a", "a");
@@ -90,6 +96,9 @@ fn an_elevated_delete_reports_a_refusal_as_a_refusal() {
 
 #[test]
 fn an_elevated_scan_streams_the_tree_and_ends_with_done() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let _turn = one_at_a_time();
     let fx = Fixture::new("elevate-scan");
     for i in 0..30 {
@@ -121,6 +130,9 @@ fn an_elevated_scan_streams_the_tree_and_ends_with_done() {
 
 #[test]
 fn a_scan_can_be_stopped_from_another_thread() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let _turn = one_at_a_time();
     let fx = Fixture::new("elevate-cancel");
     for d in 0..400 {
@@ -154,6 +166,9 @@ fn a_scan_can_be_stopped_from_another_thread() {
 
 #[test]
 fn a_dismissed_or_failed_prompt_is_reported_as_declined() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let _turn = one_at_a_time();
     let fx = Fixture::new("elevate-declined");
     for code in [126, 127] {
@@ -169,6 +184,9 @@ fn a_dismissed_or_failed_prompt_is_reported_as_declined() {
 
 #[test]
 fn a_program_that_does_not_speak_the_protocol_is_not_taken_for_the_helper() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let _turn = one_at_a_time();
     let fx = Fixture::new("elevate-impostor");
     fx.write("work/f", "x");
@@ -190,6 +208,9 @@ fn a_program_that_does_not_speak_the_protocol_is_not_taken_for_the_helper() {
 
 #[test]
 fn the_helper_refuses_to_start_when_pkexec_names_another_user() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let _turn = one_at_a_time();
     let fx = Fixture::new("elevate-wrong-user");
     fx.write("work/f", "x");
@@ -205,6 +226,9 @@ fn the_helper_refuses_to_start_when_pkexec_names_another_user() {
 
 #[test]
 fn a_missing_helper_or_pkexec_is_reported_before_anything_starts() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let _turn = one_at_a_time();
     let fx = Fixture::new("elevate-missing");
     let no_helper =
@@ -221,6 +245,9 @@ fn a_missing_helper_or_pkexec_is_reported_before_anything_starts() {
 
 #[test]
 fn a_delete_asked_of_a_scan_helper_is_never_done() {
+    if common::refuses_the_superuser() {
+        return;
+    }
     let _turn = one_at_a_time();
     // The launch decides what the user authorized; the interface API cannot
     // mix them up, but a hand-made conversation must not either.

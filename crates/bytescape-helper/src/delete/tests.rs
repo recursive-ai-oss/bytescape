@@ -611,3 +611,186 @@ fn swapping_a_folder_for_a_link_during_the_delete_never_reaches_outside() {
         let _ = fs::remove_dir_all(lab.p("victim"));
     }
 }
+
+// ----------------------------------------------------------- Network volumes
+
+use crate::volume::{Verdict, VolumeCheck};
+use std::sync::Mutex;
+
+/// A volume check with the answers a test gives it, which records the paths it
+/// was asked about.
+struct Volumes {
+    before: Box<dyn Fn(&Path) -> Verdict + Send + Sync>,
+    after: Box<dyn Fn(&Path) -> Verdict + Send + Sync>,
+    opened: Mutex<Vec<PathBuf>>,
+    /// The file system numbers the delete passed along with each opened item.
+    magics: Mutex<Vec<Option<i64>>>,
+}
+
+impl Volumes {
+    fn new(
+        before: impl Fn(&Path) -> Verdict + Send + Sync + 'static,
+        after: impl Fn(&Path) -> Verdict + Send + Sync + 'static,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            before: Box::new(before),
+            after: Box::new(after),
+            opened: Mutex::new(Vec::new()),
+            magics: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl VolumeCheck for std::sync::Arc<Volumes> {
+    fn before_opening(&self, path: &Path) -> Verdict {
+        (self.before)(path)
+    }
+    fn after_opening(&self, real: &Path, _mount_id: Option<u64>, magic: Option<i64>) -> Verdict {
+        self.magics.lock().unwrap().push(magic);
+        self.opened.lock().unwrap().push(real.to_path_buf());
+        (self.after)(real)
+    }
+}
+
+#[test]
+fn an_item_on_a_network_volume_is_refused_and_not_even_opened() {
+    let lab = Lab::new("remote-before");
+    lab.write("share/file", "x");
+    let share = lab.p("share");
+    let volumes = Volumes::new(
+        move |path| {
+            if path.starts_with(&share) {
+                Verdict::Remote
+            } else {
+                Verdict::Unknown
+            }
+        },
+        |_| Verdict::Local,
+    );
+    let judge = lab.judge().with_volume_check(Box::new(volumes.clone()));
+    let outcomes = run(&judge, &request(vec![item(&lab.p("share/file"))]));
+    assert_eq!(refusal(&outcomes[0]), Refusal::RemoteVolume);
+    assert!(lab.exists("share/file"));
+    // Refused from the path alone: the item was never opened.
+    assert!(volumes.opened.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_item_that_turns_out_to_be_on_a_network_volume_once_opened_is_refused() {
+    let lab = Lab::new("remote-after");
+    lab.write("work/file", "x");
+    // The path gave nothing away (a link, a bind mount, a mount hidden under
+    // another); the mount the kernel names for the opened item is remote.
+    for after in [Verdict::Remote, Verdict::Unknown] {
+        let volumes = Volumes::new(|_| Verdict::Unknown, move |_| after);
+        let judge = lab.judge().with_volume_check(Box::new(volumes));
+        let outcomes = run(&judge, &request(vec![item(&lab.p("work/file"))]));
+        assert_eq!(refusal(&outcomes[0]), Refusal::RemoteVolume, "{after:?}");
+        assert!(lab.exists("work/file"), "{after:?}");
+    }
+}
+
+/// The kernel's file system number reaches the check from the folder the
+/// delete already holds open, so no name is looked up a second time.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_file_system_number_is_taken_from_the_held_folder() {
+    use std::os::fd::AsRawFd;
+    let lab = Lab::new("remote-magic");
+    lab.write("work/file", "x");
+    let folder = std::fs::File::open(lab.p("work")).unwrap();
+    let expected = bs_fsops::remove::fstatfs_type(folder.as_raw_fd()).unwrap();
+    let volumes = Volumes::new(|_| Verdict::Unknown, |_| Verdict::Local);
+    let judge = lab.judge().with_volume_check(Box::new(volumes.clone()));
+    let outcomes = run(&judge, &request(vec![item(&lab.p("work/file"))]));
+    assert!(matches!(outcomes[0], ItemOutcome::Deleted { .. }));
+    let seen = volumes.magics.lock().unwrap().clone();
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|m| *m == Some(expected)), "{seen:?}");
+}
+
+#[test]
+fn one_item_on_a_network_volume_refuses_the_whole_selection() {
+    let lab = Lab::new("remote-mixed");
+    lab.write("local/a", "1");
+    lab.write("share/b", "2");
+    let share = lab.p("share");
+    let volumes = Volumes::new(
+        |_| Verdict::Unknown,
+        move |real| {
+            if real.starts_with(&share) {
+                Verdict::Remote
+            } else {
+                Verdict::Local
+            }
+        },
+    );
+    let judge = lab.judge().with_volume_check(Box::new(volumes));
+    let outcomes = run(
+        &judge,
+        &request(vec![item(&lab.p("local/a")), item(&lab.p("share/b"))]),
+    );
+    assert_eq!(
+        refusal(&outcomes[0]),
+        Refusal::SelectionRefused { driver: 1 }
+    );
+    assert_eq!(refusal(&outcomes[1]), Refusal::RemoteVolume);
+    assert!(lab.exists("local/a") && lab.exists("share/b"));
+}
+
+#[test]
+fn an_item_on_a_local_volume_is_deleted_as_before() {
+    let lab = Lab::new("remote-local");
+    lab.write("work/file", "x");
+    let volumes = Volumes::new(|_| Verdict::Unknown, |_| Verdict::Local);
+    let judge = lab.judge().with_volume_check(Box::new(volumes.clone()));
+    let outcomes = run(&judge, &request(vec![item(&lab.p("work/file"))]));
+    assert!(
+        matches!(outcomes[0], ItemOutcome::Deleted { entries: 1, .. }),
+        "{outcomes:?}"
+    );
+    assert!(!lab.exists("work/file"));
+    // The check saw the place the item really was, and the mount it is on.
+    // (The item is looked up again just before it is deleted.)
+    let opened = volumes.opened.lock().unwrap();
+    assert!(!opened.is_empty());
+    assert!(opened.iter().all(|real| *real == lab.p("work/file")));
+}
+
+#[test]
+fn the_mount_table_check_refuses_a_remote_mount_by_the_id_the_kernel_gives_the_item() {
+    let lab = Lab::new("remote-table");
+    lab.write("work/file", "x");
+    let target = bs_fsops::Target::open(&lab.p("work/file")).unwrap();
+    let Some(id) = target.mount_id() else {
+        return println!("NOT RUN: this kernel does not report mount IDs");
+    };
+    // Tables in which the fixture's own mount is an NFS mount, an ext4 mount,
+    // and one that cannot be read.
+    let remote = format!("{id} 1 0:99 / / rw - nfs4 server:/export rw\n");
+    fs::write(lab.p("table-remote"), remote).unwrap();
+    let local = format!("{id} 1 0:99 / / rw - ext4 /dev/sda1 rw\n");
+    fs::write(lab.p("table-local"), local).unwrap();
+    let path = lab.p("work/file");
+    for (table, want) in [
+        ("table-remote", Refusal::RemoteVolume),
+        ("table-absent", Refusal::RemoteVolume),
+    ] {
+        let judge = lab
+            .judge()
+            .with_volume_check(Box::new(crate::volume::MountTable::new(lab.p(table))));
+        let outcomes = run(&judge, &request(vec![item(&path)]));
+        assert_eq!(refusal(&outcomes[0]), want, "{table}");
+        assert!(lab.exists("work/file"), "{table}");
+    }
+    let judge = lab
+        .judge()
+        .with_volume_check(Box::new(crate::volume::MountTable::new(
+            lab.p("table-local"),
+        )));
+    let outcomes = run(&judge, &request(vec![item(&path)]));
+    assert!(
+        matches!(outcomes[0], ItemOutcome::Deleted { .. }),
+        "{outcomes:?}"
+    );
+}

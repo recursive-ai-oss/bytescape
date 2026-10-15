@@ -20,10 +20,15 @@ libc = "0.2"
 windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Security",
+    # The user's identifier as text, to find the user's profile folder.
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     # The named pipe to the elevated helper.
     "Win32_System_Pipes",
+    # The system's folders, read from the machine's part of the registry.
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 

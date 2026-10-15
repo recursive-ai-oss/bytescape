@@ -225,18 +225,20 @@ fn a_mount_hidden_by_a_mount_over_a_shorter_path_is_not_the_one_the_scan_uses() 
     };
     fs::create_dir(b.clone()).unwrap();
     fs::write(b.join("mark"), "B").unwrap();
-    // The folder shows B, but the table's longest mount point for it is A's.
+    // The folder shows B. A's mount point is longer, but B was mounted later,
+    // over a shorter path, so the table's answer is B's mount, and A's mount
+    // is not a mount point in view at all.
     assert_eq!(fs::read_to_string(b.join("mark")).unwrap(), "B");
     let table = parse(&fs::read("/proc/self/mountinfo").unwrap());
+    let over_id = at_exactly(&table, a.as_os_str().as_bytes()).unwrap().id;
     let by_table = containing(&table, b.join("mark").as_os_str().as_bytes()).unwrap();
     assert_eq!(
-        by_table.id, hidden_id,
-        "the table alone points at the hidden mount"
+        by_table.id, over_id,
+        "the table points at the mount in view"
     );
-    assert_eq!(
-        at_exactly(&table, b.as_os_str().as_bytes()).unwrap().id,
-        hidden_id
-    );
+    assert_ne!(by_table.id, hidden_id);
+    assert!(at_exactly(&table, b.as_os_str().as_bytes()).is_none());
+    assert!(at_exactly(&table, b.join("sub").as_os_str().as_bytes()).is_none());
     // The hidden mount is no longer chosen: nothing is entered because of it.
     for backend in [bs_ipc::Backend::Walker, bs_ipc::Backend::Auto] {
         let (ran, _, ids) = plan_summary(backend, &b, &host, &[sub_id]);

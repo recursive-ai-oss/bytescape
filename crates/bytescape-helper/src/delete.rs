@@ -21,12 +21,15 @@
 //!    confirmation for that path.
 //! 6. An item that is not what the interface saw, or is where another
 //!    filesystem starts, is refused.
+//! 7. An item on a network volume, or on a volume the helper cannot place, is
+//!    refused. Only disks of this computer are deleted from.
 //!
 //! Across the request the strictest rule applies: one blocked item, one
-//! unconfirmed protected item or one malformed path refuses every other item
-//! as well, so a selection is never half deleted because of its own mistake.
+//! unconfirmed protected item, one item on a network volume or one malformed
+//! path refuses every other item as well, so a selection is never half deleted because of its own mistake.
 //! An item inside another item of the request is left to the outer one.
 
+use crate::volume::{Verdict, VolumeCheck};
 use bs_fsops::{DeleteError, OpenError, Target, validate_path};
 use bs_ipc::{DeleteItem, DeleteRequest, ErrorCode, ItemOutcome, Refusal, path_from_wire};
 use bs_knowledge::{Knowledge, Level};
@@ -37,6 +40,9 @@ pub struct Judge {
     knowledge: Knowledge,
     /// Why this helper must not delete anything at all, when it must not.
     unavailable: Option<(ErrorCode, &'static str)>,
+    /// Tells a disk of this computer from a network volume. Without one every
+    /// volume is taken as local (only the tests build a judge that way).
+    volumes: Option<Box<dyn VolumeCheck>>,
 }
 
 impl Judge {
@@ -46,7 +52,17 @@ impl Judge {
         Self {
             knowledge,
             unavailable: None,
+            volumes: None,
         }
+    }
+
+    /// A judge that refuses to delete on network volumes, as `volumes` tells
+    /// them from the disks of this computer. A volume it cannot place is
+    /// refused too.
+    #[must_use]
+    pub fn with_volume_check(mut self, volumes: Box<dyn VolumeCheck>) -> Self {
+        self.volumes = Some(volumes);
+        self
     }
 
     /// A judge whose table is not complete enough to be trusted with a delete:
@@ -83,10 +99,27 @@ impl Judge {
         if as_sent >= Level::Blocked {
             return Err(Refusal::Blocked);
         }
+        // A network volume is not for an administrator's delete. Asked before
+        // the item is opened as well as after: opening a name on a server that
+        // has stopped answering would hold the helper up.
+        if let Some(volumes) = &self.volumes
+            && volumes.before_opening(&path) == Verdict::Remote
+        {
+            return Err(Refusal::RemoteVolume);
+        }
         let target = Target::open(&path).map_err(|e| match e {
             OpenError::NotFound => Refusal::NotFound,
             _ => Refusal::CannotResolve,
         })?;
+        if let Some(volumes) = &self.volumes
+            && volumes.after_opening(
+                target.real_path(),
+                target.mount_id(),
+                target.filesystem_magic(),
+            ) != Verdict::Local
+        {
+            return Err(Refusal::RemoteVolume);
+        }
         // The real place may be stricter than the text: a link in the middle
         // of the path can lead into the system.
         let level = as_sent.max(self.level_of(target.real_path()));
@@ -179,7 +212,10 @@ impl Judge {
         let deciding = checked.iter().position(|c| {
             matches!(
                 c,
-                Err(Refusal::Blocked | Refusal::ProtectedNotConfirmed | Refusal::BadPath)
+                Err(Refusal::Blocked
+                    | Refusal::ProtectedNotConfirmed
+                    | Refusal::BadPath
+                    | Refusal::RemoteVolume)
             )
         });
         if let Some(driver) = deciding {

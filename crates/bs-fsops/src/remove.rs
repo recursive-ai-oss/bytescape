@@ -226,6 +226,29 @@ pub fn fstat(fd: RawFd) -> io::Result<Meta> {
     statx_raw(fd, c"".as_ptr(), libc::AT_EMPTY_PATH)
 }
 
+/// The kernel's file system number (`f_type` of `statfs`) for an open folder or
+/// file, asked of the descriptor itself so that no name is looked up again.
+///
+/// The field is `__fsword_t`: 32 bits on some targets and 64 on others, and the
+/// numbers in the kernel's list are 32-bit values, so only the low 32 bits are
+/// returned.
+pub fn fstatfs_type(fd: RawFd) -> io::Result<i64> {
+    retry(|| {
+        let mut buf = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        // SAFETY: `buf` is writable storage of the type `fstatfs` fills in, and
+        // the caller's descriptor stays open for the call.
+        let status = unsafe { libc::fstatfs(fd, buf.as_mut_ptr()) };
+        if status != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: zeroed above and, on success, filled in by the kernel.
+        let raw = unsafe { buf.assume_init() };
+        #[allow(clippy::useless_conversion)]
+        let number = i64::from(raw.f_type) & 0xFFFF_FFFF;
+        Ok(number)
+    })
+}
+
 /// The limits of one operation: the device and mount it started on. Anything
 /// on another device or another mount is left alone, because a bind mount
 /// shows other data under a name inside the folder being worked on.

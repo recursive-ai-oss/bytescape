@@ -284,6 +284,24 @@ fn names_with_spaces_newlines_and_invalid_utf8_survive() {
 }
 
 #[test]
+fn a_token_made_for_tests_belongs_to_no_bin_entry() {
+    let lab = Lab::new("restore-test-token");
+    lab.write("work/f.txt", "still here");
+    let token = RestoreToken::for_tests(lab.p("work/f.txt"));
+    assert_eq!(token.original_path(), lab.p("work/f.txt"));
+    // It can be kept, compared and cloned like a real one, and restoring it
+    // touches nothing.
+    assert_eq!(token.clone(), token);
+    assert_eq!(
+        lab.home().restore(&token),
+        RestoreOutcome::Refused {
+            reason: RefuseReason::NotInBin
+        }
+    );
+    assert_eq!(lab.read("work/f.txt"), "still here");
+}
+
+#[test]
 fn restoring_never_overwrites() {
     let lab = Lab::new("restore-exists");
     lab.write("work/f.txt", "original");

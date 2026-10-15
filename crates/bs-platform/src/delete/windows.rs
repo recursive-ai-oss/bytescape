@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
 use windows_sys::Win32::Storage::FileSystem::{
     DeleteFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_STANDARD_INFO,
-    FileStandardInfo, MoveFileExW,
+    FileStandardInfo, GetVolumePathNameW, MoveFileExW,
 };
 use windows_sys::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
@@ -577,11 +577,12 @@ fn find_in_bin(drive: &Drive, original: &Path) -> Option<PathBuf> {
     let folder = crate::bins::winpure::recycle_folder(&drive.mount_point, sid)?;
     let mut best: Option<(u64, PathBuf)> = None;
     for entry in std::fs::read_dir(&folder).ok()?.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with("$I") {
+        // The item is named after the record unit for unit: a name read as text
+        // would turn a lone surrogate into U+FFFD, the name of another file.
+        let Some(item_name) = winpure::recycled_for(&units_of(Path::new(&entry.file_name())))
+        else {
             continue;
-        }
+        };
         let Ok(bytes) = read_small(&entry.path()) else {
             continue;
         };
@@ -593,7 +594,10 @@ fn find_in_bin(drive: &Drive, original: &Path) -> Option<PathBuf> {
                 .as_ref()
                 .is_none_or(|(when, _)| record.deleted_at >= *when)
         {
-            best = Some((record.deleted_at, folder.join(format!("$R{}", &name[2..]))));
+            best = Some((
+                record.deleted_at,
+                folder.join(OsString::from_wide(&item_name)),
+            ));
         }
     }
     best.map(|(_, path)| path)
@@ -625,6 +629,28 @@ fn move_out_of_bin(recycled: &Path, to: &Path) -> io::Result<()> {
         unsafe { DeleteFileW(info.as_ptr()) };
     }
     Ok(())
+}
+
+/// The root of the volume that holds `path`, as the system names it: a drive
+/// root, or the folder a volume is mounted on. `None` if the system cannot say.
+fn volume_root_units(path: &Path) -> Option<Vec<u16>> {
+    /// Room for the longest path the system returns.
+    const ROOM: usize = 32 * 1024;
+    let input = wide(path.as_os_str());
+    // The system would silently read only the text before a NUL.
+    if input[..input.len() - 1].contains(&0) {
+        return None;
+    }
+    let mut buffer = vec![0u16; ROOM];
+    // SAFETY: `input` is NUL-terminated and outlives the call; `buffer` is
+    // writable for the `ROOM` units passed as its length.
+    let ok = unsafe { GetVolumePathNameW(input.as_ptr(), buffer.as_mut_ptr(), ROOM as u32) };
+    if ok == 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|unit| *unit == 0)?;
+    buffer.truncate(end);
+    Some(buffer)
 }
 
 /// The 16-bit units of a path, for comparing places exactly.
@@ -810,12 +836,16 @@ impl Disposal {
     ) -> Result<PathBuf, Result<OpError, RefuseReason>> {
         let not_in_bin = || Err(Err(RefuseReason::NotInBin));
         // Only this user's folder in a bin may be restored from.
-        let text = recycled.recycled.to_string_lossy().into_owned();
         let Some(sid) = user_sid() else {
             return not_in_bin();
         };
-        let marker = format!(r"\$Recycle.Bin\{sid}\").to_lowercase();
-        if !text.to_lowercase().contains(&marker) {
+        // The bin's folder must be at the root of the volume the item is on,
+        // as the system names that root: a folder with the bin's name made
+        // anywhere else is not the bin.
+        let Some(root) = volume_root_units(&recycled.recycled) else {
+            return not_in_bin();
+        };
+        if !winpure::is_in_user_bin(&units_of(&recycled.recycled), sid, &root) {
             return not_in_bin();
         }
         // The record is looked up under the item's own name, unit for unit.

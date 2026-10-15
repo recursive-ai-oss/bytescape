@@ -2,7 +2,7 @@
 
 use super::programs::ProgramIndex;
 use super::{Backend, Owner, registry};
-use bs_knowledge::{Environment, Knowledge};
+use bs_knowledge::Knowledge;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +22,7 @@ impl System {
 
     fn index(&self) -> &ProgramIndex {
         self.index.get_or_init(|| {
-            let environment = Environment::from_lookup(|name| std::env::var_os(name));
+            let environment = crate::system_environment();
             ProgramIndex::new(registry::read_all(), &Knowledge::new(&environment))
         })
     }

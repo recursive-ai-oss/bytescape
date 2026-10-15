@@ -55,6 +55,27 @@ struct FileOpenDialogVtbl {
     get_selected_items: Slot,
 }
 
+/// Shows a message box with an OK button and waits for it to be dismissed.
+/// Task modal and in front, so it appears for a program with no window.
+pub(crate) fn message(title: &str, text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TASKMODAL, MessageBoxW,
+    };
+    let title = wide(OsStr::new(title));
+    let text = wide(OsStr::new(text));
+    // SAFETY: both strings are NUL-terminated and outlive the call; a null
+    // owner window is allowed, and `MB_TASKMODAL` then blocks this thread's
+    // windows until the box is closed.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND,
+        );
+    }
+}
+
 pub(crate) fn pick_folder(start: &Path) -> Result<Option<PathBuf>, DialogError> {
     let _com = ComScope::enter().map_err(|_| DialogError::Unavailable)?;
     let mut dialog: *mut c_void = std::ptr::null_mut();

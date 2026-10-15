@@ -300,6 +300,17 @@ enum TokenInner {
 }
 
 impl RestoreToken {
+    /// A token for `original` that belongs to no bin entry. For tests of code
+    /// that keeps tokens with its items: restoring it is refused as not being
+    /// in the bin. The product only gets tokens from a move to the bin.
+    #[doc(hidden)]
+    pub fn for_tests(original: impl Into<PathBuf>) -> Self {
+        Self {
+            original: original.into(),
+            inner: TokenInner::None,
+        }
+    }
+
     /// Where the item was before it was moved: its real place, in the form
     /// described on [`RestoreToken`].
     pub fn original_path(&self) -> &Path {
@@ -479,8 +490,7 @@ impl Disposal {
     /// protected-path table.
     pub fn system() -> Result<Self, DriveError> {
         let drives = crate::drives::list_drives()?;
-        let environment = Environment::from_lookup(|name| std::env::var_os(name))
-            .with_drive_roots(roots(&drives));
+        let environment = crate::system_environment().with_drive_roots(roots(&drives));
         Ok(Self::new(Knowledge::new(&environment), drives))
     }
 
@@ -890,7 +900,7 @@ fn roots(drives: &[Drive]) -> Vec<PathBuf> {
 /// The knowledge-table environment for a set of drives, for callers that build
 /// their own [`Knowledge`].
 pub fn environment_for(drives: &[Drive]) -> Environment {
-    Environment::from_lookup(|name| std::env::var_os(name)).with_drive_roots(roots(drives))
+    crate::system_environment().with_drive_roots(roots(drives))
 }
 
 #[cfg(test)]

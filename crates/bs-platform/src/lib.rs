@@ -17,8 +17,10 @@ pub mod elevate;
 pub mod elevation;
 pub mod launch;
 pub mod software;
+mod sysenv;
 
 pub use clock::local_utc_offset_seconds;
+pub use sysenv::system_environment;
 
 #[cfg(windows)]
 mod winreg;

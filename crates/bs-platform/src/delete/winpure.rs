@@ -10,7 +10,7 @@ use std::path::Path;
 pub(crate) use bs_fsops::winpath::same_path;
 #[cfg(test)]
 pub(crate) use bs_fsops::winpath::strip_extended_prefix;
-use bs_fsops::winpath::{fold_units, is_inside_units, strip_extended_prefix_units};
+use bs_fsops::winpath::{child_units, fold_units, is_inside_units, strip_extended_prefix_units};
 
 /// Why the Recycle Bin would not take an item, if it would not.
 ///
@@ -200,18 +200,70 @@ pub(crate) fn parse_record(bytes: &[u8]) -> Option<RecycleRecord> {
 /// extension.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn info_for(recycled: &[u16]) -> Option<Vec<u16>> {
-    let split = recycled
+    swap_marker(recycled, b'R', b'I')
+}
+
+/// The `$R` item that goes with a `$I` record: the other way round from
+/// [`info_for`]. Given a bare file name or a whole path.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn recycled_for(info: &[u16]) -> Option<Vec<u16>> {
+    swap_marker(info, b'I', b'R')
+}
+
+/// `name` with its `$<from>` prefix turned into `$<to>`, every other unit as it
+/// was.
+fn swap_marker(path: &[u16], from: u8, to: u8) -> Option<Vec<u16>> {
+    let split = path
         .iter()
-        .rposition(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))?;
-    let (folder, name) = recycled.split_at(split + 1);
-    let rest = name.strip_prefix(&[u16::from(b'$'), u16::from(b'R')])?;
+        .rposition(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))
+        .map_or(0, |at| at + 1);
+    let (folder, name) = path.split_at(split);
+    let rest = name.strip_prefix(&[u16::from(b'$'), u16::from(from)])?;
     if rest.is_empty() {
         return None;
     }
     let mut out = folder.to_vec();
-    out.extend([u16::from(b'$'), u16::from(b'I')]);
+    out.extend([u16::from(b'$'), u16::from(to)]);
     out.extend_from_slice(rest);
     Some(out)
+}
+
+/// Whether `path` is an item directly inside the Recycle Bin folder of the
+/// user with security identifier `sid` on the volume whose root is
+/// `volume_root`: the item's folder is `<volume_root>\$Recycle.Bin\<sid>`, and
+/// nothing is deeper. Parts are compared by their exact 16-bit units, ignoring
+/// case.
+///
+/// The bin's folder has to sit at the root of the item's own volume (a drive
+/// root, or the folder a volume is mounted on). A folder anyone can make
+/// called `$Recycle.Bin` inside their own files, with a folder named like the
+/// user's identifier in it, is not the bin: a restore reads the record next to
+/// the item and moves the item, so it has to be the bin's own folder. The
+/// caller takes `volume_root` from the system's answer for the item's place,
+/// never from the item's text.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_in_user_bin(path: &[u16], sid: &str, volume_root: &[u16]) -> bool {
+    const BACKSLASH: u16 = b'\\' as u16;
+    const SLASH: u16 = b'/' as u16;
+    let plain = |text: &[u16]| -> Vec<u16> {
+        strip_extended_prefix_units(text)
+            .into_iter()
+            .map(|unit| if unit == SLASH { BACKSLASH } else { unit })
+            .collect()
+    };
+    let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+    let path = plain(path);
+    let root = plain(volume_root);
+    // No root, or nothing but separators: not a volume root.
+    if root.iter().all(|unit| *unit == BACKSLASH) {
+        return false;
+    }
+    let Some(cut) = path.iter().rposition(|unit| *unit == BACKSLASH) else {
+        return false;
+    };
+    let (folder, name) = (&path[..cut], &path[cut + 1..]);
+    let bin = child_units(&child_units(&root, &units("$Recycle.Bin")), &units(sid));
+    !name.is_empty() && fold_units(folder) == fold_units(&bin)
 }
 
 #[cfg(test)]
@@ -555,6 +607,107 @@ mod tests {
         for bad in [r"C:\x\$I1A2B3C.txt", r"C:\x\file", r"C:\x\$R", r"C:\x\R12"] {
             assert_eq!(info_for(&u(bad)), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn the_recycled_item_of_a_record_is_found_by_name_unit_for_unit() {
+        let u = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+        assert_eq!(recycled_for(&u(r"$I1A2B3C.txt")), Some(u(r"$R1A2B3C.txt")));
+        assert_eq!(
+            recycled_for(&u(r"C:\$Recycle.Bin\S-1\$I1A2B3C")),
+            Some(u(r"C:\$Recycle.Bin\S-1\$R1A2B3C"))
+        );
+        for bad in [r"$R1A2B3C", r"$I", r"I1A2B3C", r"", r"C:\x\$R1"] {
+            assert_eq!(recycled_for(&u(bad)), None, "{bad}");
+        }
+        // An extension that ends in a lone surrogate is carried over as it is.
+        let mut info = u("$I1A2B3C.t");
+        info.push(0xD800);
+        let mut want = u("$R1A2B3C.t");
+        want.push(0xD800);
+        assert_eq!(recycled_for(&info), Some(want));
+        // And the two directions undo each other.
+        let item = u(r"D:\$Recycle.Bin\S-1-5\$R9Z9Z9Z.d");
+        assert_eq!(recycled_for(&info_for(&item).unwrap()), Some(item));
+    }
+
+    #[test]
+    fn only_an_item_directly_in_the_users_own_bin_folder_may_be_restored_from() {
+        let u = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+        let sid = "S-1-5-21-1-2-3-1001";
+        for (good, root) in [
+            (r"C:\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1A2B3C.txt", r"C:\"),
+            (r"c:\$RECYCLE.BIN\s-1-5-21-1-2-3-1001\$R1A2B3C", r"C:\"),
+            (r"\\?\C:\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1A2B3C", r"C:\"),
+            (r"C:\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1A2B3C", r"\\?\C:\"),
+            // A volume mounted on a folder has its bin inside that folder,
+            // whether the root is given with or without its last separator.
+            (
+                r"D:\mnt\vol\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1",
+                r"D:\mnt\vol\",
+            ),
+            (
+                r"D:\mnt\vol\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1",
+                r"D:\mnt\vol",
+            ),
+            ("C:/$Recycle.Bin/S-1-5-21-1-2-3-1001/$R1", r"C:\"),
+        ] {
+            assert!(is_in_user_bin(&u(good), sid, &u(root)), "{good} on {root}");
+        }
+        for (bad, root) in [
+            // Another user's folder, or the folder itself.
+            (r"C:\$Recycle.Bin\S-1-5-21-1-2-3-1002\$R1", r"C:\"),
+            (r"C:\$Recycle.Bin\S-1-5-21-1-2-3-1001", r"C:\"),
+            (r"C:\$Recycle.Bin\S-1-5-21-1-2-3-1001\", r"C:\"),
+            // Deeper than an item of the bin, or not under the bin's folder.
+            (r"C:\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1\inner", r"C:\"),
+            (r"C:\Users\x\$Recycle.Bin\S-1-5-21-1-2-3-1001x\$R1", r"C:\"),
+            (r"C:\x\S-1-5-21-1-2-3-1001\$R1", r"C:\"),
+            (r"C:\$Recycle.Binx\S-1-5-21-1-2-3-1001\$R1", r"C:\"),
+            (r"$Recycle.Bin\S-1-5-21-1-2-3-1001", r"C:\"),
+            (r"", r"C:\"),
+            // A folder of the user's own named like the bin, with a folder
+            // named like the identifier in it, is not the bin: it is not at
+            // the root of the volume.
+            (
+                r"C:\Users\me\Documents\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1",
+                r"C:\",
+            ),
+            (r"C:\Users\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1", r"C:\"),
+            (
+                r"D:\mnt\vol\Users\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1",
+                r"D:\mnt\vol\",
+            ),
+            // A bin on a mounted volume is not the bin of the volume above it,
+            // and the other way round.
+            (r"D:\mnt\vol\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1", r"D:\"),
+            (r"D:\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1", r"D:\mnt\vol\"),
+            // A volume root that is not one: nothing is accepted.
+            (r"\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1", ""),
+            (r"\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1", r"\"),
+            (r"C:\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1", ""),
+        ] {
+            assert!(!is_in_user_bin(&u(bad), sid, &u(root)), "{bad} on {root}");
+        }
+        // The marker text anywhere else in the path is not the bin.
+        assert!(!is_in_user_bin(
+            &u(r"C:\evil\$Recycle.Bin\S-1-5-21-1-2-3-1001\sub\$R1"),
+            sid,
+            &u(r"C:\")
+        ));
+        // A name with a lone surrogate is not the look-alike with U+FFFD.
+        let mut lone = u(r"C:\$Recycle.Bin\S-1-5-21-1-2-3-1001");
+        lone.push(0xD800);
+        lone.extend(u(r"\$R1"));
+        assert!(!is_in_user_bin(&lone, sid, &u(r"C:\")));
+        // Nor is a root with a lone surrogate the root it resembles.
+        let mut lone_root = u(r"D:\mnt\vol");
+        lone_root.push(0xD800);
+        assert!(!is_in_user_bin(
+            &u(r"D:\mnt\vol\$Recycle.Bin\S-1-5-21-1-2-3-1001\$R1"),
+            sid,
+            &lone_root
+        ));
     }
 
     #[test]

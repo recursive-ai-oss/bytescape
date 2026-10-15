@@ -166,6 +166,18 @@ pub(crate) fn serve<W: Write>(
         Ok(root) => root,
         Err(why) => tell!(ErrorCode::BadRequest, why),
     };
+    // Only disks of this computer are read with administrator rights.
+    match crate::volume::of_scan_root(&root, host) {
+        crate::volume::Verdict::Local => {}
+        crate::volume::Verdict::Remote => tell!(
+            ErrorCode::RemoteVolume,
+            "network volumes are not scanned with administrator rights"
+        ),
+        crate::volume::Verdict::Unknown => tell!(
+            ErrorCode::Refused,
+            "the helper cannot tell what kind of volume this is, so it does not scan it"
+        ),
+    }
     let plan = plan_for(request.backend, &root, host, &request.extra_mount_ids);
     let os_used = StatvfsVolume.used_bytes(&root).ok();
     // Only mounts of the drive's own filesystem are entered, and the user's

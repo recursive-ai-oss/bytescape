@@ -25,9 +25,7 @@ use std::process::ExitCode;
 use windows_sys::Win32::Storage::FileSystem::{
     GetDriveTypeW, GetLogicalDriveStringsW, GetVolumeInformationW,
 };
-use windows_sys::Win32::System::SystemInformation::{
-    GetSystemWindowsDirectoryW, GlobalMemoryStatusEx, MEMORYSTATUSEX,
-};
+use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 /// The name of the interface's program, which sits beside the helper's.
 const INTERFACE_EXE: &str = "bytescape.exe";
@@ -80,22 +78,34 @@ fn wide_to_string(units: &[u16]) -> String {
     String::from_utf16_lossy(units)
 }
 
-/// The Windows folder as the system reports it, and every drive root.
+/// The folders the protected-path table names by variable, and every drive
+/// root.
+///
+/// This process is started with whatever environment its parent chose, so
+/// nothing here is read from it: the Windows folder, the Program Files
+/// folders, the program data folder and the user's profile come from the
+/// system's own answers (see `bs_fsops::folders`). A folder the system does
+/// not give is left out, and the table then guards the usual place by its
+/// drive letter alone.
 fn system_knowledge() -> Knowledge {
-    let mut env = Environment::from_lookup(|name| std::env::var_os(name));
-    let mut buffer = [0u16; 512];
-    // SAFETY: `buffer` is writable for the number of units passed.
-    let len = unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), units_of(&buffer)) };
-    if let Some(units) = buffer.get(..len as usize)
-        && len > 0
-    {
-        // The system's own answer replaces whatever the environment says.
-        env = env.with("SystemRoot", wide_to_string(units));
+    knowledge_from(&bs_fsops::folders::System, drive_roots())
+}
+
+/// The table for the folders `source` gives and the drives `roots`.
+fn knowledge_from(source: &dyn bs_fsops::folders::Source, roots: Vec<PathBuf>) -> Knowledge {
+    let mut env = Environment::new();
+    for (name, value) in bs_fsops::folders::trusted(source) {
+        env = env.with(name, value);
     }
+    Knowledge::new(&env.with_drive_roots(roots))
+}
+
+/// The root of every drive the system lists.
+fn drive_roots() -> Vec<PathBuf> {
     let mut drives = [0u16; 512];
     // SAFETY: `drives` is writable for the number of units passed.
     let len = unsafe { GetLogicalDriveStringsW(units_of(&drives), drives.as_mut_ptr()) };
-    let roots: Vec<PathBuf> = drives
+    drives
         .get(..len as usize)
         .map(|units| {
             units
@@ -104,8 +114,16 @@ fn system_knowledge() -> Knowledge {
                 .map(|part| PathBuf::from(wide_to_string(part)))
                 .collect()
         })
-        .unwrap_or_default();
-    Knowledge::new(&env.with_drive_roots(roots))
+        .unwrap_or_default()
+}
+
+/// `GetDriveTypeW` for the root `X:\` or `\\?\Volume{...}\` given as units
+/// without a NUL.
+pub(crate) fn drive_type_of_root(root: &[u16]) -> u32 {
+    let mut wide: Vec<u16> = root.to_vec();
+    wide.push(0);
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    unsafe { GetDriveTypeW(wide.as_ptr()) }
 }
 
 /// `GetDriveTypeW` answer for a disk built into the machine.
@@ -210,7 +228,8 @@ pub(crate) fn main() -> ExitCode {
         mode: args.mode,
         request_timeout: session::REQUEST_TIMEOUT,
         write_stall: session::WRITE_STALL,
-        judge: Judge::new(system_knowledge()),
+        judge: Judge::new(system_knowledge())
+            .with_volume_check(Box::new(crate::volume::SystemDrives)),
         host: Host::system(),
         on_stall: Box::new(|| std::process::exit(i32::from(Exit::Idle.code()))),
     };
@@ -245,6 +264,98 @@ mod tests {
         assert!(!is_the_interface(&own, &own));
         assert!(!is_the_interface(&own, Path::new(r"C:\does\not\exist.exe")));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A system with the answers a test gives it.
+    struct Fake;
+
+    impl bs_fsops::folders::Source for Fake {
+        fn windows_directory(&self) -> Option<String> {
+            Some(r"D:\WINNT".into())
+        }
+        fn machine_string(&self, subkey: &str, value: &str) -> Option<String> {
+            match (subkey.rsplit('\\').next(), value) {
+                (Some("CurrentVersion"), "ProgramFilesDir") => Some(r"D:\Apps".into()),
+                _ => None,
+            }
+        }
+        fn user_sid(&self) -> Option<String> {
+            None
+        }
+    }
+
+    fn level(knowledge: &Knowledge, path: &str) -> bs_knowledge::Level {
+        knowledge.protection(Path::new(path)).level
+    }
+
+    #[test]
+    fn the_table_knows_the_folders_the_system_gives() {
+        let knowledge = knowledge_from(&Fake, Vec::new());
+        // Folders that exist only on this made-up system, and that no literal
+        // entry of the table covers.
+        assert_eq!(
+            level(&knowledge, r"D:\WINNT\system32"),
+            bs_knowledge::Level::Blocked
+        );
+        assert_eq!(level(&knowledge, r"D:\Apps"), bs_knowledge::Level::Blocked);
+        assert_eq!(
+            level(&knowledge, r"D:\Apps\Tool"),
+            bs_knowledge::Level::Protected
+        );
+        assert_eq!(
+            level(&knowledge, r"D:\Other\Tool"),
+            bs_knowledge::Level::Normal
+        );
+    }
+
+    /// Only the tests that change the environment take it, so they do not
+    /// see each other's values.
+    static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_environment_this_process_was_started_with_does_not_shape_the_table() {
+        let _turn = ENVIRONMENT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let names = [
+            "SystemRoot",
+            "ProgramFiles",
+            "ProgramData",
+            "USERPROFILE",
+            "LOCALAPPDATA",
+        ];
+        let old: Vec<_> = names.iter().map(std::env::var_os).collect();
+        let clean = system_knowledge();
+        for name in names {
+            // SAFETY: the other tests that change the environment wait on
+            // `ENVIRONMENT`; nothing else in this test program reads these.
+            unsafe { std::env::set_var(name, r"Z:\planted\x") };
+        }
+        let planted = system_knowledge();
+        for (name, value) in names.iter().zip(old) {
+            // SAFETY: as above.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        // With the same drives and the same system, the same table: the
+        // planted values changed nothing, and nothing under them is guarded.
+        for path in [
+            r"Z:\planted\x",
+            r"Z:\planted\x\y",
+            r"C:\Windows",
+            r"C:\Program Files",
+            r"C:\ProgramData",
+        ] {
+            assert_eq!(level(&planted, path), level(&clean, path), "{path}");
+        }
+        assert_eq!(
+            level(&planted, r"Z:\planted\x"),
+            bs_knowledge::Level::Normal
+        );
     }
 
     #[test]

@@ -88,6 +88,27 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// The units of a path with a NUL after them, exactly as the path holds them.
+/// Read as text, a name with a lone surrogate would turn into the name of a
+/// different file, and that is the program the elevation prompt would start.
+fn wide_path(path: &std::path::Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// Whether the program that connected (`image`) is the helper that was
+/// started (`helper`): the same place, compared by the exact 16-bit units of
+/// the names after the documented normalisation (case, `/`, `\\?\`). A name
+/// with a lone surrogate is not the one with U+FFFD in its place.
+fn is_the_helper(image: &std::path::Path, helper: &std::path::Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    let units = |path: &std::path::Path| -> Vec<u16> { path.as_os_str().encode_wide().collect() };
+    bs_fsops::winpath::same_path_units(&units(image), &units(helper))
+}
+
 pub(super) fn random_bytes(buf: &mut [u8]) -> Result<(), ElevateError> {
     let len = u32::try_from(buf.len())
         .map_err(|_| ElevateError::Unavailable(Unavailable::Other("too many bytes")))?;
@@ -186,7 +207,7 @@ fn create_pipe(name: &str) -> Result<PipeEnd, ElevateError> {
 
 /// Starts the helper elevated and gives back its process handle.
 fn start_elevated(helper: &std::path::Path, parameters: &str) -> Result<HANDLE, ElevateError> {
-    let file = wide(&helper.to_string_lossy());
+    let file = wide_path(helper);
     let verb = wide("runas");
     let parameters = wide(parameters);
     // SAFETY: an all-zero structure is the documented starting point.
@@ -313,11 +334,7 @@ pub(super) fn launch(
     let image = std::fs::canonicalize(image)
         .map_err(|_| ElevateError::PeerNotVerified("the connecting program is unknown"))?;
     // Compared by the 16-bit units of the names, not as text.
-    let units = |path: &std::path::Path| -> Vec<u16> {
-        use std::os::windows::ffi::OsStrExt;
-        path.as_os_str().encode_wide().collect()
-    };
-    if !bs_fsops::winpath::same_path_units(&units(&image), &units(&helper)) {
+    if !is_the_helper(&image, &helper) {
         return Err(ElevateError::PeerNotVerified(
             "the connecting program is not the helper",
         ));
@@ -653,6 +670,52 @@ mod tests {
             &sid_from_text("S-1-5-32-544"),
             &sid_from_text("S-1-5-32-545")
         ));
+    }
+
+    #[test]
+    fn the_helper_image_is_compared_by_exact_units() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        let named = |tail: &[u16]| -> PathBuf {
+            let mut units: Vec<u16> = r"C:\Program Files\Bytescape\".encode_utf16().collect();
+            units.extend_from_slice(tail);
+            PathBuf::from(OsString::from_wide(&units))
+        };
+        let plain: Vec<u16> = "bytescape-helper.exe".encode_utf16().collect();
+        let mut lone = plain.clone();
+        lone.insert(0, 0xD800);
+        let mut replaced = plain.clone();
+        replaced.insert(0, 0xFFFD);
+        // The same file spelled in another case, or with the long-path prefix.
+        assert!(is_the_helper(
+            &named(&plain),
+            &PathBuf::from(named(&plain).to_string_lossy().to_uppercase())
+        ));
+        assert!(is_the_helper(
+            &PathBuf::from(format!(r"\\?\{}", named(&plain).display())),
+            &named(&plain)
+        ));
+        // A lone surrogate is not U+FFFD, and neither is another program.
+        assert!(!is_the_helper(&named(&lone), &named(&replaced)));
+        assert!(is_the_helper(&named(&lone), &named(&lone)));
+        assert!(!is_the_helper(
+            &named(&plain),
+            &named(&"bytescape.exe".encode_utf16().collect::<Vec<u16>>())
+        ));
+    }
+
+    #[test]
+    fn a_path_is_handed_to_the_shell_as_its_exact_units() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        let mut units: Vec<u16> = r"C:\a\".encode_utf16().collect();
+        units.push(0xD800);
+        let path = PathBuf::from(OsString::from_wide(&units));
+        let mut want = units.clone();
+        want.push(0);
+        assert_eq!(wide_path(&path), want);
+        // Not what reading it as text would give.
+        assert_ne!(wide(&path.to_string_lossy()), want);
     }
 
     #[test]

@@ -84,24 +84,18 @@ fn unescape(field: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The mount in view among `candidates`, which are mounts on one path: the one
-/// that no other candidate is attached to. Mount IDs are handed out lowest
-/// free first, so a higher ID is not a later mount; the parent links say what
-/// is stacked on what. If the links do not settle it (more than one
-/// candidate is on top), the highest ID decides.
+/// The mount in view among `candidates`, which are mounts on one path, in
+/// table order: the one that no other candidate is attached to. Mount IDs are
+/// handed out lowest free first, so a higher ID is not a later mount; the
+/// parent links say what is stacked on what. If the links do not settle it
+/// (more than one candidate is on top), the last in the table decides, as the
+/// kernel lists mounts in the order they were made.
 fn on_top<'a>(candidates: impl Iterator<Item = &'a Mount>) -> Option<&'a Mount> {
     let all: Vec<&Mount> = candidates.collect();
     all.iter()
         .copied()
-        .filter(|m| !all.iter().any(|other| other.parent == m.id))
-        .max_by_key(|m| m.id)
-        .or_else(|| all.iter().copied().max_by_key(|m| m.id))
-}
-
-/// The mount that shows `path`, when `path` is exactly a mount point. When
-/// several mounts are stacked on it the one in view wins.
-pub fn at_exactly<'a>(mounts: &'a [Mount], path: &[u8]) -> Option<&'a Mount> {
-    on_top(mounts.iter().filter(|m| m.mount_point == path))
+        .rfind(|m| !all.iter().any(|other| other.parent == m.id))
+        .or_else(|| all.last().copied())
 }
 
 /// Whether `path` is `folder` or inside it, by whole path parts.
@@ -113,19 +107,31 @@ fn is_under(path: &[u8], folder: &[u8]) -> bool {
         && (path.len() == folder.len() || path.get(folder.len()) == Some(&b'/'))
 }
 
-/// The mount that holds `path`: the one with the longest mount point that
-/// `path` is at or inside, and the one in view when several are stacked.
+/// The mount that holds `path`: the one in view there.
+///
+/// The table lists mounts in the order they were made, and a mount made later
+/// hides what the earlier ones show under its mount point. So the last mount
+/// in the table whose mount point holds `path` is the one in view, even when
+/// an earlier mount has a longer mount point: a mount of `/mnt/data` made
+/// before a mount of `/mnt` is hidden by it. Several mounts on one mount point
+/// are told apart by what is stacked on what, and only those made after the
+/// last mount of a shorter mount point count: the earlier ones are under it.
 pub fn containing<'a>(mounts: &'a [Mount], path: &[u8]) -> Option<&'a Mount> {
-    let longest = mounts
+    let holds = |m: &&Mount| is_under(path, &m.mount_point);
+    let last = mounts.iter().rposition(|m| holds(&m))?;
+    let point = &mounts.get(last)?.mount_point;
+    let covering = mounts
         .iter()
-        .filter(|m| is_under(path, &m.mount_point))
-        .map(|m| m.mount_point.len())
-        .max()?;
-    on_top(
-        mounts
-            .iter()
-            .filter(|m| m.mount_point.len() == longest && is_under(path, &m.mount_point)),
-    )
+        .rposition(|m| holds(&m) && m.mount_point.len() < point.len());
+    let from = covering.map_or(0, |at| at.saturating_add(1));
+    on_top(mounts.iter().skip(from).filter(|m| &m.mount_point == point))
+}
+
+/// The mount that shows `path`, when `path` is exactly a mount point and the
+/// mount is in view: one that a later mount of a shorter path covers is not.
+/// When several mounts are stacked on it the one in view wins.
+pub fn at_exactly<'a>(mounts: &'a [Mount], path: &[u8]) -> Option<&'a Mount> {
+    containing(mounts, path).filter(|m| m.mount_point == path)
 }
 
 /// Whether two mounts show the same filesystem: the same device number and
@@ -222,20 +228,47 @@ pub fn already_shown_ids(
             *position,
         )
     });
+    // A mount is a repeat when another mount of the family shows its folder.
+    // Only a mount that is itself entered can show anything, so a mount that
+    // is a repeat covers nothing: otherwise a mount that is in the way of one
+    // mount could be dropped for a second mount that is dropped itself, and
+    // its files would be counted nowhere. What shows a folder has a root
+    // above it or equal to it (earlier in the family), so judging the mounts
+    // from the shortest root down has every mount's coverers decided first.
+    let mut by_root: Vec<usize> = (0..family.len()).collect();
+    by_root.sort_by_key(|&index| {
+        (
+            family
+                .get(index)
+                .map_or(0, |(_, member)| depth(&member.root)),
+            index,
+        )
+    });
+    let mut repeat = vec![false; family.len()];
+    for &index in &by_root {
+        let Some((_, member)) = family.get(index) else {
+            continue;
+        };
+        if member.id == home.id {
+            continue;
+        }
+        let covered = family.iter().enumerate().any(|(other_index, (_, other))| {
+            other_index != index
+                && !repeat.get(other_index).copied().unwrap_or(false)
+                && is_under(&member.root, &other.root)
+                && (member.root != other.root || other_index < index)
+                && !hides_its_own_folder(member, other)
+        });
+        if let Some(slot) = repeat.get_mut(index) {
+            *slot = covered;
+        }
+    }
     dropped.extend(
         family
             .iter()
-            .enumerate()
-            .filter(|(index, (_, member))| {
-                member.id != home.id
-                    && family.iter().enumerate().any(|(other_index, (_, other))| {
-                        other_index != *index
-                            && is_under(&member.root, &other.root)
-                            && (member.root != other.root || other_index < *index)
-                            && !hides_its_own_folder(member, other)
-                    })
-            })
-            .map(|(_, (_, member))| member.id),
+            .zip(&repeat)
+            .filter(|(_, repeated)| **repeated)
+            .map(|((_, member), _)| member.id),
     );
     dropped
 }
@@ -347,6 +380,63 @@ garbage line
         assert!(containing(&mounts, b"relative").is_none());
     }
 
+    #[test]
+    fn a_mount_hidden_under_a_later_mount_of_a_shorter_path_is_not_in_view() {
+        // /mnt/data was mounted first and /mnt over it afterwards: the folder
+        // /mnt/data that the user sees is the one inside the tmpfs.
+        let text = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 8:2 / /mnt/data rw - ext4 /dev/sda2 rw
+3 1 0:50 / /mnt rw - tmpfs tmpfs rw
+";
+        let mounts = parse(text.as_bytes());
+        assert_eq!(containing(&mounts, b"/mnt/data/x").unwrap().id, 3);
+        assert_eq!(containing(&mounts, b"/mnt/data").unwrap().id, 3);
+        assert_eq!(containing(&mounts, b"/mnt/other").unwrap().id, 3);
+        assert!(at_exactly(&mounts, b"/mnt/data").is_none());
+        assert_eq!(at_exactly(&mounts, b"/mnt").unwrap().id, 3);
+        // Mounted in the other order the longer mount point is in view.
+        let text = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+3 1 0:50 / /mnt rw - tmpfs tmpfs rw
+2 3 8:2 / /mnt/data rw - ext4 /dev/sda2 rw
+";
+        let mounts = parse(text.as_bytes());
+        assert_eq!(containing(&mounts, b"/mnt/data/x").unwrap().id, 2);
+        assert_eq!(at_exactly(&mounts, b"/mnt/data").unwrap().id, 2);
+    }
+
+    #[test]
+    fn a_mount_made_on_the_same_path_before_the_cover_is_not_a_candidate() {
+        // 9 is on /mnt/data below the cover (3 on /mnt). 4 is mounted on
+        // /mnt/data inside the cover, so it is the one in view. Neither has
+        // anything stacked on it, so by IDs and links alone 9 would win.
+        let text = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+9 1 8:2 / /mnt/data rw - ext4 /dev/sda2 rw
+3 1 0:50 / /mnt rw - tmpfs tmpfs rw
+4 3 8:3 / /mnt/data rw - ext4 /dev/sda3 rw
+";
+        let mounts = parse(text.as_bytes());
+        assert_eq!(containing(&mounts, b"/mnt/data/f").unwrap().id, 4);
+        assert_eq!(at_exactly(&mounts, b"/mnt/data").unwrap().id, 4);
+        // The cover alone, with the mount that was under it listed first.
+        let text = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+9 1 8:2 / /mnt/data rw - ext4 /dev/sda2 rw
+3 1 0:50 / /mnt rw - tmpfs tmpfs rw
+";
+        let mounts = parse(text.as_bytes());
+        assert_eq!(containing(&mounts, b"/mnt/data/f").unwrap().id, 3);
+    }
+
+    #[test]
+    fn without_links_that_settle_it_the_last_mount_in_the_table_is_in_view() {
+        // The higher ID comes first in the table: it was made first.
+        let text = b"9 1 8:2 / /y rw - ext4 /dev/sda2 rw\n4 1 8:2 / /y rw - ext4 /dev/sda2 rw\n";
+        assert_eq!(at_exactly(&parse(text), b"/y").unwrap().id, 4);
+    }
+
     /// The requested mounts a scan of `root` on mount `home` must not enter.
     fn dropped(text: &str, home: u64, root: &str, requested: &[u64]) -> Vec<u64> {
         let mounts = parse(text.as_bytes());
@@ -379,6 +469,57 @@ garbage line
         assert_eq!(dropped(text, 1, "/", &[2, 3, 4]), vec![4]);
         // Nothing is dropped that was not asked for.
         assert!(dropped(text, 1, "/", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_mount_in_the_way_is_not_dropped_for_a_mount_that_is_dropped_itself() {
+        // The scan starts at /data (the subvolume @). Mount 2 shows @/q again
+        // at /data/elsewhere, so it is a repeat of what /data shows at
+        // /data/q. Mount 3 is mounted exactly where /data shows @/q/r, so it
+        // is in the way of /data and the only way to reach its files. Mount 2
+        // shows @/q/r as well, but a repeat is not entered and shows nothing:
+        // 3 must be kept.
+        let text = "\
+1 0 0:27 /@ /data rw - btrfs /dev/sda3 rw
+2 1 0:27 /@/q /data/elsewhere rw - btrfs /dev/sda3 rw
+3 1 0:27 /@/q/r /data/q/r rw - btrfs /dev/sda3 rw
+";
+        assert_eq!(dropped(text, 1, "/data", &[2, 3]), vec![2]);
+        assert_eq!(dropped(text, 1, "/data", &[3]), Vec::<u64>::new());
+        // A mount whose coverer is entered is still dropped.
+        let text = "\
+1 0 0:27 /@ /data rw - btrfs /dev/sda3 rw
+2 1 0:27 /@/q /data/elsewhere rw - btrfs /dev/sda3 rw
+3 1 0:27 /@/q/r /data/elsewhere/r rw - btrfs /dev/sda3 rw
+";
+        // 2 is a repeat of /data/q (covered by the start); 3 shows @/q/r at
+        // /data/elsewhere/r, which is where 2 would show it, so 3 is in 2's
+        // way and also not in the start's way: covered by the start, dropped.
+        assert_eq!(dropped(text, 1, "/data", &[2, 3]), vec![2, 3]);
+    }
+
+    #[test]
+    fn a_subvolume_mounted_on_its_own_folder_is_entered_by_a_scan_from_the_top_level() {
+        // `/` is the top level (subvolume 5); `home` is mounted on `/home` and a
+        // subvolume of it on `/home/alice`, each on the folder where its
+        // parent shows it. A scan of `/` has to enter all of them: their files
+        // are reachable only through the mounts.
+        let text = "\
+29 1 0:27 / / rw,relatime shared:1 - btrfs /dev/sda3 rw,ssd,subvolid=5,subvol=/
+41 29 0:27 /home /home rw,relatime shared:25 - btrfs /dev/sda3 rw,ssd,subvolid=257,subvol=/home
+57 41 0:27 /home/alice /home/alice rw,relatime shared:31 - btrfs /dev/sda3 rw,ssd,subvolid=300,subvol=/home/alice
+";
+        assert!(dropped(text, 29, "/", &[41, 57]).is_empty());
+        // A scan that starts at /home does too, and is not covered by the top
+        // level that is a mount above its start.
+        assert!(dropped(text, 41, "/home", &[57]).is_empty());
+        // The scan root being the subvolume's own mount point: the top level
+        // mounted above it is not requested, so it cannot repeat anything.
+        assert!(
+            dropped(text, 41, "/home", &[29, 57])
+                .iter()
+                .all(|id| *id != 57)
+        );
     }
 
     #[test]

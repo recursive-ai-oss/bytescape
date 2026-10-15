@@ -808,6 +808,7 @@ fn every_fallback_and_error_code_round_trips_and_an_unknown_one_is_refused() {
         ErrorCode::Refused,
         ErrorCode::Internal,
         ErrorCode::NoAccount,
+        ErrorCode::RemoteVolume,
     ] {
         let error = Message::Error(ErrorReport {
             code,
@@ -819,10 +820,56 @@ fn every_fallback_and_error_code_round_trips_and_an_unknown_one_is_refused() {
             error
         );
         let mut damaged = bytes[4..].to_vec();
-        damaged[2] = 7;
+        damaged[2] = 99;
         assert!(matches!(
             decode_body(&damaged, Direction::ToInterface),
             Err(DecodeError::BadValue)
         ));
     }
+}
+
+#[test]
+fn every_refusal_round_trips_and_an_unknown_one_is_refused() {
+    let all = [
+        Refusal::Blocked,
+        Refusal::ProtectedNotConfirmed,
+        Refusal::SelectionRefused { driver: 3 },
+        Refusal::BadPath,
+        Refusal::NotFound,
+        Refusal::CannotResolve,
+        Refusal::ChangedSinceScan,
+        Refusal::MountPoint,
+        Refusal::Overlaps { with: 4 },
+        Refusal::NotRealPath,
+        Refusal::NotPermanent,
+        Refusal::RemoteVolume,
+    ];
+    for refusal in all {
+        let message = Message::DeleteItem {
+            index: 1,
+            outcome: ItemOutcome::Refused(refusal),
+        };
+        let bytes = frame(&message);
+        assert_eq!(
+            decode_body(&bytes[4..], Direction::ToInterface).unwrap(),
+            message,
+            "{refusal:?}"
+        );
+    }
+    // The refusal code is the second last byte group of the body: find it by
+    // encoding a refusal whose code is known and changing that byte.
+    let known = Message::DeleteItem {
+        index: 1,
+        outcome: ItemOutcome::Refused(Refusal::RemoteVolume),
+    };
+    let bytes = frame(&known);
+    let body = &bytes[4..];
+    let at = body.len() - 5;
+    assert_eq!(body[at], 12, "the code of RemoteVolume");
+    let mut damaged = body.to_vec();
+    damaged[at] = 13;
+    assert!(matches!(
+        decode_body(&damaged, Direction::ToInterface),
+        Err(DecodeError::BadValue)
+    ));
 }

@@ -179,6 +179,11 @@ pub enum ErrorCode {
     /// helper does not know which folders are the user's own to protect.
     /// Nothing was deleted.
     NoAccount,
+    /// The volume is on another computer (a network share or a remote file
+    /// system). The helper reads and deletes only on disks of this computer:
+    /// what a server hands to an administrator account is not the server's
+    /// to decide. Nothing was read or deleted.
+    RemoteVolume,
 }
 
 impl ErrorCode {
@@ -190,6 +195,7 @@ impl ErrorCode {
             ErrorCode::Refused => 4,
             ErrorCode::Internal => 5,
             ErrorCode::NoAccount => 6,
+            ErrorCode::RemoteVolume => 7,
         }
     }
 
@@ -201,6 +207,7 @@ impl ErrorCode {
             4 => ErrorCode::Refused,
             5 => ErrorCode::Internal,
             6 => ErrorCode::NoAccount,
+            7 => ErrorCode::RemoteVolume,
             _ => return None,
         })
     }
@@ -244,6 +251,10 @@ pub enum Refusal {
     NotRealPath,
     /// The request did not ask for a permanent delete.
     NotPermanent,
+    /// The item is on a network volume (a share or a remote file system), or
+    /// the helper cannot tell what kind of volume it is on. Only disks of
+    /// this computer are deleted from with administrator rights.
+    RemoteVolume,
 }
 
 /// What happened to one item.
