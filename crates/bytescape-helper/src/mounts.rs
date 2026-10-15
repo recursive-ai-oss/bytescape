@@ -499,6 +499,27 @@ garbage line
     }
 
     #[test]
+    fn a_mount_covered_by_a_mount_that_is_covered_itself_is_dropped_and_its_files_are_counted_once()
+    {
+        // The scan starts at /data (the subvolume @). Mount 2 shows @/q at
+        // /data/e, which /data shows at /data/q already: a repeat. Mount 3
+        // shows @/q/r at /data/e2, inside what both /data and mount 2 show.
+        // Mount 2 is a repeat, so it shows nothing and covers nothing; mount
+        // 3 is covered by /data itself. Both are dropped, and the files under
+        // @/q/r are counted once, through /data. Nothing is lost and nothing
+        // is counted twice (the model test below checks this for every small
+        // table).
+        let text = "\
+1 0 0:27 /@ /data rw - btrfs /dev/sda3 rw
+2 1 0:27 /@/q /data/e rw - btrfs /dev/sda3 rw
+3 1 0:27 /@/q/r /data/e2 rw - btrfs /dev/sda3 rw
+";
+        assert_eq!(dropped(text, 1, "/data", &[2, 3]), vec![2, 3]);
+        // Asked for alone, mount 3 is covered by the start all the same.
+        assert_eq!(dropped(text, 1, "/data", &[3]), vec![3]);
+    }
+
+    #[test]
     fn a_subvolume_mounted_on_its_own_folder_is_entered_by_a_scan_from_the_top_level() {
         // `/` is the top level (subvolume 5); `home` is mounted on `/home` and a
         // subvolume of it on `/home/alice`, each on the folder where its
@@ -580,5 +601,251 @@ garbage line
         assert!(same_filesystem(&m[0], &m[1]));
         assert!(!same_filesystem(&m[0], &m[2]));
         assert!(!same_filesystem(&m[3], &m[4]), "two tmpfs instances");
+    }
+}
+
+/// The rule that drops mounts a scan would count twice, checked against a model
+/// of what a walk sees: every table of up to four mounts of one file system
+/// (with the mount points made on folders that exist), asking whether each
+/// folder of the file system is counted exactly once by the mounts that are
+/// entered, and never lost or counted twice.
+#[cfg(test)]
+mod coverage_model {
+    #![allow(clippy::cast_possible_truncation)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
+    use super::*;
+
+    /// The folders of the file system the tables are made from.
+    const FOLDERS: [&str; 6] = ["/", "/a", "/a/b", "/a/b/c", "/d", "/d/e"];
+    /// Empty folders made to be mount points: hiding one hides nothing.
+    const PLACEHOLDERS: [&str; 4] = ["/p", "/q", "/a/p", "/a/q"];
+    /// Where mounts other than the scan's start are attached, under `/s`: on
+    /// folders with files in them, and on empty ones.
+    const PLACES: [&str; 5] = ["/s/a", "/s/a/b", "/s/d", "/s/p", "/s/q"];
+    const ROOTS: [&str; 6] = FOLDERS;
+
+    struct Line {
+        id: u64,
+        root: &'static str,
+        at: &'static str,
+    }
+
+    fn text_of(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                format!(
+                    "{} 1 0:27 {} {} rw - btrfs /dev/sda3 rw\n",
+                    l.id, l.root, l.at
+                )
+            })
+            .collect()
+    }
+
+    /// Where `mount` shows the folder `folder` of the file system, if it does.
+    fn place(mount: &Mount, folder: &str) -> Option<String> {
+        let root = String::from_utf8_lossy(&mount.root).into_owned();
+        if !is_under(folder.as_bytes(), root.as_bytes()) {
+            return None;
+        }
+        let rest = if root == "/" {
+            folder
+        } else {
+            &folder[root.len()..]
+        };
+        let at = String::from_utf8_lossy(&mount.mount_point).into_owned();
+        let rest = if rest == "/" { "" } else { rest };
+        Some(format!("{at}{rest}"))
+    }
+
+    /// Whether `mount` shows `folder` to a walk: it is there, and no mount
+    /// attached inside its tree sits on the place or above it.
+    fn shows(table: &[Mount], mount: &Mount, folder: &str) -> bool {
+        let Some(at) = place(mount, folder) else {
+            return false;
+        };
+        !table.iter().any(|n| {
+            n.id != mount.id
+                && n.mount_point != mount.mount_point
+                && is_under(&n.mount_point, &mount.mount_point)
+                && is_under(at.as_bytes(), &n.mount_point)
+        })
+    }
+
+    /// The mount a walk is in when it meets the mount point of `n`: the deepest
+    /// other mount that holds it.
+    fn holder<'a>(table: &'a [Mount], n: &Mount) -> Option<&'a Mount> {
+        table
+            .iter()
+            .filter(|k| {
+                k.id != n.id
+                    && k.mount_point != n.mount_point
+                    && is_under(&n.mount_point, &k.mount_point)
+            })
+            .max_by_key(|k| k.mount_point.len())
+    }
+
+    /// The mounts a walk from `home` goes through when it enters `entered`:
+    /// each is met on a folder of a mount that is walked.
+    fn walked<'a>(table: &'a [Mount], home: &'a Mount, entered: &[u64]) -> Vec<&'a Mount> {
+        let mut walked = vec![home];
+        loop {
+            let next = table.iter().find(|n| {
+                entered.contains(&n.id)
+                    && !walked.iter().any(|w| w.id == n.id)
+                    && holder(table, n).is_some_and(|h| walked.iter().any(|w| w.id == h.id))
+            });
+            match next {
+                Some(n) => walked.push(n),
+                None => return walked,
+            }
+        }
+    }
+
+    /// The folder of the file system that `n` is mounted on, as the mount that
+    /// holds it shows it.
+    fn folder_of(table: &[Mount], n: &Mount) -> Option<String> {
+        let k = holder(table, n)?;
+        let root = String::from_utf8_lossy(&k.root).into_owned();
+        let rest = String::from_utf8_lossy(&n.mount_point[k.mount_point.len()..]).into_owned();
+        Some(if root == "/" {
+            rest
+        } else {
+            format!("{root}{rest}")
+        })
+    }
+
+    /// Whether the table could exist and is an ordinary one: every mount point
+    /// is on a folder of the mount that holds it, and a mount placed on a
+    /// folder that has files in it shows that very folder (a subvolume on its
+    /// own folder). Anything else mounted over files would hide them, and the
+    /// folders it crosses are not what any real layout does.
+    fn possible(table: &[Mount]) -> bool {
+        table.iter().skip(1).all(|n| {
+            folder_of(table, n).is_some_and(|folder| {
+                PLACEHOLDERS.contains(&folder.as_str())
+                    || (FOLDERS.contains(&folder.as_str()) && n.root == folder.as_bytes())
+            })
+        })
+    }
+
+    /// Whether a mount is attached on a folder strictly inside its own root: a
+    /// file system mounted into itself, which loops. (On its own folder it
+    /// replaces that folder and does not.)
+    fn loops(table: &[Mount]) -> bool {
+        table.iter().skip(1).any(|n| {
+            folder_of(table, n).is_some_and(|folder| {
+                folder.as_bytes() != n.root.as_slice() && is_under(folder.as_bytes(), &n.root)
+            })
+        })
+    }
+
+    /// Every way to fill the places with a mount of some root or nothing, in
+    /// the order of the places and in the reverse order, for each root of the
+    /// scan's start.
+    fn tables() -> Vec<Vec<Line>> {
+        let options = ROOTS.len() + 1;
+        let mut out = Vec::new();
+        for home_root in &ROOTS[..2] {
+            for code in 0..options.pow(PLACES.len() as u32) {
+                let chosen: Vec<(&'static str, &'static str)> = PLACES
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, at)| {
+                        let pick = code / options.pow(slot as u32) % options;
+                        pick.checked_sub(1).map(|root| (ROOTS[root], *at))
+                    })
+                    .collect();
+                for reversed in [false, true] {
+                    let mut mounts = chosen.clone();
+                    if reversed {
+                        mounts.reverse();
+                    }
+                    let mut lines = vec![Line {
+                        id: 1,
+                        root: home_root,
+                        at: "/s",
+                    }];
+                    for (index, (root, at)) in mounts.into_iter().enumerate() {
+                        lines.push(Line {
+                            id: 2 + index as u64,
+                            root,
+                            at,
+                        });
+                    }
+                    out.push(lines);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_folder_is_counted_once_by_the_mounts_that_are_entered() {
+        let mut checked = 0u64;
+        let mut covered_by_a_covered = 0u64;
+        for lines in tables() {
+            let table = parse(text_of(&lines).as_bytes());
+            if !possible(&table) {
+                continue;
+            }
+            let home = &table[0];
+            // A file system mounted into itself loops: its files are seen
+            // through the mount again and again, and no choice of mounts
+            // counts each folder once. Those tables are not judged here.
+            if loops(&table) {
+                continue;
+            }
+            checked += 1;
+            let requested: Vec<u64> = table.iter().skip(1).map(|m| m.id).collect();
+            let dropped = already_shown_ids(&table, home, b"/s", &requested);
+            let entered: Vec<u64> = requested
+                .iter()
+                .copied()
+                .filter(|id| !dropped.contains(id))
+                .collect();
+            // What the walk can reach if every mount were entered.
+            let everything = walked(&table, home, &requested);
+            let counted = walked(&table, home, &entered);
+            for folder in FOLDERS {
+                let possible_at = everything
+                    .iter()
+                    .filter(|m| shows(&table, m, folder))
+                    .count();
+                let counts = counted.iter().filter(|m| shows(&table, m, folder)).count();
+                let text = text_of(&lines);
+                if possible_at > 0 {
+                    assert_eq!(
+                        counts, 1,
+                        "{folder} is counted {counts} times (dropped {dropped:?}) in\n{text}"
+                    );
+                } else {
+                    assert_eq!(counts, 0, "{folder} appears from nowhere in\n{text}");
+                }
+            }
+            // How often the transitive case comes up: a dropped mount whose
+            // root lies inside the root of another dropped mount, so the one
+            // it is judged covered by is itself covered.
+            let root_of = |id: &u64| table.iter().find(|m| m.id == *id).map(|m| m.root.clone());
+            let chained = dropped.iter().any(|a| {
+                dropped.iter().any(|b| {
+                    a != b
+                        && matches!((root_of(a), root_of(b)),
+                            (Some(x), Some(y)) if is_under(&x, &y))
+                })
+            });
+            if chained {
+                covered_by_a_covered += 1;
+            }
+        }
+        assert!(checked > 500, "only {checked} tables were possible");
+        assert!(
+            covered_by_a_covered > 20,
+            "the transitive case came up only {covered_by_a_covered} times"
+        );
     }
 }

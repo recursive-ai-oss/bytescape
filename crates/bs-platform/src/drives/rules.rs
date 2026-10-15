@@ -658,6 +658,25 @@ mod tests {
     }
 
     #[test]
+    fn a_mount_covered_by_a_mount_that_is_covered_itself_is_covered_once_and_counted_once() {
+        // `/data` shows the subvolume `@`. Mount 2 shows `@/q` on `/data/e`,
+        // which `/data` shows at `/data/q` already: a repeat. Mount 3 shows
+        // `@/q/r` on `/data/e2`, inside what both `/data` and mount 2 show.
+        // Mount 2 is a repeat, so it shows nothing and covers nothing; mount
+        // 3 is covered by `/data`. Both are flagged, and the files under
+        // `@/q/r` are reached once, through `/data`.
+        let text = "\
+1 0 0:27 /@ /data rw - btrfs /dev/sda3 rw
+2 1 0:27 /@/q /data/e rw - btrfs /dev/sda3 rw
+3 1 0:27 /@/q/r /data/e2 rw - btrfs /dev/sda3 rw
+";
+        assert_eq!(
+            covered_flags(&parse(text.as_bytes())),
+            vec![false, true, true]
+        );
+    }
+
+    #[test]
     fn the_top_level_btrfs_mount_covers_the_subvolume_mounts() {
         // `/data` shows the top of the filesystem, where @, @home and the rest
         // are ordinary folders, so a walk of it already reaches them.

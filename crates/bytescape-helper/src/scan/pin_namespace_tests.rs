@@ -352,3 +352,116 @@ fn the_plan_is_placed_by_the_judged_mount() {
     .expect("judged");
     assert_eq!(plan.mount_ids, vec![sub_id]);
 }
+
+/// The figure for the volume's use is asked of the folder that was judged, not
+/// of its name: the name is made to lead to another file system while the
+/// judgement is under way (the mount table is a named pipe, so the judgement
+/// waits for it after the folder is open), and the figure must still be the
+/// judged file system's.
+#[test]
+fn the_figure_for_the_volumes_use_is_asked_of_the_judged_folder() {
+    let Some(fx) = Fixture::new("used") else {
+        return;
+    };
+    std::fs::create_dir_all(fx.p("root")).unwrap();
+    let first = mount_tmpfs(&fx.p("root")).unwrap();
+    // A file the judged file system holds and the next one will not.
+    std::fs::write(fx.p("root/big"), vec![7u8; 1 << 20]).unwrap();
+    let table = std::fs::read("/proc/self/mountinfo").unwrap();
+    let pipe = fx.p("mountinfo");
+    // SAFETY: a NUL-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(c(&pipe).as_ptr(), 0o600) }, 0);
+    let judge = {
+        let (root, pipe) = (fx.p("root"), pipe.clone());
+        std::thread::spawn(move || {
+            let host = Host { mountinfo: pipe };
+            crate::volume::judge_scan_root(&root, &host)
+                .ok()
+                .and_then(|judged| judged.os_used)
+        })
+    };
+    // Wait until the folder is open: the judgement is now waiting for the table.
+    let root = fx.p("root");
+    let is_open = || {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .any(|entry| std::fs::read_link(entry.path()).is_ok_and(|to| to == root))
+    };
+    let started = std::time::Instant::now();
+    while !is_open() && started.elapsed() < std::time::Duration::from_secs(3) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let was_open = is_open();
+    // The name now leads to an empty file system.
+    // SAFETY: a NUL-terminated path that outlives the call.
+    unsafe { libc::umount2(c(&fx.p("root")).as_ptr(), libc::MNT_DETACH) };
+    let second = mount_tmpfs(&fx.p("root")).unwrap();
+    std::fs::write(&pipe, table).unwrap();
+    let used = judge.join().unwrap();
+    drop(second);
+    drop(first);
+    assert!(was_open, "the folder was not open while the table was read");
+    assert!(
+        used.is_some_and(|bytes| bytes >= 1 << 20),
+        "the figure is not the judged file system's: {used:?}"
+    );
+}
+
+/// A subvolume mounted on its own folder, below the scan's start, is entered
+/// and its files are counted: the layout of a btrfs top level with `home` on
+/// `/home` and a subvolume of it on `/home/alice`, made with bind mounts of one
+/// tmpfs (the same shape in the kernel's table: one device, roots that are
+/// folders of the file system, mount points on those very folders).
+#[test]
+fn a_mount_on_its_own_folder_is_entered_on_a_real_mount_table() {
+    use crate::mounts::{at_exactly, parse};
+    let Some(fx) = Fixture::new("own-folder") else {
+        return;
+    };
+    std::fs::create_dir_all(fx.p("top")).unwrap();
+    let _top = mount_tmpfs(&fx.p("top")).unwrap();
+    std::fs::create_dir_all(fx.p("top/home/alice")).unwrap();
+    for file in ["top/file", "top/home/file", "top/home/alice/file"] {
+        std::fs::write(fx.p(file), "1").unwrap();
+    }
+    let Some(_home) = bind_mount(&fx.p("top/home"), &fx.p("top/home")) else {
+        eprintln!("NOT RUN: cannot make a bind mount here");
+        assert!(std::env::var_os("BYTESCAPE_REQUIRE_NAMESPACES").is_none());
+        return;
+    };
+    let _alice = bind_mount(&fx.p("top/home/alice"), &fx.p("top/home/alice")).unwrap();
+    let table = parse(&std::fs::read("/proc/self/mountinfo").unwrap());
+    let id = |relative: &str| {
+        at_exactly(&table, fx.p(relative).as_os_str().as_bytes())
+            .unwrap()
+            .id
+    };
+    let (home_id, alice_id) = (id("top/home"), id("top/home/alice"));
+    let host = Host::system();
+    let (plan, options) = prepare(
+        &fx.p("top"),
+        bs_ipc::Backend::Walker,
+        &[home_id, alice_id],
+        &[],
+        &host,
+    )
+    .expect("judged");
+    let mut entered = plan.mount_ids.clone();
+    entered.sort_unstable();
+    let mut want = vec![home_id, alice_id];
+    want.sort_unstable();
+    assert_eq!(entered, want, "a mount on its own folder was left out");
+    // All three files are counted, and none is marked unreadable.
+    match files_counted(plan, options, &fx.p("top")) {
+        Counted::Walked(n) => assert_eq!(n, 3),
+        Counted::Moved { error, .. } => panic!("{error}"),
+    }
+    // Control: without the mounts named, the walk stops at them.
+    let (plan, options) =
+        prepare(&fx.p("top"), bs_ipc::Backend::Walker, &[], &[], &host).expect("judged");
+    match files_counted(plan, options, &fx.p("top")) {
+        Counted::Walked(n) => assert_eq!(n, 1),
+        Counted::Moved { error, .. } => panic!("{error}"),
+    }
+}
