@@ -37,8 +37,26 @@ pub struct DataStream {
     pub resident: bool,
     /// The value's length when resident; the stream's real size otherwise.
     pub length: u64,
-    /// Bytes of clusters the attribute says it occupies; 0 when resident.
+    /// The allocated length the attribute header says; 0 when resident. For
+    /// a sparse or compressed attribute this counts the holes too (the stream
+    /// is rounded up in whole compression units), so it is not the clusters
+    /// the stream holds.
     pub allocated: u64,
+    /// The clusters the stream really holds, counted from its run list: the
+    /// runs that are not holes. 0 when resident.
+    pub held_clusters: u64,
+    /// The header's total-allocated field (offset 0x40, present on compressed
+    /// and sparse attributes): the bytes the stream holds in clusters. `None`
+    /// when the attribute has no such field.
+    pub total_allocated: Option<u64>,
+}
+
+impl DataStream {
+    /// Whether the stream holds no cluster, by the run list and by the header
+    /// field when there is one.
+    pub fn holds_no_clusters(&self) -> bool {
+        self.held_clusters == 0 && self.total_allocated.is_none_or(|t| t == 0)
+    }
 }
 
 /// How the update sequence was found in the bytes handed over.
@@ -101,7 +119,14 @@ impl RecordFacts {
                     if s.resident {
                         String::new()
                     } else {
-                        format!(", allocated {}", s.allocated)
+                        format!(
+                            ", allocated {}, holds {} clusters{}",
+                            s.allocated,
+                            s.held_clusters,
+                            s.total_allocated.map_or_else(String::new, |t| format!(
+                                " (total-allocated field {t})"
+                            ))
+                        )
                     }
                 )
             })
@@ -216,6 +241,55 @@ fn name_of(attr: &[u8]) -> Result<String, String> {
     Ok(String::from_utf16_lossy(&units))
 }
 
+/// The clusters a run list really occupies: the sum of the lengths of the
+/// runs that are not holes (a run with no offset bytes is a hole). `runs`
+/// starts at the first run and ends at the attribute's end; a list that does
+/// not end with its zero byte inside that, or that has a malformed run, is an
+/// error. Bounded by the bytes given: every run takes at least two.
+fn real_clusters(runs: &[u8]) -> Result<u64, String> {
+    let mut pos = 0usize;
+    let mut total = 0u64;
+    loop {
+        let header = *runs.get(pos).ok_or("the run list has no end")?;
+        if header == 0 {
+            return Ok(total);
+        }
+        let len_size = usize::from(header & 0x0F);
+        let off_size = usize::from(header >> 4);
+        if len_size == 0 || len_size > 8 || off_size > 8 {
+            return Err(format!(
+                "a run with length size {len_size} and offset size {off_size}"
+            ));
+        }
+        let body = pos
+            .checked_add(1)
+            .and_then(|p| p.checked_add(len_size))
+            .and_then(|p| p.checked_add(off_size))
+            .ok_or("run end")?;
+        if body > runs.len() {
+            return Err("a run is cut off".into());
+        }
+        let mut length = 0u64;
+        for (i, b) in runs
+            .get(pos + 1..pos + 1 + len_size)
+            .ok_or("run length bytes")?
+            .iter()
+            .enumerate()
+        {
+            length |= u64::from(*b) << (8 * i);
+        }
+        if length == 0 {
+            return Err("a run of length 0".into());
+        }
+        if off_size != 0 {
+            total = total
+                .checked_add(length)
+                .ok_or("the run lengths overflow")?;
+        }
+        pos = body;
+    }
+}
+
 /// Reads the data streams of the file record `raw`.
 pub fn read_record(raw: &[u8]) -> Result<RecordFacts, String> {
     let (rec, fixups) = apply_fixups(raw)?;
@@ -278,6 +352,8 @@ pub fn read_record(raw: &[u8]) -> Result<RecordFacts, String> {
                     resident: true,
                     length,
                     allocated: 0,
+                    held_clusters: 0,
+                    total_allocated: None,
                 }
             } else {
                 if attr.len() < 0x40 {
@@ -293,11 +369,28 @@ pub fn read_record(raw: &[u8]) -> Result<RecordFacts, String> {
                 } else {
                     (0, 0)
                 };
+                let runs_at =
+                    usize::from(u16_at(attr, 0x20).ok_or_else(|| bad("non-resident header"))?);
+                if runs_at < 0x40 || runs_at > attr.len() {
+                    return Err(bad("the run list starts outside its attribute"));
+                }
+                let held_clusters =
+                    real_clusters(attr.get(runs_at..).unwrap_or(&[])).map_err(|e| bad(&e))?;
+                // Compressed and sparse attributes carry the bytes they hold
+                // in clusters in a field after the common header.
+                let unit = *attr.get(0x22).ok_or_else(|| bad("non-resident header"))?;
+                let total_allocated = if unit != 0 && runs_at >= 0x48 {
+                    Some(u64_at(attr, 0x40).ok_or_else(|| bad("non-resident header"))?)
+                } else {
+                    None
+                };
                 DataStream {
                     name,
                     resident: false,
                     length,
                     allocated,
+                    held_clusters,
+                    total_allocated,
                 }
             };
             facts.streams.push(stream);

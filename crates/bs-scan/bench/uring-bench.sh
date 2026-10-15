@@ -113,7 +113,8 @@ status=0
     [ -n "$disk" ] || disk="$(basename "$src")"
     model="$(lsblk -dno MODEL "/dev/$disk" 2>/dev/null | sed 's/ *$//')"
     rota="$(cat "/sys/block/$disk/queue/rotational" 2>/dev/null || echo ?)"
-    echo "  - $ds: $fst on $src, device ${model:-unknown} ($([ "$rota" = 0 ] && echo 'non-rotational' || ([ "$rota" = 1 ] && echo rotational || echo 'type unknown')))"
+    if [ "$rota" = 0 ]; then kind='non-rotational'; elif [ "$rota" = 1 ]; then kind='rotational'; else kind='type unknown'; fi
+    echo "  - $ds: $fst on $src, device ${model:-unknown} ($kind)"
   done
   echo
   echo "## Datasets"

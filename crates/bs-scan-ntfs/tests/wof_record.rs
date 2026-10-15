@@ -48,7 +48,9 @@ fn a_resident_overlay_stream_is_read_as_resident_with_its_length() {
             name: WOF_NAME.into(),
             resident: true,
             length: 500,
-            allocated: 0
+            allocated: 0,
+            held_clusters: 0,
+            total_allocated: None,
         }
     );
     assert_eq!(f.named_length(), 500);
@@ -179,4 +181,106 @@ fn hostile_records_are_errors_and_never_panics() {
     r[used - 8..used - 4].copy_from_slice(&0u32.to_le_bytes());
     stamp(&mut r);
     assert!(read_record(&r).is_err(), "no end marker");
+}
+
+/// A non-resident `$DATA` attribute with the given run list.
+fn stream_with_runs(
+    name: &str,
+    size: u64,
+    unit: u8,
+    compressed: Option<u64>,
+    runs: &[u8],
+) -> NonRes {
+    NonRes {
+        ty: 0x80,
+        name: name.into(),
+        flags: if unit != 0 { 0x8000 } else { 0 },
+        lowest_vcn: 0,
+        highest_vcn: 0,
+        unit,
+        allocated: size.div_ceil(65536) * 65536,
+        size,
+        initialized: size,
+        compressed,
+        runs: runs.to_vec(),
+    }
+}
+
+#[test]
+fn the_clusters_a_stream_holds_come_from_its_run_list_not_its_allocated_length() {
+    // All hole: one sparse run of 16 clusters (no offset bytes). The header
+    // allocates 65536 bytes; the stream holds nothing, and its total-allocated
+    // field (a compressed attribute has one) says 0.
+    let rec = builder()
+        .nonres(&stream_with_runs("", 6384, 4, Some(0), &[0x01, 0x10, 0x00]))
+        .build();
+    let s = read_record(&rec).unwrap().streams.remove(0);
+    assert_eq!(
+        (s.allocated, s.held_clusters, s.total_allocated),
+        (65536, 0, Some(0))
+    );
+    assert!(s.holds_no_clusters());
+    // Data runs and a hole: 3 clusters at LCN 100, a hole of 13, 2 at +50.
+    let rec = builder()
+        .nonres(&stream_with_runs(
+            "",
+            6384,
+            0,
+            None,
+            &[0x11, 0x03, 0x64, 0x01, 0x0D, 0x11, 0x02, 0x32, 0x00],
+        ))
+        .build();
+    let s = read_record(&rec).unwrap().streams.remove(0);
+    assert_eq!((s.held_clusters, s.total_allocated), (5, None));
+    assert!(!s.holds_no_clusters());
+    // The header field shows bytes though the run list is all hole.
+    let rec = builder()
+        .nonres(&stream_with_runs(
+            "",
+            6384,
+            4,
+            Some(8192),
+            &[0x01, 0x10, 0x00],
+        ))
+        .build();
+    let s = read_record(&rec).unwrap().streams.remove(0);
+    assert_eq!(s.held_clusters, 0);
+    assert!(!s.holds_no_clusters(), "the total-allocated field is bytes");
+    // The summary says what the stream holds.
+    let line = read_record(&rec).unwrap().describe();
+    assert!(
+        line.contains("holds 0 clusters (total-allocated field 8192)"),
+        "{line}"
+    );
+}
+
+#[test]
+fn damaged_run_lists_are_errors() {
+    let bad: [(&str, &[u8]); 6] = [
+        // Eight bytes, so the attribute's padding adds no end byte.
+        (
+            "no end byte",
+            &[0x01, 0x10, 0x01, 0x10, 0x01, 0x10, 0x01, 0x10],
+        ),
+        (
+            "a run cut off",
+            &[0x01, 0x10, 0x01, 0x10, 0x01, 0x10, 0x41, 0x05],
+        ),
+        ("length size 0", &[0x10, 0x05, 0x00]),
+        ("length size 9", &[0x19, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0x00]),
+        ("a run of length 0", &[0x11, 0x00, 0x05, 0x00]),
+        (
+            "lengths that overflow",
+            &[
+                0x18, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x18, 0x01, 0, 0, 0, 0,
+                0, 0, 0, 0x01, 0x00,
+            ],
+        ),
+    ];
+    for (what, runs) in bad {
+        let rec = builder()
+            .nonres(&stream_with_runs("", 100, 0, None, runs))
+            .build();
+        assert!(read_record(&rec).is_err(), "{what}");
+    }
 }

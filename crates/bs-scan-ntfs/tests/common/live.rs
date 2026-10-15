@@ -13,6 +13,16 @@
 //!   from listings;
 //! * the walker recorded that it could not read the folder.
 //!
+//! Every answer from the system (its attributes, its allocation, a file's
+//! record) is asked **by the path** the reader's tree gives, opened at the
+//! time of the sorting, not by a file reference the reader recorded: the
+//! reader's tree carries none. A file replaced after the scan is therefore
+//! judged by its successor. That cannot turn a difference into an
+//! explanation by itself: each class also needs the figures to agree (the
+//! system's length, plus the record's named streams, must equal the reader's
+//! length), so a successor that does not match leaves the difference
+//! unexplained. The same holds for every by-path answer here.
+//!
 //! Anything left over is unexplained, and the test fails on it. The system is
 //! asked through [`Oracle`], so the sorting runs on every platform against a
 //! stand-in, and on Windows against the real drive.
@@ -87,7 +97,9 @@ pub trait Oracle {
     /// `path` is relative to the scanned root, `/`-separated.
     fn ask(&self, path: &str) -> Answer;
 
-    /// What the file's own record says about its data streams, fetched from
+    /// What the file's own record says about its data streams. Like every
+    /// answer here it is asked by path, not by the reader's file reference
+    /// (see the module documentation). Fetched from
     /// the volume (the system's stream listing hides the overlay layer's
     /// stream, so the record is the source that sees it). `Err` says why the
     /// record could not be had or read.
@@ -130,7 +142,7 @@ pub const B_REPARSE: &str = "The table says the file carries a reparse tag that 
 pub const B_STALE: &str = "A directory listing reports the copy of a file's times and sizes that its folder keeps. The file system updates that copy when the file is closed, not while it is open and not when a folder's contents change, so the listing can lag. Asked by opening the entry, the system gives the reader's figure.";
 pub const B_STALE_SPARSE: &str = "The walker marks a file sparse or compressed from the allocation size in the entry's copy that its folder keeps. For a hard-linked name, or a file compressed after the name was made, that copy can still say the full length, while the table (and the system, asked by opening the file) say the file holds fewer bytes than its length.";
 pub const B_COMPRESSED: &str = "A file compressed by the system's overlay layer keeps its data in a named stream (WofCompressedData) and its main stream holds no clusters. The listing-style count (main stream only) is therefore 0 for it, and the directory listing reports a stale copy, often the full length. The full count includes the named stream, and for this very file it equals the system's own allocation.";
-pub const B_RESIDENT_STREAM: &str = "The file's own record, fetched from the volume, holds the compressed-data stream (WofCompressedData) as a resident value: the bytes are inside the record, which the full scan shows as the table item, and the stream has no clusters. The reader counts 0 clusters for such a stream, as for any value held in a record. The system, asked by opening the file, reports a larger allocation (one cluster at most for this class); that is its own figure, and the record, not that figure, decides the class. Required per file: no cluster counted by the reader; the record is a base record without an attribute list, and has exactly one resident WofCompressedData value; the reader's full length is the system's main length plus the record's named stream lengths.";
+pub const B_RESIDENT_STREAM: &str = "The file's own record, fetched from the volume, holds the compressed-data stream (WofCompressedData) as a resident value: the bytes are inside the record, which the full scan shows as the table item, and the stream has no clusters. The reader counts 0 clusters for such a stream, as for any value held in a record. The system, asked by opening the file, reports a larger allocation (one cluster at most for this class); that is its own figure, and the record, not that figure, decides the class. Required per file: no cluster counted by the reader; the record shows the main stream holds none (its run list is all holes); the record is a base record without an attribute list, and has exactly one resident WofCompressedData value; the reader's full length is the system's main length plus the record's named stream lengths.";
 pub const B_SYSTEM_FOLDER: &str = "Windows writes into the System Volume Information folder while the volume is in use; the reader's time is later than the walker's and not later than the system's own answer afterwards.";
 
 /// One difference, sorted.
@@ -751,6 +763,11 @@ pub struct Audit {
     /// that holds for this very file (see [`resident_overlay_stream`]), with
     /// the evidence found.
     pub resident: Vec<(Diff, String)>,
+    /// Files the reader marks as links not followed that the system reports
+    /// with another reparse tag (not the overlay layer's): not overlay files,
+    /// so the overlay rule does not apply to them. Each is still compared
+    /// with the system's allocation.
+    pub other_reparse: Vec<(String, u32)>,
     /// Differences: the reader's full count is not the system's allocation
     /// and nothing explains it, or the system does not say the file is
     /// backed by the overlay layer.
@@ -773,6 +790,8 @@ pub struct Geometry {
 /// * the reader's full count holds no cluster for the file;
 /// * the system's allocation is above zero and at most one cluster (a larger
 ///   gap is not a stream of a few hundred bytes, whatever the record says);
+/// * the record shows that the main stream holds no cluster: its run list has
+///   only holes, and so does its total-allocated field where it has one;
 /// * the record is a base record with no attribute list (so no attribute is
 ///   somewhere else), and holds exactly one `WofCompressedData` value,
 ///   resident, of at least one byte;
@@ -806,6 +825,22 @@ pub fn resident_overlay_stream(
     }
     if facts.has_attribute_list {
         return Err("the record has an attribute list: other records may hold streams".into());
+    }
+    // The reader's 0 is the figure under audit, so the record has to show it
+    // for the main stream: the clusters the stream holds (not what its header
+    // allocates, which for a sparse or compressed stream counts holes).
+    let mains: Vec<_> = facts.streams.iter().filter(|s| s.name.is_empty()).collect();
+    let [main] = mains.as_slice() else {
+        return Err(format!(
+            "the record holds {} main streams, not exactly one",
+            mains.len()
+        ));
+    };
+    if !main.holds_no_clusters() {
+        return Err(format!(
+            "the record's main stream holds {} clusters (total-allocated field {:?}): the reader's 0 would be an under-count",
+            main.held_clusters, main.total_allocated
+        ));
     }
     let wof = facts.wof();
     let [stream] = wof.as_slice() else {
@@ -906,6 +941,24 @@ pub fn audit_overlay_files(
                     }
                 }
             }
+            // The system reports another kind of reparse point (an app
+            // execution alias, say): not an overlay file. Its bytes are still
+            // compared with the system's allocation, so a reader figure that
+            // disagrees is a difference. The tag is tallied and printed.
+            Answer::Found(t) if t.attributes & ATTR_REPARSE != 0 && t.reparse_tag != 0 => {
+                audit.other_reparse.push((text.clone(), t.reparse_tag));
+                if f.allocated != t.allocation {
+                    audit.differ.push(Diff {
+                        path: text,
+                        field: "reparse point bytes",
+                        reader: format!("full count {} of length {}", f.allocated, f.logical),
+                        other: format!(
+                            "not an overlay file: tag {:#010x}; system allocation {} (length {})",
+                            t.reparse_tag, t.allocation, t.logical
+                        ),
+                    });
+                }
+            }
             Answer::Found(t) => audit.differ.push(Diff {
                 path: text,
                 field: "overlay file bytes",
@@ -927,13 +980,30 @@ const REPORT_LIMIT: usize = 200;
 /// Prints the audit.
 pub fn report_audit(a: &Audit) {
     println!(
-        "overlay-backed files the reader marks: {}; full count equals the system's allocation for {}; stream held in the file's own record {}; not asked or gone {}; different {}",
+        "files the reader marks as links not followed: {}; of the overlay-backed ones, full count equals the system's allocation for {}, stream held in the file's own record {}; not asked or gone {}; different {}",
         a.files,
         a.agree,
         a.resident.len(),
         a.unanswered,
         a.differ.len()
     );
+    // The files that are reparse points of another kind, by tag.
+    let mut by_tag: BTreeMap<u32, usize> = BTreeMap::new();
+    for (_, tag) in &a.other_reparse {
+        *by_tag.entry(*tag).or_default() += 1;
+    }
+    println!(
+        "    not overlay files (the system reports another reparse tag): {}",
+        a.other_reparse.len()
+    );
+    for (tag, n) in &by_tag {
+        let example = a
+            .other_reparse
+            .iter()
+            .find(|(_, t)| t == tag)
+            .map_or("", |(p, _)| p.as_str());
+        println!("        tag {tag:#010x}: {n} files, for example {example:?}");
+    }
     // Every residual, with the reader's figures and what the record says.
     for (d, evidence) in a.resident.iter().take(REPORT_LIMIT) {
         println!(

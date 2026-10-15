@@ -78,12 +78,23 @@ fn stream(name: &str, resident: bool, length: u64, allocated: u64) -> DataStream
         resident,
         length,
         allocated,
+        // A stream in clusters holds what its header allocates, unless a test
+        // says otherwise.
+        held_clusters: if resident { 0 } else { allocated / 4096 },
+        total_allocated: None,
     }
 }
 
-/// The main stream of the overlay-compressed small file: a hole, no value.
+/// The main stream of an overlay-compressed file as the volume has it: all
+/// hole. Its header allocates the whole length (rounded up to compression
+/// units) but the stream holds no cluster.
 fn main_stream(length: u64) -> DataStream {
-    stream("", false, length, 0)
+    DataStream {
+        allocated: length.div_ceil(65536) * 65536,
+        held_clusters: 0,
+        total_allocated: Some(0),
+        ..stream("", false, length, 0)
+    }
 }
 
 /// A volume with 4 KiB clusters and 1 KiB table records.
@@ -1046,4 +1057,161 @@ fn a_failed_allocation_question_is_no_answer_and_not_zero() {
     assert!(allocation_answer(false, 0).is_err());
     assert!(allocation_answer(false, 4096).is_err());
     assert!(allocation_answer(true, -1).is_err());
+}
+
+/// An audit of one link the reader does not follow, for which the system gives
+/// `facts`; the reader's full count of the file is `full_allocated`.
+fn audit_link(full_allocated: u64, facts: Truth) -> Audit {
+    let mut t = Trees::new();
+    t.dir("d", OLD).file("d/alias.exe", OLD);
+    t.flags("d/alias.exe", NF, NF);
+    t.full_count("d/alias.exe", full_allocated);
+    let sys = says(&[("d/alias.exe", found(facts))]);
+    let full = t.full.clone().unwrap();
+    audit_overlay_files(&t.reader, &t.walker, &full, &sys, GEO)
+}
+
+const APP_ALIAS: u32 = 0x8000_001b;
+
+#[test]
+fn a_link_the_system_reports_with_another_tag_is_not_an_overlay_file() {
+    // An app execution alias: tag 0x8000001b, reparse attribute set, no
+    // backing. Nothing is allocated on either side. It is tallied with its
+    // tag, and it is not a difference.
+    let alias = Truth {
+        attributes: ATTR_REPARSE,
+        reparse_tag: APP_ALIAS,
+        ..truth(OLD, 0, 0)
+    };
+    let a = audit_link(0, alias.clone());
+    assert_eq!(
+        (a.files, a.agree, a.resident.len(), a.differ.len()),
+        (1, 0, 0, 0)
+    );
+    assert_eq!(a.other_reparse, [("d/alias.exe".to_owned(), APP_ALIAS)]);
+    // The tag is printed (report_audit prints without failing).
+    report_audit(&a);
+    // Its bytes are still compared: a reader figure that the system does not
+    // give is a difference, with the tag in it.
+    let a = audit_link(4096, alias);
+    assert_eq!((a.other_reparse.len(), a.differ.len()), (1, 1));
+    assert!(
+        a.differ[0]
+            .other
+            .contains("not an overlay file: tag 0x8000001b"),
+        "{}",
+        a.differ[0].other
+    );
+    assert_eq!(a.differ[0].field, "reparse point bytes");
+}
+
+#[test]
+fn a_link_the_system_does_not_show_as_a_reparse_point_stays_a_difference() {
+    // Tag 0 with the reparse attribute: the system names nothing behind it.
+    let a = audit_link(
+        0,
+        Truth {
+            attributes: ATTR_REPARSE,
+            reparse_tag: 0,
+            ..truth(OLD, 0, 0)
+        },
+    );
+    assert_eq!((a.other_reparse.len(), a.differ.len()), (0, 1));
+    assert!(a.differ[0].other.contains("names no overlay layer"));
+    // A tag without the reparse attribute: the same.
+    let a = audit_link(
+        0,
+        Truth {
+            attributes: 0,
+            reparse_tag: APP_ALIAS,
+            ..truth(OLD, 0, 0)
+        },
+    );
+    assert_eq!((a.other_reparse.len(), a.differ.len()), (0, 1));
+    // An ordinary file the reader calls a link.
+    let a = audit_link(0, truth(OLD, 10, 4096));
+    assert_eq!((a.other_reparse.len(), a.differ.len()), (0, 1));
+}
+
+#[test]
+fn an_overlay_file_is_still_judged_by_the_overlay_rule_and_not_tallied_as_other() {
+    // Tag 0x80000017 (and reparse attribute): the overlay rule applies.
+    let wof = Truth {
+        attributes: ATTR_REPARSE,
+        reparse_tag: TAG_WOF,
+        ..truth(OLD, 6384, 4096)
+    };
+    let a = audit_link(4096, wof);
+    assert_eq!((a.agree, a.other_reparse.len(), a.differ.len()), (1, 0, 0));
+}
+
+fn real_stream(
+    name: &str,
+    length: u64,
+    allocated: u64,
+    held: u64,
+    total: Option<u64>,
+) -> DataStream {
+    DataStream {
+        name: name.to_owned(),
+        resident: false,
+        length,
+        allocated,
+        held_clusters: held,
+        total_allocated: total,
+    }
+}
+
+#[test]
+fn the_main_stream_must_hold_no_cluster_by_the_record_and_the_audit_prints_what_it_holds() {
+    // The shape of the real records: the header allocates 65536 bytes (holes
+    // included), the stream holds nothing.
+    let a = audit_one(6384 + 600, 0, 4096, Ok(resident_wof(600)));
+    assert_eq!(a.resident.len(), 1);
+    let line = &a.resident[0].0.other;
+    assert!(
+        line.contains("allocated 65536, holds 0 clusters (total-allocated field 0)"),
+        "{line}"
+    );
+    // The run list shows a cluster though the reader counted none: the
+    // reader's 0 would be an under-count, and it is not explained.
+    let held = |n: u64, total: Option<u64>| {
+        record_of(&[
+            real_stream("", 6384, 65536, n, total),
+            stream(WOF_NAME, true, 600, 0),
+        ])
+    };
+    let a = audit_one(6384 + 600, 0, 4096, Ok(held(1, Some(0))));
+    assert_eq!((a.resident.len(), a.differ.len()), (0, 1));
+    assert!(
+        a.differ[0].other.contains("main stream holds 1 clusters"),
+        "{}",
+        a.differ[0].other
+    );
+    assert!(a.differ[0].other.contains("under-count"));
+    // The header's total-allocated field shows bytes though the run list says
+    // holes: not explained either.
+    let a = audit_one(6384 + 600, 0, 4096, Ok(held(0, Some(4096))));
+    assert_eq!((a.resident.len(), a.differ.len()), (0, 1));
+    assert!(
+        a.differ[0]
+            .other
+            .contains("total-allocated field Some(4096)"),
+        "{}",
+        a.differ[0].other
+    );
+    // A main stream with no such field is judged by its run list alone.
+    let a = audit_one(6384 + 600, 0, 4096, Ok(held(0, None)));
+    assert_eq!((a.resident.len(), a.differ.len()), (1, 0));
+    // Two main streams, or none: not a record to rely on.
+    let two = record_of(&[
+        main_stream(6384),
+        main_stream(6384),
+        stream(WOF_NAME, true, 600, 0),
+    ]);
+    let a = audit_one(6384 + 600, 0, 4096, Ok(two));
+    assert_eq!((a.resident.len(), a.differ.len()), (0, 1));
+    let none = record_of(&[stream(WOF_NAME, true, 600, 0)]);
+    let a = audit_one(600, 0, 4096, Ok(none));
+    assert_eq!((a.resident.len(), a.differ.len()), (0, 1));
 }
