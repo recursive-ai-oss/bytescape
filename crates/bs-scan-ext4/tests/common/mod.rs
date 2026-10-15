@@ -158,11 +158,10 @@ fn write_item(src: &Path, item: &Item) {
     match item {
         Item::Dir(_) => fs::create_dir_all(&at).expect("create dir"),
         Item::File(_, len) => {
-            // One write, so that a `sync` run by a test building its own image
-            // at the same time cannot land halfway and make the host file system
-            // allocate the file in pieces: a file with many extents carries an
-            // extra index block, which the walker would count and the image
-            // does not have.
+            // One write, which makes it less likely that a `sync` run by a test
+            // building its own image at the same time lands halfway and makes
+            // the host file system allocate the file in pieces. It cannot rule
+            // it out: see `explain_host_extent_index`.
             let mut f = File::create(&at).expect("create file");
             let mut data = Vec::new();
             let mut left = *len;
@@ -635,6 +634,67 @@ pub fn apply_exceptions<'a>(
         rest.push(d);
     }
     (allowed, rest)
+}
+
+/// Allocated-size differences that the host's layout of the walker's source
+/// copy explains, taken out of `diffs`; each one is printed with its reason.
+///
+/// The walker scans a copy of the tree on the host file system, and the
+/// reader scans the image `mke2fs` made from it. On an ext4 host, a regular
+/// file the host allocated in more than four pieces (the inode holds four
+/// extents) carries one extra block, the extent tree's leaf, in its block
+/// count. How a host splits a file depends on what else is writing to it at
+/// the time and on how fragmented its free space is, so the same fixture is
+/// sometimes one block larger to the walker than the contiguous file in the
+/// image. (Measured on an ext4 host: files written the same way and then
+/// synced showed 5864 sectors, or 5872 once the host had split them into five
+/// or more extents.) The image is not wrong: `debugfs` checks every reader
+/// size against the image exactly, in the same tests.
+///
+/// A difference is explained only when all of this holds, so that nothing
+/// else is let through: the host file system is ext4; the path is a regular
+/// file on the host; the reader's size is at least five blocks, since fewer
+/// cannot be in five extents; and the walker's size is the reader's plus
+/// exactly one host block. Any other size difference stays.
+pub fn explain_host_extent_index(src: &Path, diffs: Vec<Diff>) -> Vec<Diff> {
+    // Only ext4 counts an extent tree's blocks this way.
+    let host_is_ext4 = stat_f(src, "%T").is_some_and(|t| t == "ext2/ext3");
+    let host_block: u64 = if host_is_ext4 {
+        stat_f(src, "%S").and_then(|t| t.parse().ok()).unwrap_or(0)
+    } else {
+        0
+    };
+    let mut rest = Vec::new();
+    for d in diffs {
+        let sizes = (d.reader.parse::<u64>().ok(), d.other.parse::<u64>().ok());
+        if d.field == "allocated"
+            && host_block != 0
+            && let (Some(reader), Some(walker)) = sizes
+            && walker == reader.saturating_add(host_block)
+            && reader >= host_block.saturating_mul(5)
+            && fs::symlink_metadata(src.join(os(d.path.as_bytes()))).is_ok_and(|m| m.is_file())
+        {
+            eprintln!(
+                "explained: {:?} allocated: the walker counted {walker} B and the image holds \
+                 {reader} B; the host copy is at least five blocks, so a host that split it into \
+                 more than four extents counts the extent tree's leaf block ({host_block} B) too",
+                d.path
+            );
+            continue;
+        }
+        rest.push(d);
+    }
+    rest
+}
+
+/// One field of `stat -f`, for the file system holding `path`.
+fn stat_f(path: &Path, format: &str) -> Option<String> {
+    let out = Command::new("stat")
+        .args(["-f", "-c", format])
+        .arg(path)
+        .output()
+        .ok()?;
+    Some(String::from_utf8(out.stdout).ok()?.trim().to_owned())
 }
 
 /// Fails the test with every uncovered difference listed.

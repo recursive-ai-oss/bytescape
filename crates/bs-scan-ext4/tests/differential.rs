@@ -151,6 +151,7 @@ fn run_case(name: &str, spec: ImageSpec, extra: &[Exception]) -> (Fixture, Image
         }
         rest.push(d);
     }
+    let rest = explain_host_extent_index(&fixture.src, rest);
     assert_no_diffs(&format!("{name}: reader vs walker"), &rest);
 
     // The oracle: debugfs's own view of every plain path, for sizes the
@@ -447,4 +448,48 @@ fn mount_points_are_empty_and_what_lies_under_them_is_counted() {
     // and the files' blocks.
     assert_eq!(hidden.dirs, 2);
     assert!(hidden.allocated >= 8192 + 2 * 4096);
+}
+
+#[test]
+fn only_one_extra_block_on_a_large_host_file_is_explained() {
+    let items = vec![dir("d"), file("big", 100_000), file("small", 9000)];
+    let fixture = build("hostlayout", &ImageSpec::new(items));
+    let block = 4096;
+    let diff = |path: &str, reader: u64, walker: u64| Diff {
+        path: path.into(),
+        field: "allocated",
+        reader: reader.to_string(),
+        other: walker.to_string(),
+    };
+    let kept = |d: Diff| explain_host_extent_index(&fixture.src, vec![d]).len();
+    let host_is_ext4 = run(std::process::Command::new("stat")
+        .args(["-f", "-c", "%T"])
+        .arg(&fixture.src))
+    .trim()
+        == "ext2/ext3";
+    // One extra block on a regular file of five blocks or more: explained on
+    // an ext4 host, and on no other.
+    assert_eq!(
+        kept(diff("big", 25 * block, 26 * block)),
+        usize::from(!host_is_ext4)
+    );
+    assert_eq!(
+        kept(diff("big", 5 * block, 6 * block)),
+        usize::from(!host_is_ext4)
+    );
+    // Anything but exactly one block more is not.
+    assert_eq!(kept(diff("big", 25 * block, 27 * block)), 1);
+    assert_eq!(kept(diff("big", 25 * block, 25 * block)), 1);
+    assert_eq!(kept(diff("big", 25 * block, 26 * block - 512)), 1);
+    assert_eq!(kept(diff("big", 26 * block, 25 * block)), 1);
+    // A file too small to be in five extents is not explained.
+    assert_eq!(kept(diff("small", 4 * block, 5 * block)), 1);
+    // A directory is not a file.
+    assert_eq!(kept(diff("d", 25 * block, 26 * block)), 1);
+    // Other fields are never touched.
+    let mut other = diff("big", 25 * block, 26 * block);
+    other.field = "logical";
+    assert_eq!(kept(other), 1);
+    // A path that is not on the host is not explained.
+    assert_eq!(kept(diff("missing", 25 * block, 26 * block)), 1);
 }
