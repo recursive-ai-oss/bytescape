@@ -39,6 +39,35 @@ fn effective_uid() -> u32 {
     fs::metadata("/proc/self").unwrap().uid()
 }
 
+/// Checks that every folder above `path` can be searched by anyone, which the
+/// ordinary user needs to reach a file inside. Nothing is changed.
+fn searchable_above(path: &Path) -> Result<(), String> {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d == Path::new("/") {
+            break;
+        }
+        let mode = fs::metadata(d)
+            .map_err(|e| e.to_string())?
+            .permissions()
+            .mode();
+        if mode & 0o001 == 0 {
+            return Err(format!(
+                "{} cannot be searched by an ordinary user; use a temporary folder that can (TMPDIR)",
+                d.display()
+            ));
+        }
+        dir = d.parent();
+    }
+    Ok(())
+}
+
+/// Makes `dir` belong to `uid` and `gid` and closes it to everyone else.
+fn close_to_everyone_but(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    std::os::unix::fs::chown(dir, Some(uid), Some(gid))?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+}
+
 struct Root {
     fx: Fixture,
     su_env: std::path::PathBuf,
@@ -53,23 +82,19 @@ fn setup(label: &str) -> Result<Root, String> {
         return Err("not running as the superuser".into());
     }
     let fx = Fixture::new(label);
-    // The ordinary user must be able to reach the stand-in.
-    let mut dir = Some(fx.path());
-    while let Some(d) = dir {
-        let mode = fs::metadata(d)
-            .map_err(|e| e.to_string())?
-            .permissions()
-            .mode();
-        if mode & 0o001 == 0 {
-            fs::set_permissions(d, fs::Permissions::from_mode(mode | 0o755))
-                .map_err(|_| format!("{} cannot be searched by an ordinary user", d.display()))?;
-        }
-        dir = d.parent().filter(|p| *p != Path::new("/"));
-    }
+    // The folder made for this test is ours to open up. The folders above it
+    // are not: the ordinary user must be able to search them already, and if
+    // not the test says so and does not run, instead of changing them.
+    fs::set_permissions(fx.path(), fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    searchable_above(fx.path())?;
     let su_env = fx.p("su/env");
     fs::create_dir_all(su_env.parent().unwrap()).map_err(|e| e.to_string())?;
     fs::copy("/usr/bin/env", &su_env).map_err(|e| format!("no /usr/bin/env: {e}"))?;
     fs::set_permissions(&su_env, fs::Permissions::from_mode(0o4755)).map_err(|e| e.to_string())?;
+    // Only the ordinary user the stand-in acts for can reach it: a copy of
+    // `env` that is set-user-id root would give anyone who could start it a
+    // root shell, for as long as it exists.
+    close_to_everyone_but(su_env.parent().unwrap(), USER, USER).map_err(|e| e.to_string())?;
     // A file system mounted `nosuid` ignores the bit.
     let name = std::ffi::CString::new(su_env.to_str().unwrap()).unwrap();
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
@@ -283,4 +308,36 @@ fn the_helper_refuses_a_parent_that_is_not_the_user_it_was_told_about() {
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(3));
+}
+
+// ------------------------------------------- the stand-in's own safety
+
+#[test]
+fn the_stand_in_folder_is_closed_to_everyone_but_the_user_it_acts_for() {
+    // Runs without root: the folder is given to its current owner, which is
+    // what changing the owner to the ordinary user does for the real run.
+    let fx = Fixture::new("stand-in-closed");
+    fx.mkdir("su");
+    fs::set_permissions(fx.p("su"), fs::Permissions::from_mode(0o755)).unwrap();
+    let before = fs::metadata(fx.p("su")).unwrap();
+    close_to_everyone_but(&fx.p("su"), before.uid(), before.gid()).unwrap();
+    let after = fs::metadata(fx.p("su")).unwrap();
+    assert_eq!(after.permissions().mode() & 0o777, 0o700);
+    assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+}
+
+#[test]
+fn the_folders_above_the_stand_in_are_checked_and_never_changed() {
+    let fx = Fixture::new("stand-in-above");
+    fx.mkdir("a/b");
+    let closed = fx.p("a");
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o700)).unwrap();
+    let before = fs::metadata(&closed).unwrap().permissions().mode();
+    let error = searchable_above(&fx.p("a/b/c")).unwrap_err();
+    assert!(error.contains("cannot be searched"), "{error}");
+    assert!(error.contains("TMPDIR"), "{error}");
+    // The check changed nothing.
+    assert_eq!(fs::metadata(&closed).unwrap().permissions().mode(), before);
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
+    searchable_above(&fx.p("a/b/c")).unwrap();
 }

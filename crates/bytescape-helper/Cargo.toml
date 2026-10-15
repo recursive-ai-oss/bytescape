@@ -29,12 +29,15 @@ bs-scan = { path = "../bs-scan" }
 bs-tree = { path = "../bs-tree" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+bs-scan-btrfs = { path = "../bs-scan-btrfs" }
 bs-scan-ext4 = { path = "../bs-scan-ext4" }
+bs-scan-xfs = { path = "../bs-scan-xfs" }
 libc = "0.2"
 
 # Drive roots and the Windows folder, for the protected-path table. The pipe
 # itself is opened by bs-ipc. No networking feature is enabled.
 [target.'cfg(windows)'.dependencies]
+bs-scan-ntfs = { path = "../bs-scan-ntfs" }
 windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
@@ -45,6 +48,8 @@ windows-sys = { version = "0.61", default-features = false, features = [
 # path from launch to answer. It is not part of the helper's dependencies.
 [dev-dependencies]
 bs-platform = { path = "../bs-platform" }
+# The unit tests of the reader choice run the Windows rules on every system.
+bs-scan-ntfs = { path = "../bs-scan-ntfs" }
 
 # The Windows tests make a pipe like the interface does.
 [target.'cfg(windows)'.dev-dependencies]

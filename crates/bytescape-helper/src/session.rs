@@ -264,8 +264,8 @@ fn serve_delete<W: Write>(
 ) -> Exit {
     // Checked before any item is looked at: a table that cannot be trusted
     // judges nothing.
-    if let Some(why) = judge.refusal() {
-        return match out.error(ErrorCode::Refused, why) {
+    if let Some((code, why)) = judge.refusal() {
+        return match out.error(code, why) {
             Ok(()) => Exit::Failed(why.to_owned()),
             Err(exit) => exit,
         };

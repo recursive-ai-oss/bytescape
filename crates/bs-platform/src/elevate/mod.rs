@@ -61,13 +61,70 @@ mod linux;
 #[cfg(windows)]
 mod windows;
 
+/// Why elevation cannot be used on this system, in terms the interface can
+/// explain. Where the interface offers a full scan only when it can work, it
+/// hides the offer for most of these; for the two that are about the edition
+/// the program came in ([`Unavailable::AppImage`] and
+/// [`Unavailable::SnapConfined`]) it should say so where the offer would be,
+/// because the way to get it is to install another edition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Unavailable {
+    /// The system has no elevation service (`pkexec` is not installed).
+    NoElevationService,
+    /// The helper is not installed where it is expected, or is not the kind
+    /// of file that can be started.
+    HelperNotInstalled,
+    /// The helper, or a folder on its way, can be changed by someone other
+    /// than the administrator. Starting it with administrator rights would
+    /// run whatever such a person put there, so it is not started.
+    HelperNotTrusted,
+    /// This program runs from an AppImage. An AppImage is mounted for the
+    /// account that started it, and the administrator's helper cannot be run
+    /// from there.
+    AppImage,
+    /// This program runs in a snap with strict confinement, which cannot
+    /// start programs with administrator rights.
+    SnapConfined,
+    /// This program already runs with administrator rights, and never starts
+    /// a helper from there.
+    AlreadyElevated,
+    /// Elevation is not supported on this system.
+    UnsupportedSystem,
+    /// Something else prevented it; the text says what.
+    Other(&'static str),
+}
+
+impl Unavailable {
+    /// A sentence for the interface to show where the offer would have been.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::NoElevationService => {
+                "This computer has no service for asking for administrator rights (pkexec)."
+            }
+            Self::HelperNotInstalled => "The helper that reads the whole drive is not installed.",
+            Self::HelperNotTrusted => {
+                "The helper that reads the whole drive is in a place that other accounts can change, so it is not started with administrator rights."
+            }
+            Self::AppImage => {
+                "A full scan needs a helper that runs with administrator rights, and an AppImage cannot provide one: it is mounted for your account only. The .deb package can."
+            }
+            Self::SnapConfined => {
+                "System folders can't be scanned in this edition: a snap with strict confinement cannot ask for administrator rights."
+            }
+            Self::AlreadyElevated => "This program is already running with administrator rights.",
+            Self::UnsupportedSystem => "Administrator scans are not supported on this system.",
+            Self::Other(text) => text,
+        }
+    }
+}
+
 /// Why the helper could not be used.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ElevateError {
-    /// Elevation is not available here: no `pkexec`, the helper is not
-    /// installed where it is expected, or this process is already elevated.
-    Unavailable(&'static str),
+    /// Elevation is not available here; the reason says why.
+    Unavailable(Unavailable),
     /// The user declined the prompt, or is not allowed to authorize it.
     Declined,
     /// The helper could not be started.
@@ -83,7 +140,9 @@ pub enum ElevateError {
 impl std::fmt::Display for ElevateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unavailable(why) => write!(f, "elevation is not available: {why}"),
+            Self::Unavailable(why) => {
+                write!(f, "elevation is not available: {}", why.explanation())
+            }
             Self::Declined => f.write_str("the request for administrator rights was declined"),
             Self::Launch(e) => write!(f, "the helper could not be started: {e}"),
             Self::PeerNotVerified(why) => {
@@ -146,18 +205,25 @@ pub struct Elevation {
     helper: PathBuf,
     #[cfg(unix)]
     pkexec: Option<PathBuf>,
+    /// The user and top folder that the helper's path must belong to, checked
+    /// again at every launch. Set for the helpers this system installs; a
+    /// helper the caller names (a portable copy) is the caller's choice.
+    #[cfg(target_os = "linux")]
+    trusted: Option<linux::Trust>,
 }
 
 impl Elevation {
     /// The helper that is installed with this program: the packaged location on
-    /// Linux, the program beside this one on Windows.
+    /// Linux (or, in a snap with classic confinement, the one inside the
+    /// snap), the program beside this one on Windows.
+    ///
+    /// Fails with the reason when elevation cannot be used from here: inside
+    /// an AppImage or a strictly confined snap, for example. A helper that is
+    /// missing from the packaged location is found out when it is launched.
     pub fn system() -> Result<Self, ElevateError> {
         #[cfg(target_os = "linux")]
         {
-            Ok(Self {
-                helper: PathBuf::from(linux::INSTALLED_HELPER),
-                pkexec: None,
-            })
+            linux::system()
         }
         #[cfg(windows)]
         {
@@ -167,7 +233,7 @@ impl Elevation {
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
-            Err(ElevateError::Unavailable("not supported on this system"))
+            Err(ElevateError::Unavailable(Unavailable::UnsupportedSystem))
         }
     }
 
@@ -179,6 +245,8 @@ impl Elevation {
             helper: helper.into(),
             #[cfg(unix)]
             pkexec: None,
+            #[cfg(target_os = "linux")]
+            trusted: None,
         }
     }
 
@@ -247,7 +315,7 @@ impl Elevation {
         #[cfg(not(any(target_os = "linux", windows)))]
         let launched: Launched = {
             let _ = (mode, nonce);
-            return Err(ElevateError::Unavailable("not supported on this system"));
+            return Err(ElevateError::Unavailable(Unavailable::UnsupportedSystem));
         };
         let writer = SharedWriter::new(launched.writer);
         let client = match Client::connect(launched.reader, writer.clone(), nonce) {
@@ -373,7 +441,7 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> Result<(), ElevateError> {
     #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = buf;
-        Err(ElevateError::Unavailable("not supported on this system"))
+        Err(ElevateError::Unavailable(Unavailable::UnsupportedSystem))
     }
 }
 

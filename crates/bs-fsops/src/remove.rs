@@ -152,6 +152,11 @@ pub struct Meta {
     stat: Stat,
     /// `None` when the kernel gave no mount ID (before Linux 5.8).
     pub mnt: Option<u64>,
+    /// When the file was created, in nanoseconds since 1970, when the
+    /// filesystem keeps it and the kernel reports it (Linux 4.11 and later).
+    /// Unlike an inode number it is not handed on to the next file that takes
+    /// the inode.
+    pub birth: Option<u64>,
 }
 
 impl std::ops::Deref for Meta {
@@ -161,7 +166,7 @@ impl std::ops::Deref for Meta {
     }
 }
 
-const WANT: libc::c_uint = libc::STATX_BASIC_STATS | libc::STATX_MNT_ID;
+const WANT: libc::c_uint = libc::STATX_BASIC_STATS | libc::STATX_MNT_ID | libc::STATX_BTIME;
 
 fn statx_raw(dir: RawFd, path: *const libc::c_char, flags: libc::c_int) -> io::Result<Meta> {
     retry(|| {
@@ -195,8 +200,20 @@ fn statx_raw(dir: RawFd, path: *const libc::c_char, flags: libc::c_int) -> io::R
                 allocated: raw.stx_blocks.saturating_mul(512),
             },
             mnt: (raw.stx_mask & libc::STATX_MNT_ID != 0).then_some(raw.stx_mnt_id),
+            birth: (raw.stx_mask & libc::STATX_BTIME != 0)
+                .then(|| birth_nanos(raw.stx_btime.tv_sec, raw.stx_btime.tv_nsec))
+                .flatten(),
         })
     })
+}
+
+/// A creation time as nanoseconds since 1970. `None` for a time before 1970 or
+/// one that does not fit in 64 bits, which is taken as not reported.
+fn birth_nanos(seconds: i64, nanos: u32) -> Option<u64> {
+    let total = i128::from(seconds)
+        .checked_mul(1_000_000_000)?
+        .checked_add(i128::from(nanos))?;
+    u64::try_from(total).ok()
 }
 
 /// The status of `name` inside `dir`, not following a final link.
@@ -366,11 +383,19 @@ pub fn measure_entry(parent: RawFd, name: &CStr, bound: Boundary, depth: usize, 
     }
 }
 
-/// The identity of a status read.
-pub fn identity_of(stat: &Stat) -> crate::Identity {
+/// The identity of a status read: the inode in the low 64 bits and, where the
+/// filesystem reports it, the creation time in the high 64 bits.
+///
+/// The inode alone says little: a file that is deleted and replaced often gets
+/// the same inode number back, so a replacement made after the item was looked
+/// at would look like the item. The creation time of the new file is a later
+/// time. It is as fine as the filesystem's clock, a few milliseconds on
+/// common ones, so a replacement within the same tick is not told apart; that
+/// is still a far smaller window than the inode alone leaves open.
+pub fn identity_of(meta: &Meta) -> crate::Identity {
     crate::Identity {
-        volume: stat.dev,
-        file: u128::from(stat.ino),
+        volume: meta.dev,
+        file: u128::from(meta.ino) | (u128::from(meta.birth.unwrap_or(0)) << 64),
     }
 }
 

@@ -303,19 +303,17 @@ pub(crate) fn match_any(
     }
 }
 
-/// The most parts of a raw path that are matched against patterns. Longer
-/// paths are matched on their first parts only, which is enough for every
-/// pattern (they have at most a handful of parts) except a name deeper than
-/// this, which is then not seen.
-pub(crate) const MAX_PARTS: usize = 48;
+/// How many parts of a path a [`Split`] keeps without allocating. Every path
+/// a person has is shorter; a longer one is kept on the heap, whole.
+pub(crate) const INLINE_PARTS: usize = 48;
 
-/// The first parts of a raw path and its last part.
+/// The parts of a raw path and its last part.
 pub(crate) struct Split<'a> {
     pub style: Style,
-    pub parts: [&'a [u8]; MAX_PARTS],
-    pub count: usize,
-    /// `parts` holds the whole path.
-    pub complete: bool,
+    inline: [&'a [u8]; INLINE_PARTS],
+    /// Every part, when there are more than fit inline; empty otherwise.
+    long: Vec<&'a [u8]>,
+    count: usize,
     pub last: &'a [u8],
 }
 
@@ -324,25 +322,33 @@ impl<'a> Split<'a> {
         let (style, iter) = split(path);
         let mut out = Split {
             style,
-            parts: [&[]; MAX_PARTS],
+            inline: [&[]; INLINE_PARTS],
+            long: Vec::new(),
             count: 0,
-            complete: true,
             last: &[],
         };
         for part in iter {
             out.last = part;
-            if out.count < MAX_PARTS {
-                out.parts[out.count] = part;
-                out.count += 1;
+            if let Some(slot) = out.inline.get_mut(out.count) {
+                *slot = part;
             } else {
-                out.complete = false;
+                if out.long.is_empty() {
+                    out.long.extend_from_slice(&out.inline);
+                }
+                out.long.push(part);
             }
+            out.count += 1;
         }
         out
     }
 
+    /// All the parts. A name is never missed for being deep in the path.
     pub fn slice(&self) -> &[&'a [u8]] {
-        &self.parts[..self.count]
+        if self.long.is_empty() {
+            &self.inline[..self.count]
+        } else {
+            &self.long
+        }
     }
 }
 

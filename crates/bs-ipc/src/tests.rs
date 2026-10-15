@@ -768,3 +768,61 @@ fn writing_to_a_closed_peer_is_an_error_not_a_panic() {
         Err(WriteError::Io(_))
     ));
 }
+
+#[test]
+fn every_fallback_and_error_code_round_trips_and_an_unknown_one_is_refused() {
+    // A peer built before a code existed reads it as an unknown value and
+    // refuses the frame (a decode error), which ends the conversation; it
+    // never takes it for another code.
+    for fallback in [
+        Fallback::None,
+        Fallback::Unavailable,
+        Fallback::TooLarge,
+        Fallback::PartialMount,
+        Fallback::NotSupported,
+        Fallback::MountNotPlaced,
+    ] {
+        let done = Message::ScanDone(ScanDone {
+            backend: Backend::Btrfs,
+            end: ScanEnd::Completed,
+            fallback,
+            progress: progress(),
+        });
+        let bytes = frame(&done);
+        assert_eq!(
+            decode_body(&bytes[4..], Direction::ToInterface).unwrap(),
+            done
+        );
+        // Frame body: version, kind, backend, end, then the fallback code.
+        let mut damaged = bytes[4..].to_vec();
+        damaged[4] = 99;
+        assert!(matches!(
+            decode_body(&damaged, Direction::ToInterface),
+            Err(DecodeError::BadValue)
+        ));
+    }
+    for code in [
+        ErrorCode::BadRequest,
+        ErrorCode::ScanFailed,
+        ErrorCode::Unsupported,
+        ErrorCode::Refused,
+        ErrorCode::Internal,
+        ErrorCode::NoAccount,
+    ] {
+        let error = Message::Error(ErrorReport {
+            code,
+            message: "x".into(),
+        });
+        let bytes = frame(&error);
+        assert_eq!(
+            decode_body(&bytes[4..], Direction::ToInterface).unwrap(),
+            error
+        );
+        let mut damaged = bytes[4..].to_vec();
+        damaged[2] = 7;
+        assert!(matches!(
+            decode_body(&damaged, Direction::ToInterface),
+            Err(DecodeError::BadValue)
+        ));
+    }
+}

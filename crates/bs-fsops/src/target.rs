@@ -233,13 +233,20 @@ mod tests {
         let target = Target::open(&f.path().join("a/b/file")).unwrap();
         assert_eq!(target.real_path(), f.path().join("a/b/file"));
         let meta = fs::symlink_metadata(f.path().join("a/b/file")).unwrap();
-        assert_eq!(
-            target.identity(),
-            Identity {
-                volume: meta.dev(),
-                file: u128::from(meta.ino())
-            }
-        );
+        let identity = target.identity();
+        assert_eq!(identity.volume, meta.dev());
+        // The inode is in the low 64 bits.
+        assert_eq!(identity.file & u128::from(u64::MAX), u128::from(meta.ino()));
+        // The creation time, where the filesystem keeps it, is in the high 64.
+        if let Ok(created) = meta.created() {
+            let nanos = created
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            assert_eq!(identity.file >> 64, nanos);
+        } else {
+            assert_eq!(identity.file >> 64, 0);
+        }
         assert!(!target.on_mount_point());
     }
 
@@ -252,7 +259,7 @@ mod tests {
         let link = Target::open(&f.path().join("alias")).unwrap();
         assert_eq!(link.real_path(), f.path().join("alias"));
         assert_ne!(
-            link.identity().file,
+            link.identity().file & u128::from(u64::MAX),
             u128::from(fs::metadata(f.path().join("real")).unwrap().ino())
         );
         // A link in the middle is followed, and the real place says so.
@@ -302,6 +309,63 @@ mod tests {
         fs::rename(f.path().join("work/new"), f.path().join("work/file")).unwrap();
         assert!(matches!(target.delete(), Err(DeleteError::Replaced)));
         assert!(f.path().join("work/file").exists());
+    }
+
+    #[test]
+    fn an_item_keeps_its_identity_when_it_is_changed_and_renamed_but_not_replaced() {
+        let f = Fixture::new("target-stable");
+        f.write("work/file", "old");
+        let before = Target::open(&f.path().join("work/file"))
+            .unwrap()
+            .identity();
+        // Writing, changing the mode and the times, and moving to another name
+        // in the same folder do not make it another file.
+        fs::write(f.path().join("work/file"), "much longer than before").unwrap();
+        fs::set_permissions(
+            f.path().join("work/file"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        fs::rename(f.path().join("work/file"), f.path().join("work/renamed")).unwrap();
+        let after = Target::open(&f.path().join("work/renamed"))
+            .unwrap()
+            .identity();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_replacement_that_gets_the_same_inode_back_is_still_caught() {
+        // Deleting a file and creating another usually hands the inode number
+        // on, so the number alone cannot tell the two apart. Try until the
+        // filesystem does so (it does at once on ext4); the creation time
+        // then has to.
+        let f = Fixture::new("target-reuse");
+        let mut reused = false;
+        for attempt in 0..40 {
+            let name = format!("work/file{attempt}");
+            f.write(&name, "old");
+            let target = Target::open(&f.path().join(&name)).unwrap();
+            let old = fs::symlink_metadata(f.path().join(&name)).unwrap();
+            fs::remove_file(f.path().join(&name)).unwrap();
+            // Filesystem clocks tick every few milliseconds.
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            f.write(&name, "new, and not what was judged");
+            let new = fs::symlink_metadata(f.path().join(&name)).unwrap();
+            if new.ino() != old.ino() {
+                continue;
+            }
+            reused = true;
+            if old.created().is_err() {
+                println!("NOT RUN: this filesystem does not report creation times");
+                return;
+            }
+            assert!(matches!(target.delete(), Err(DeleteError::Replaced)));
+            assert!(f.path().join(&name).exists());
+            break;
+        }
+        if !reused {
+            println!("NOT RUN: this filesystem did not hand an inode number on");
+        }
     }
 
     #[test]

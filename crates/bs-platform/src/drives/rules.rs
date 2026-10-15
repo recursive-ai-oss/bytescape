@@ -211,6 +211,12 @@ pub(crate) fn is_under(path: &[u8], mount_point: &[u8]) -> bool {
 /// For each mount of one filesystem (in representative order), whether another
 /// mount already shows its folder: that mount's root contains this one's, or
 /// is the same and comes earlier in the list.
+///
+/// A mount that is attached on the very folder the other mount would show it
+/// in is not covered: the top level of a btrfs filesystem mounted at `/` shows
+/// the subvolume `home` as the folder `/home`, and the mount of that subvolume
+/// at `/home` hides that folder. The files are reachable only through the
+/// second mount, so a scan has to enter it.
 pub(crate) fn covered_flags(members: &[MountEntry]) -> Vec<bool> {
     members
         .iter()
@@ -220,9 +226,36 @@ pub(crate) fn covered_flags(members: &[MountEntry]) -> Vec<bool> {
                 other_index != index
                     && is_under(&member.root, &other.root)
                     && (member.root != other.root || other_index < index)
+                    && !hides_its_own_folder(member, other)
             })
         })
         .collect()
+}
+
+/// Whether `mount` is attached inside the tree that `other` shows, on the
+/// folder where `other` shows `mount`'s own folder (or above it). Then
+/// `other` cannot be what shows that folder: `mount` is in the way.
+fn hides_its_own_folder(mount: &MountEntry, other: &MountEntry) -> bool {
+    // `mount` has to be attached somewhere inside `other`'s tree.
+    if mount.mount_point == other.mount_point || !is_under(&mount.mount_point, &other.mount_point) {
+        return false;
+    }
+    // Where `other` shows the folder `mount.root`.
+    let relative = if other.root == b"/" {
+        mount.root.as_slice()
+    } else {
+        mount.root.get(other.root.len()..).unwrap_or_default()
+    };
+    let mut shown_at = if other.mount_point == b"/" {
+        Vec::new()
+    } else {
+        other.mount_point.clone()
+    };
+    shown_at.extend_from_slice(relative);
+    if shown_at.is_empty() {
+        shown_at.push(b'/');
+    }
+    is_under(&shown_at, &mount.mount_point)
 }
 
 /// Finds the candidate that holds a folder.
@@ -555,6 +588,58 @@ mod tests {
         let flags = covered_flags(&btrfs.members);
         assert!(!flags[0]);
         assert!(flags[1..].iter().all(|f| *f));
+    }
+
+    #[test]
+    fn a_subvolume_mounted_on_its_own_folder_is_not_covered_by_the_top_level() {
+        // The top level of the filesystem (subvolume 5) is `/`; the subvolume
+        // `home` is a folder of it and is also mounted on that very folder.
+        let text = "\
+29 1 0:27 / / rw - btrfs /dev/sda3 rw,subvolid=5,subvol=/
+41 29 0:27 /home /home rw - btrfs /dev/sda3 rw,subvolid=257,subvol=/home
+42 29 0:27 /var/log /var/log rw - btrfs /dev/sda3 rw,subvolid=258,subvol=/var/log
+43 29 0:27 /home/alice/src /srv/src rw - btrfs /dev/sda3 rw,subvolid=259,subvol=/home/alice/src
+44 29 0:27 /home /mnt/home-again rw - btrfs /dev/sda3 rw,subvolid=257,subvol=/home
+";
+        let entries = parse(text.as_bytes());
+        let points: Vec<_> = entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.mount_point).into_owned())
+            .collect();
+        assert_eq!(
+            points,
+            ["/", "/home", "/var/log", "/srv/src", "/mnt/home-again"]
+        );
+        // `/home` and `/var/log` are mounted on the folders where `/` shows
+        // them, so the top level does not cover them. `/srv/src` shows a
+        // folder that the other two show already, and `/mnt/home-again` shows
+        // `/home` a second time: both are repeats.
+        assert_eq!(
+            covered_flags(&entries),
+            vec![false, false, false, true, true]
+        );
+    }
+
+    #[test]
+    fn mounts_that_are_not_in_the_way_of_what_covers_them_are_still_covered() {
+        // A subvolume mounted deeper than its own folder is still reachable
+        // through the top level.
+        let text = "\
+1 0 0:27 / / rw - btrfs /dev/sda3 rw
+2 1 0:27 /data /srv/data rw - btrfs /dev/sda3 rw
+";
+        assert_eq!(covered_flags(&parse(text.as_bytes())), vec![false, true]);
+        // The top level mounted below the others covers them where they are
+        // not in its way.
+        let text = "\
+1 0 0:27 /@ / rw - btrfs /dev/sda3 rw
+2 1 0:27 /@home /home rw - btrfs /dev/sda3 rw
+3 1 0:27 / /data rw - btrfs /dev/sda3 rw
+";
+        assert_eq!(
+            covered_flags(&parse(text.as_bytes())),
+            vec![true, true, false]
+        );
     }
 
     #[test]

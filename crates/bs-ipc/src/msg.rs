@@ -144,6 +144,9 @@ pub enum Fallback {
     PartialMount,
     /// The reader cannot read this filesystem.
     NotSupported,
+    /// A mount of the drive could not be placed in the reader's view of the
+    /// filesystem, so a tree from it would not match what is mounted.
+    MountNotPlaced,
 }
 
 /// A scan finished.
@@ -171,6 +174,11 @@ pub enum ErrorCode {
     Refused,
     /// Something went wrong inside the helper.
     Internal,
+    /// An administrator delete cannot be judged on this computer: the
+    /// account that asked has no entry in the local account database, so the
+    /// helper does not know which folders are the user's own to protect.
+    /// Nothing was deleted.
+    NoAccount,
 }
 
 impl ErrorCode {
@@ -181,6 +189,7 @@ impl ErrorCode {
             ErrorCode::Unsupported => 3,
             ErrorCode::Refused => 4,
             ErrorCode::Internal => 5,
+            ErrorCode::NoAccount => 6,
         }
     }
 
@@ -191,6 +200,7 @@ impl ErrorCode {
             3 => ErrorCode::Unsupported,
             4 => ErrorCode::Refused,
             5 => ErrorCode::Internal,
+            6 => ErrorCode::NoAccount,
             _ => return None,
         })
     }

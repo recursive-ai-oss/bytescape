@@ -16,6 +16,7 @@ use crate::delete::Judge;
 use crate::scan::Host;
 use crate::session::{self, Config, Exit};
 use crate::{EXIT_PEER, EXIT_USAGE};
+use bs_ipc::ErrorCode;
 use bs_knowledge::{Environment, Knowledge};
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd};
@@ -80,18 +81,41 @@ fn harden() {
     }
 }
 
-/// The home folder of `uid` from the text of `/etc/passwd`.
-pub(crate) fn home_in_passwd(text: &str, uid: u32) -> Option<String> {
-    text.lines().find_map(|line| {
-        let mut fields = line.split(':');
-        let _name = fields.next()?;
-        let _password = fields.next()?;
-        let found: u32 = fields.next()?.parse().ok()?;
-        let _gid = fields.next()?;
-        let _comment = fields.next()?;
-        let home = fields.next()?;
-        (found == uid && home.starts_with('/')).then(|| home.to_owned())
-    })
+/// What the account file says about one user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Account {
+    /// The user's home folder, as the bytes of the file give it.
+    Home(Vec<u8>),
+    /// The user has a line, but it does not name an absolute home folder.
+    Damaged,
+    /// No line has this user id.
+    Missing,
+}
+
+/// What `uid` is in the bytes of `/etc/passwd`: the first line that names it,
+/// as the system's own lookup would pick. Only that line is read as text. The
+/// file may hold names and comments in any encoding, so the other lines are
+/// split on bytes and never need to be valid UTF-8; a line whose user id
+/// field cannot be read as a number belongs to nobody.
+pub(crate) fn account_in_passwd(text: &[u8], uid: u32) -> Account {
+    for line in text.split(|&b| b == b'\n') {
+        let fields: Vec<&[u8]> = line.split(|&b| b == b':').collect();
+        let named = fields
+            .get(2)
+            .filter(|id| !id.is_empty() && id.iter().all(u8::is_ascii_digit))
+            .and_then(|id| std::str::from_utf8(id).ok())
+            .and_then(|id| id.parse::<u32>().ok());
+        if named != Some(uid) {
+            continue;
+        }
+        return match fields.get(5) {
+            Some(home) if home.first() == Some(&b'/') && !home.contains(&0) => {
+                Account::Home((*home).to_vec())
+            }
+            _ => Account::Damaged,
+        };
+    }
+    Account::Missing
 }
 
 /// What the interface is told when the account has no home folder on record.
@@ -106,17 +130,20 @@ const NO_ACCOUNT: &str = "administrator deletes are not available: this account 
 /// name services from an elevated process could reach the network. An account
 /// that exists only there has no home on record, and a table without it would
 /// protect less than the interface's own does, so such a judge refuses every
-/// delete.
+/// delete. Only the user's own line matters: damage elsewhere in the file is
+/// no reason to refuse.
 fn system_judge(uid: u32, passwd: &std::path::Path, mountinfo: &std::path::Path) -> Judge {
     use std::os::unix::ffi::OsStrExt;
     let mut env = Environment::new();
-    let home = std::fs::read_to_string(passwd)
-        .ok()
-        .and_then(|text| home_in_passwd(&text, uid));
-    let has_home = home.is_some();
-    if let Some(home) = home {
+    // A file that cannot be read has no line for the user either.
+    let account =
+        std::fs::read(passwd).map_or(Account::Missing, |text| account_in_passwd(&text, uid));
+    let has_home = if let Account::Home(home) = account {
         env = env.with("HOME", home);
-    }
+        true
+    } else {
+        false
+    };
     let mounts = std::fs::read(mountinfo)
         .map(|text| crate::mounts::parse(&text))
         .unwrap_or_default();
@@ -127,7 +154,7 @@ fn system_judge(uid: u32, passwd: &std::path::Path, mountinfo: &std::path::Path)
     if has_home {
         judge
     } else {
-        judge.unavailable(NO_ACCOUNT)
+        judge.unavailable(ErrorCode::NoAccount, NO_ACCOUNT)
     }
 }
 
@@ -207,15 +234,69 @@ mod tests {
 
     #[test]
     fn the_home_folder_comes_from_the_matching_account() {
-        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
-                      alice:x:1000:1000:Alice,,,:/home/alice:/bin/bash\n\
-                      bob:x:1001:1001::relative:/bin/sh\n\
-                      broken line\n";
-        assert_eq!(home_in_passwd(passwd, 1000).as_deref(), Some("/home/alice"));
-        assert_eq!(home_in_passwd(passwd, 0).as_deref(), Some("/root"));
-        // A home that is not an absolute path is not used.
-        assert_eq!(home_in_passwd(passwd, 1001), None);
-        assert_eq!(home_in_passwd(passwd, 4242), None);
+        let passwd = b"root:x:0:0:root:/root:/bin/bash\n\
+                       alice:x:1000:1000:Alice,,,:/home/alice:/bin/bash\n\
+                       bob:x:1001:1001::relative:/bin/sh\n\
+                       carol:x:1002:1002::/home/carol\n\
+                       dave:x:1003:1003:::/bin/sh\n\
+                       broken line\n";
+        assert_eq!(
+            account_in_passwd(passwd, 1000),
+            Account::Home(b"/home/alice".to_vec())
+        );
+        assert_eq!(
+            account_in_passwd(passwd, 0),
+            Account::Home(b"/root".to_vec())
+        );
+        // A line without a shell field is still a line with a home.
+        assert_eq!(
+            account_in_passwd(passwd, 1002),
+            Account::Home(b"/home/carol".to_vec())
+        );
+        // A home that is not an absolute path, or is empty, is damage.
+        assert_eq!(account_in_passwd(passwd, 1001), Account::Damaged);
+        assert_eq!(account_in_passwd(passwd, 1003), Account::Damaged);
+        assert_eq!(account_in_passwd(passwd, 4242), Account::Missing);
+        // The first line that names the user decides, as the system's lookup
+        // does.
+        let twice = b"a:x:5:5::/first:/bin/sh\nb:x:5:5::/second:/bin/sh\n";
+        assert_eq!(
+            account_in_passwd(twice, 5),
+            Account::Home(b"/first".to_vec())
+        );
+        // Ids that are not plain numbers belong to nobody.
+        for id in ["+1000", "-1", "1000 ", "0x3e8", "", "99999999999"] {
+            let line = format!("n:x:{id}:1::/home/n:/bin/sh\n");
+            assert_eq!(account_in_passwd(line.as_bytes(), 1000), Account::Missing);
+        }
+    }
+
+    #[test]
+    fn lines_of_other_users_may_be_any_bytes() {
+        // A name in Latin-1, a comment that is not text at all, and a home
+        // folder with a byte that is not UTF-8 (a Linux name may hold one).
+        let mut passwd = Vec::new();
+        passwd.extend_from_slice(b"ren\xe9:x:2000:2000:\xff\xfe\x00:/home/ren\xe9:/bin/sh\n");
+        passwd.extend_from_slice(b"alice:x:1000:1000::/home/alice:/bin/sh\n");
+        assert_eq!(
+            account_in_passwd(&passwd, 1000),
+            Account::Home(b"/home/alice".to_vec())
+        );
+        assert_eq!(
+            account_in_passwd(&passwd, 2000),
+            Account::Home(b"/home/ren\xe9".to_vec()),
+            "a comment that is not text is no reason to refuse"
+        );
+        assert_eq!(
+            account_in_passwd(b"x:x:7:7::/home/a\0b:/bin/sh\n", 7),
+            Account::Damaged,
+            "a NUL in the home folder is damage"
+        );
+        let clean = b"ren\xe9:x:2000:2000:Ren\xe9:/home/ren\xe9:/bin/sh\n";
+        assert_eq!(
+            account_in_passwd(clean, 2000),
+            Account::Home(b"/home/ren\xe9".to_vec())
+        );
     }
 
     #[test]
@@ -232,25 +313,38 @@ mod tests {
         assert_eq!(system_judge(1000, &passwd, &mountinfo).refusal(), None);
         // Every way the account file can fail to name the user's home: the user
         // exists only through the name services, the file is missing, it
-        // cannot be read (here a folder stands in for it), or it is not text
-        // (a file with a byte that is not UTF-8 is refused as a whole, even for
-        // a user whose own line is fine). Each is refused, with a reason the
+        // cannot be read (here a folder stands in for it), or the user's own
+        // line is damaged. Each is refused, with a code and a reason the
         // interface can show.
         f.mkdir("unreadable");
         std::fs::write(
-            f.p("binary"),
-            b"alice:x:1000:1000:Ali\xe7e:/home/alice:/bin/sh\n",
+            f.p("damaged"),
+            b"alice:x:1000:1000:Alice:relative:/bin/sh\n",
         )
         .unwrap();
         for (uid, file) in [
             (4242, passwd.clone()),
             (1000, f.p("absent")),
             (1000, f.p("unreadable")),
-            (1000, f.p("binary")),
+            (1000, f.p("damaged")),
         ] {
             let judge = system_judge(uid, &file, &mountinfo);
-            let why = judge.refusal().expect("deletes are refused");
+            let (code, why) = judge.refusal().expect("deletes are refused");
+            assert_eq!(code, ErrorCode::NoAccount);
             assert!(why.contains("account"), "{why}");
         }
+    }
+
+    #[test]
+    fn damage_in_other_lines_does_not_refuse_the_user_with_a_good_line() {
+        let f = crate::testutil::Fixture::new("other-lines");
+        std::fs::write(
+            f.p("passwd"),
+            b"ren\xe9:x:2000:2000:\xff\xfe:/home/ren\xe9:/bin/sh\nbroken\nalice:x:1000:1000::/home/alice:/bin/sh\n",
+        )
+        .unwrap();
+        std::fs::write(f.p("mountinfo"), b"").unwrap();
+        let judge = system_judge(1000, &f.p("passwd"), &f.p("mountinfo"));
+        assert_eq!(judge.refusal(), None);
     }
 }

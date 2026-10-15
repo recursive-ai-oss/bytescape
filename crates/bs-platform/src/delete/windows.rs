@@ -588,7 +588,7 @@ fn find_in_bin(drive: &Drive, original: &Path) -> Option<PathBuf> {
         let Some(record) = winpure::parse_record(&bytes) else {
             continue;
         };
-        if winpure::same_path(&record.original, &original.to_string_lossy())
+        if winpure::same_place(&record.original, &units_of(original))
             && best
                 .as_ref()
                 .is_none_or(|(when, _)| record.deleted_at >= *when)
@@ -625,6 +625,12 @@ fn move_out_of_bin(recycled: &Path, to: &Path) -> io::Result<()> {
         unsafe { DeleteFileW(info.as_ptr()) };
     }
     Ok(())
+}
+
+/// The 16-bit units of a path, for comparing places exactly.
+fn units_of(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().collect()
 }
 
 // ------------------------------------------------------------------ Disposal
@@ -816,8 +822,7 @@ impl Disposal {
             .and_then(|bytes| winpure::parse_record(&bytes));
         // The record must say what the token says.
         match record {
-            Some(record)
-                if winpure::same_path(&record.original, &token.original.to_string_lossy()) => {}
+            Some(record) if winpure::same_place(&record.original, &units_of(&token.original)) => {}
             _ => return not_in_bin(),
         }
         match identity_of(&recycled.recycled) {

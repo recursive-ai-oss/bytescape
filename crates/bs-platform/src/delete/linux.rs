@@ -69,11 +69,8 @@ pub(crate) fn identity_of(path: &Path) -> io::Result<Identity> {
     Ok(identity(&stat))
 }
 
-fn identity(stat: &walk::Stat) -> Identity {
-    Identity {
-        volume: stat.dev,
-        file: u128::from(stat.ino),
-    }
+fn identity(meta: &bs_fsops::remove::Meta) -> Identity {
+    bs_fsops::remove::identity_of(meta)
 }
 
 /// The folder that holds the item, the item's name in it, and the place the

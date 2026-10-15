@@ -32,6 +32,7 @@ pub mod delete;
 #[cfg(target_os = "linux")]
 pub mod mounts;
 pub mod places;
+mod plan;
 pub mod scan;
 pub mod session;
 

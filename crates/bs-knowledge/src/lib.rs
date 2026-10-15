@@ -451,7 +451,7 @@ impl<T: Copy> SystemRules<T> {
             if relative && !compiled.floating {
                 continue;
             }
-            if let Some(matched) = match_any(compiled, split.slice(), split.complete, false) {
+            if let Some(matched) = match_any(compiled, split.slice(), true, false) {
                 let wild = compiled.wild_parts();
                 f(
                     Hit {
@@ -484,7 +484,7 @@ impl<T: Copy> SystemRules<T> {
             let start = self.names.partition_point(|n| *n.name < *key);
             for rule in self.names[start..].iter().take_while(|n| *n.name == *key) {
                 // An exact rule needs the name to be the last part of a whole path.
-                if rule.exact && !(split.complete && index + 1 == parts.len()) {
+                if rule.exact && index + 1 != parts.len() {
                     continue;
                 }
                 f(

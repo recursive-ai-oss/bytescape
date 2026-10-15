@@ -243,6 +243,21 @@ pub(crate) fn acknowledge(report: &Path) -> io::Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
+/// Marks exactly these reports as seen, and no others.
+pub(crate) fn mark_seen(reports: &[PathBuf]) -> io::Result<()> {
+    let mut first_error = None;
+    for report in reports {
+        match create_private_file(&seen_marker(report)) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 /// Keeps the newest `keep` reports. Also removes the markers of reports that
 /// are gone and temporary files left by a crash during a write.
 pub(crate) fn prune(dir: &Path, keep: usize) {
@@ -501,5 +516,23 @@ mod tests {
         let tmp = Scratch::new("store-huge");
         fs::write(tmp.path().join("crash-1.txt"), vec![b'x'; 1_000_000]).unwrap();
         assert_eq!(pending(tmp.path()).unwrap().text.len() as u64, READ_LIMIT);
+    }
+
+    #[test]
+    fn only_the_named_reports_are_marked_as_seen() {
+        let scratch = Scratch::new("mark-seen");
+        let dir = scratch.path();
+        let first = write_report(dir, "first", 1_700_000_000, 0).unwrap();
+        let second = write_report(dir, "second", 1_700_000_001, 1).unwrap();
+        let third = write_report(dir, "third", 1_700_000_002, 2).unwrap();
+        // The newest and the oldest are marked; the one between is not, and
+        // marking is not a matter of age.
+        mark_seen(&[first.clone(), third.clone()]).unwrap();
+        assert_eq!(pending(dir).unwrap().path(), second.as_path());
+        // Doing it again, and marking nothing, are fine.
+        mark_seen(&[first, third]).unwrap();
+        mark_seen(&[]).unwrap();
+        mark_seen(&[second]).unwrap();
+        assert!(pending(dir).is_none());
     }
 }

@@ -38,7 +38,9 @@ impl Lab {
 
     fn p(&self, relative: &str) -> PathBuf {
         assert!(!relative.contains(".."), "{relative}");
-        self.root.join(relative)
+        // The interface sends the real place with backslashes, and the judge
+        // refuses any other spelling of it, so the tests write it that way.
+        self.root.join(relative.replace('/', "\\"))
     }
 
     fn write(&self, relative: &str, text: &str) {

@@ -632,25 +632,26 @@ fn a_volume_that_is_not_a_plain_absolute_folder_is_a_bad_request() {
 }
 
 #[test]
-fn backends_the_helper_does_not_have_yet_fall_back_to_the_walker_and_say_so() {
+fn a_reader_that_cannot_serve_the_folder_falls_back_to_the_walker_and_says_so() {
     let fx = Fixture::new("fallback");
     fx.write("tree/a", "x");
-    for backend in [Backend::Ntfs, Backend::Btrfs, Backend::Xfs] {
+    // The reader that exists only on Windows is not here.
+    let mut helper = Launch::new("scan").spawn();
+    let mut request = scan_request(&fx.p("tree"));
+    request.backend = Backend::Ntfs;
+    let (_, done) = snapshot_of(run_scan(&mut helper, request));
+    assert_eq!(done.backend, Backend::Walker);
+    assert_eq!(done.fallback, Fallback::Unavailable);
+    // The raw readers are for a filesystem at its mount point, never a folder
+    // in it; asked for one, the helper says it did not use it.
+    for backend in [Backend::Ext4, Backend::Btrfs, Backend::Xfs] {
         let mut helper = Launch::new("scan").spawn();
         let mut request = scan_request(&fx.p("tree"));
         request.backend = backend;
         let (_, done) = snapshot_of(run_scan(&mut helper, request));
-        assert_eq!(done.backend, Backend::Walker);
-        assert_eq!(done.fallback, Fallback::Unavailable, "{backend:?}");
+        assert_eq!(done.backend, Backend::Walker, "{backend:?}");
+        assert_eq!(done.fallback, Fallback::NotSupported, "{backend:?}");
     }
-    // The raw ext4 reader is for a whole filesystem at its mount point, never a
-    // folder in it; asked for one, the helper says it did not use it.
-    let mut helper = Launch::new("scan").spawn();
-    let mut request = scan_request(&fx.p("tree"));
-    request.backend = Backend::Ext4;
-    let (_, done) = snapshot_of(run_scan(&mut helper, request));
-    assert_eq!(done.backend, Backend::Walker);
-    assert_eq!(done.fallback, Fallback::NotSupported);
     // Automatic choice on a folder is the walker, with nothing to explain.
     let mut helper = Launch::new("scan").spawn();
     let mut request = scan_request(&fx.p("tree"));

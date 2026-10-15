@@ -35,7 +35,6 @@ fn config(
         write_stall,
         judge: Judge::new(Knowledge::new(&Environment::new())),
         host: Host {
-            isolate_environment: false,
             mountinfo: "/nonexistent".into(),
         },
         on_stall,
@@ -219,7 +218,8 @@ fn a_judge_that_cannot_be_trusted_refuses_the_delete_and_touches_nothing() {
         Duration::from_secs(60),
         Box::new(|| {}),
     );
-    cfg.judge = Judge::new(Knowledge::new(&Environment::new())).unavailable("no account");
+    cfg.judge = Judge::new(Knowledge::new(&Environment::new()))
+        .unavailable(ErrorCode::NoAccount, "no account");
     let mut answer = Vec::new();
     let exit = run(reader, &mut answer, cfg);
     assert_eq!(exit, Exit::Failed(String::from("no account")));
@@ -231,7 +231,7 @@ fn a_judge_that_cannot_be_trusted_refuses_the_delete_and_touches_nothing() {
     assert!(matches!(frames.read().unwrap(), Some(Message::Hello(_))));
     match frames.read().unwrap() {
         Some(Message::Error(report)) => {
-            assert_eq!(report.code, ErrorCode::Refused);
+            assert_eq!(report.code, ErrorCode::NoAccount);
             assert_eq!(report.message, "no account");
         }
         other => panic!("expected an error report, got {other:?}"),

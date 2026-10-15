@@ -67,7 +67,7 @@ pub use msg::{
     Backend, DeleteItem, DeleteRequest, ErrorCode, ErrorReport, Fallback, Hello, ItemOutcome,
     Message, Place, Progress, Refusal, ScanDone, ScanEnd, ScanRequest, Seen,
 };
-pub use path::{WirePathError, path_from_wire, path_to_wire};
+pub use path::{WirePathError, path_from_wire, path_to_wire, wire_has_nul};
 
 /// The protocol version both sides must speak.
 pub const PROTOCOL_VERSION: u16 = 1;

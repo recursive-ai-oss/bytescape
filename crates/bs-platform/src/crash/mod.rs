@@ -151,6 +151,22 @@ pub fn acknowledge(report: &Report) -> io::Result<()> {
     store::acknowledge(&report.path)
 }
 
+/// Says that the program is ending normally. Call it once, at the end of a
+/// normal shutdown.
+///
+/// The panic hook writes a report for every panic it sees, because it cannot
+/// know whether the panic will be caught. A panic that a scan thread's owner
+/// catches, or that kills one worker while the program carries on, is not a
+/// reason to tell the user next time that Bytescape closed unexpectedly. This
+/// marks the reports written by this run as seen, so [`pending_report`] does
+/// not offer them. The files stay in the folder for anyone who looks.
+///
+/// A process that dies of a panic, an abort or an exception never gets here,
+/// and its reports stay pending.
+pub fn mark_clean_exit() {
+    hook::mark_clean_exit();
+}
+
 /// "This version is 14 months old" when `build_date` is at least
 /// [`BUILD_AGE_MONTHS`] whole calendar months before `now`; otherwise `None`.
 /// Both are Unix seconds. Months are counted by date in UTC: a month is

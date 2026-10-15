@@ -1920,6 +1920,44 @@ proptest! {
 }
 
 #[test]
+fn a_name_deep_in_a_path_is_seen_however_many_parts_come_before_it() {
+    let k = full();
+    let linux = linux_full();
+    // More parts than a path keeps inline, up to far more than any system
+    // allows in a path name.
+    for depth in [3usize, 47, 48, 49, 100, 5_000, 40_000] {
+        let prefix = "/d".repeat(depth);
+        // A file below a folder that gives its files a category, found by a
+        // pattern that matches anywhere in the path.
+        let file = format!("{prefix}/node_modules/x.png");
+        assert_eq!(
+            k.classify_bytes(file.as_bytes(), false),
+            Category::CodeDev,
+            "depth {depth}"
+        );
+        // A note that belongs to the name itself, which must be the last part.
+        let folder = format!("{prefix}/node_modules");
+        assert!(
+            k.recognize_bytes(folder.as_bytes()).is_some(),
+            "depth {depth}"
+        );
+        let inside = format!("{prefix}/node_modules/left-pad");
+        assert!(
+            k.recognize_bytes(inside.as_bytes()).is_none(),
+            "depth {depth}"
+        );
+        // The same on Windows.
+        let windows = format!(r"C:{}\node_modules\x.png", r"\d".repeat(depth));
+        assert_eq!(
+            k.classify_bytes(windows.as_bytes(), false),
+            Category::CodeDev,
+            "windows depth {depth}"
+        );
+        let _ = linux.protection_bytes(file.as_bytes());
+    }
+}
+
+#[test]
 fn very_long_paths_finish_in_bounded_time() {
     let k = full();
     let started = Instant::now();
@@ -1996,7 +2034,7 @@ fn plain_scan_place(env: &Environment, path: &[u8]) -> Option<Category> {
         if !applies {
             continue;
         }
-        if let Some(matched) = match_any(compiled, split.slice(), split.complete, false) {
+        if let Some(matched) = match_any(compiled, split.slice(), true, false) {
             let rank = (usize::MAX - matched, order);
             if best.is_none_or(|(r, _)| rank < r) {
                 best = Some((rank, *category));

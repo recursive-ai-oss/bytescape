@@ -148,6 +148,10 @@ pub struct Mount {
     /// Another mount of this drive already shows this mount's folder (this
     /// root lies inside that one's root, or is the same and that mount comes
     /// first in the list). Following this mount would count its files twice.
+    /// A mount attached on the very folder where that other mount shows it
+    /// (`subvol=home` on `/home`, when `/` shows the top level of the
+    /// filesystem) is not covered: it is in the other mount's way, and its
+    /// files are reachable only through it.
     pub covered_by_other_mount: bool,
 }
 

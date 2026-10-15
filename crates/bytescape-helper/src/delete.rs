@@ -28,7 +28,7 @@
 //! An item inside another item of the request is left to the outer one.
 
 use bs_fsops::{DeleteError, OpenError, Target, validate_path};
-use bs_ipc::{DeleteItem, DeleteRequest, ItemOutcome, Refusal, path_from_wire};
+use bs_ipc::{DeleteItem, DeleteRequest, ErrorCode, ItemOutcome, Refusal, path_from_wire};
 use bs_knowledge::{Knowledge, Level};
 use std::path::{Path, PathBuf};
 
@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 pub struct Judge {
     knowledge: Knowledge,
     /// Why this helper must not delete anything at all, when it must not.
-    unavailable: Option<&'static str>,
+    unavailable: Option<(ErrorCode, &'static str)>,
 }
 
 impl Judge {
@@ -50,15 +50,16 @@ impl Judge {
     }
 
     /// A judge whose table is not complete enough to be trusted with a delete:
-    /// the session answers a delete request with `why` and touches nothing.
+    /// the session answers a delete request with `code` and `why` and touches
+    /// nothing.
     #[must_use]
-    pub fn unavailable(mut self, why: &'static str) -> Self {
-        self.unavailable = Some(why);
+    pub fn unavailable(mut self, code: ErrorCode, why: &'static str) -> Self {
+        self.unavailable = Some((code, why));
         self
     }
 
     /// Why deleting is refused outright, if it is.
-    pub fn refusal(&self) -> Option<&'static str> {
+    pub fn refusal(&self) -> Option<(ErrorCode, &'static str)> {
         self.unavailable
     }
 

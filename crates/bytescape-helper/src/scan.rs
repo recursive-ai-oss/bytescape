@@ -3,23 +3,22 @@
 //!
 //! The helper only reads. The walker applies the same rules as in the
 //! interface (links are never followed, other filesystems are never entered,
-//! cloud placeholders are never opened); the raw ext4 reader reads the block
-//! device of a mounted filesystem and is used only for a whole filesystem
-//! mounted exactly at the requested path.
+//! cloud placeholders are never opened). The raw readers are chosen in
+//! [`crate::plan`]; this module hosts whichever runs, cuts what it finds into
+//! frames, and stops when the interface says so.
 
+use crate::plan::{Chosen, plan_for};
 use crate::session::{Event, Exit, Out};
-use bs_ipc::{
-    Backend, ErrorCode, Fallback, Message, Progress, ScanDone, ScanEnd, ScanRequest, path_from_wire,
-};
+use bs_ipc::{ErrorCode, Message, Progress, ScanDone, ScanEnd, ScanRequest, path_from_wire};
 use bs_scan::{
     Boundary, ScanContext, ScanEnd as EngineEnd, ScanError, ScanOptions, ScanProgress, Scanner,
-    StatvfsVolume, VolumeInfo, Walker,
+    StatvfsVolume, VolumeInfo,
 };
 use bs_tree::{Batch, NodeKind, Record};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The most a batch frame carries before the batch is split (the frame limit
@@ -32,9 +31,6 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
 /// What the scan needs to know about this computer.
 pub struct Host {
-    /// Read the user's places from the request and clear the helper's own
-    /// (true for the real helper; false in tests that share a process).
-    pub isolate_environment: bool,
     /// The mount table (Linux).
     pub mountinfo: PathBuf,
 }
@@ -42,7 +38,6 @@ pub struct Host {
 impl Host {
     pub fn system() -> Self {
         Self {
-            isolate_environment: true,
             mountinfo: PathBuf::from("/proc/self/mountinfo"),
         }
     }
@@ -110,164 +105,10 @@ fn progress_of(p: ScanProgress, os_used: Option<u64>) -> Progress {
     }
 }
 
-/// What reader runs, and why.
-struct Plan {
-    backend: Backend,
-    fallback: Fallback,
-    #[cfg(target_os = "linux")]
-    ext4: Option<(PathBuf, bs_scan_ext4::Ext4Options)>,
-}
-
-/// The scanner the helper runs: the raw reader when the plan has one, with the
-/// walker behind it for a filesystem the raw reader refuses.
-struct Chosen {
-    plan: Plan,
-    /// What actually ran.
-    ran: Mutex<(Backend, Fallback)>,
-}
-
-impl Scanner for Chosen {
-    fn name(&self) -> &'static str {
-        "helper"
-    }
-
-    fn scan(&self, root: &Path, ctx: &ScanContext) -> Result<EngineEnd, ScanError> {
-        self.note(self.plan.backend, self.plan.fallback);
-        #[cfg(target_os = "linux")]
-        if let Some((device, options)) = &self.plan.ext4 {
-            let raw = bs_scan_ext4::Ext4Scanner::new(device.clone(), options.clone());
-            match raw.scan(root, ctx) {
-                Ok(end) => return Ok(end),
-                Err(error) => {
-                    // The raw reader only fails before it has sent anything.
-                    // If something was sent the walker must not repeat it.
-                    if ctx.progress().batches > 0 {
-                        return Err(error);
-                    }
-                    let why = fallback_for(&error);
-                    self.note(Backend::Walker, why);
-                }
-            }
-        }
-        Walker.scan(root, ctx)
-    }
-}
-
-impl Chosen {
-    fn note(&self, backend: Backend, fallback: Fallback) {
-        if let Ok(mut ran) = self.ran.lock() {
-            *ran = (backend, fallback);
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn fallback_for(error: &ScanError) -> Fallback {
-    use bs_scan_ext4::Ext4Error;
-    let ScanError::Root(io) = error else {
-        return Fallback::NotSupported;
-    };
-    match io
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<Ext4Error>())
-    {
-        Some(Ext4Error::TooLarge(_)) => Fallback::TooLarge,
-        Some(Ext4Error::PartialMount) => Fallback::PartialMount,
-        _ => Fallback::NotSupported,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn plan_for(requested: Backend, root: &Path, host: &Host) -> Plan {
-    let mounts = std::fs::read(&host.mountinfo)
-        .map(|text| crate::mounts::parse(&text))
-        .unwrap_or_default();
-    choose(requested, root, &mounts, &is_block_device_under_dev)
-}
-
-/// The device is read as the superuser, so it must be a block device under
-/// `/dev` that the mount table names.
-#[cfg(target_os = "linux")]
-fn is_block_device_under_dev(device: &Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    device.starts_with("/dev")
-        && std::fs::canonicalize(device)
-            .ok()
-            .filter(|real| real.starts_with("/dev"))
-            .and_then(|real| std::fs::metadata(real).ok())
-            .is_some_and(|meta| meta.file_type().is_block_device())
-}
-
-/// Decides which reader runs for `requested` on `root`, given the mount table.
-/// `device_ok` says whether a device named by the table may be read raw.
-#[cfg(target_os = "linux")]
-fn choose(
-    requested: Backend,
-    root: &Path,
-    mounts: &[crate::mounts::Mount],
-    device_ok: &dyn Fn(&Path) -> bool,
-) -> Plan {
-    use std::os::unix::ffi::OsStrExt;
-    let walker = |fallback| Plan {
-        backend: Backend::Walker,
-        fallback,
-        ext4: None,
-    };
-    match requested {
-        Backend::Walker => return walker(Fallback::None),
-        Backend::Auto | Backend::Ext4 => {}
-        _ => return walker(Fallback::Unavailable),
-    }
-    // A raw read shows the whole filesystem, so it is used only for a path
-    // that is exactly where an ext2/3/4 filesystem is mounted.
-    let unsuitable = if requested == Backend::Ext4 {
-        Fallback::NotSupported
-    } else {
-        Fallback::None
-    };
-    let Some(mount) = crate::mounts::at_exactly(mounts, root.as_os_str().as_bytes()) else {
-        return walker(unsuitable);
-    };
-    if !matches!(mount.fs_type.as_str(), "ext4" | "ext3" | "ext2") {
-        return walker(unsuitable);
-    }
-    let device = PathBuf::from(std::ffi::OsStr::from_bytes(&mount.source));
-    if !device_ok(&device) {
-        return walker(unsuitable);
-    }
-    let others = mounts
-        .iter()
-        .filter(|m| m.id != mount.id)
-        .map(|m| PathBuf::from(std::ffi::OsStr::from_bytes(&m.mount_point)));
-    let options = bs_scan_ext4::Ext4Options {
-        // The mount table's own word for what this mount shows; a mount of part
-        // of a filesystem is refused by the reader.
-        mount_root: Some(mount.root.clone()),
-        ..bs_scan_ext4::Ext4Options::default()
-    }
-    .with_other_mounts(root, others);
-    Plan {
-        backend: Backend::Ext4,
-        fallback: Fallback::None,
-        ext4: Some((device, options)),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn plan_for(requested: Backend, _root: &Path, _host: &Host) -> Plan {
-    Plan {
-        backend: Backend::Walker,
-        fallback: match requested {
-            Backend::Auto | Backend::Walker => Fallback::None,
-            _ => Fallback::Unavailable,
-        },
-    }
-}
-
 /// A scan root: absolute, plain, and a real folder.
 fn scan_root(wire: &[u8]) -> Result<PathBuf, &'static str> {
     let path = path_from_wire(wire).map_err(|_| "the volume is not a valid path")?;
-    if wire.is_empty() || wire.contains(&0) || !path.is_absolute() {
+    if wire.is_empty() || bs_ipc::wire_has_nul(wire) || !path.is_absolute() {
         return Err("the volume is not an absolute path");
     }
     // Dot parts are looked for in the text: path handling quietly drops a `.`.
@@ -311,22 +152,19 @@ pub(crate) fn serve<W: Write>(
         Ok(root) => root,
         Err(why) => tell!(ErrorCode::BadRequest, why),
     };
-    let plan = plan_for(request.backend, &root, host);
+    let plan = plan_for(request.backend, &root, host, &request.extra_mount_ids);
     let os_used = StatvfsVolume.used_bytes(&root).ok();
+    // Only mounts of the drive's own filesystem are entered, and the user's
+    // places come from the request alone.
     let options = ScanOptions {
-        boundary: Boundary::with_mount_ids(request.extra_mount_ids.iter().copied()),
+        boundary: Boundary::with_mount_ids(plan.mount_ids.iter().copied()),
         os_used_bytes: os_used,
         ..ScanOptions::default()
-    };
-    if host.isolate_environment {
-        crate::places::apply(&places);
     }
+    .with_environment(crate::places::environment(&places));
     let (ctx, batches) = ScanContext::channel(options, 64);
     let ctx = Arc::new(ctx);
-    let chosen = Arc::new(Chosen {
-        ran: Mutex::new((plan.backend, plan.fallback)),
-        plan,
-    });
+    let chosen = Arc::new(Chosen::new(plan));
     let worker = {
         let ctx = Arc::clone(&ctx);
         let chosen = Arc::clone(&chosen);
@@ -401,11 +239,7 @@ pub(crate) fn serve<W: Write>(
     };
     match result {
         Ok(end) => {
-            let (backend, fallback) = chosen
-                .ran
-                .lock()
-                .map(|ran| *ran)
-                .unwrap_or((Backend::Walker, Fallback::None));
+            let (backend, fallback) = chosen.outcome();
             let done = ScanDone {
                 backend,
                 end: if cancelled || end == EngineEnd::Cancelled {
@@ -457,9 +291,7 @@ mod tests {
     // itself starts nothing.
     #![allow(clippy::disallowed_types, clippy::disallowed_methods)]
     use super::*;
-    use crate::mounts::{self, Mount};
-    use crate::testutil::Fixture;
-    use bs_tree::{Aggregator, Category, DirKey, Meta, NodeFlags};
+    use bs_tree::{Category, DirKey, Meta, NodeFlags};
 
     // -------------------------------------------------------- Splitting
 
@@ -529,237 +361,119 @@ mod tests {
             Some(Record::ListingDone { dir }) if *dir == DirKey(0)
         ));
     }
+}
 
-    // ------------------------------------------------ Choosing a reader
+#[cfg(test)]
+mod root_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use bs_ipc::path_to_wire;
 
-    const TABLE: &str = "\
-22 1 8:2 / / rw - ext4 /dev/sda2 rw
-23 22 8:3 / /data rw - ext4 /dev/sda3 rw
-24 22 8:4 /sub /part rw - ext4 /dev/sda4 rw
-25 22 0:50 / /btr rw - btrfs /dev/sda5 rw
-26 23 8:6 / /data/usb rw - vfat /dev/sdb1 rw
-27 22 8:7 / /weird rw - ext4 /tmp/not-a-device rw
-";
-
-    fn table() -> Vec<Mount> {
-        mounts::parse(TABLE.as_bytes())
-    }
-
-    fn anything_under_dev(device: &Path) -> bool {
-        device.starts_with("/dev")
-    }
-
-    fn choose_for(requested: Backend, root: &str) -> Plan {
-        choose(requested, Path::new(root), &table(), &anything_under_dev)
+    /// What the interface sends for a folder, on whichever system this is.
+    /// On Windows the wire form is 16-bit units, so an ordinary path is full
+    /// of zero bytes; none of them is a NUL character.
+    #[test]
+    fn the_wire_form_of_a_real_folder_is_accepted_as_the_volume() {
+        let folder = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = scan_root(&path_to_wire(&folder)).unwrap();
+        assert!(root.is_dir());
     }
 
     #[test]
-    fn a_whole_ext4_mount_is_read_raw_with_what_the_mount_table_says() {
-        let plan = choose_for(Backend::Auto, "/data");
-        assert_eq!(
-            (plan.backend, plan.fallback),
-            (Backend::Ext4, Fallback::None)
-        );
-        let (device, options) = plan.ext4.unwrap();
-        assert_eq!(device, Path::new("/dev/sda3"));
-        // Always passed, so a mount of part of a filesystem is refused.
-        assert_eq!(options.mount_root.as_deref(), Some(&b"/"[..]));
-        // Mounts below it are skipped; mounts elsewhere are not its business.
-        assert_eq!(options.skip, vec![b"usb".to_vec()]);
-        let (_, options) = choose_for(Backend::Ext4, "/").ext4.unwrap();
-        assert!(options.skip.contains(&b"data".to_vec()));
-        assert!(options.skip.contains(&b"data/usb".to_vec()));
-        assert!(options.skip.contains(&b"btr".to_vec()));
-    }
-
-    #[test]
-    fn a_mount_of_part_of_a_filesystem_hands_its_root_to_the_reader() {
-        let (_, options) = choose_for(Backend::Auto, "/part").ext4.unwrap();
-        assert_eq!(options.mount_root.as_deref(), Some(&b"/sub"[..]));
-    }
-
-    #[test]
-    fn everything_else_is_walked_and_an_explicit_request_says_why() {
-        for (requested, root, want) in [
-            // Not a mount point, or another kind of filesystem.
-            (Backend::Auto, "/data/folder", Fallback::None),
-            (Backend::Ext4, "/data/folder", Fallback::NotSupported),
-            (Backend::Auto, "/btr", Fallback::None),
-            (Backend::Ext4, "/btr", Fallback::NotSupported),
-            (Backend::Ext4, "/data/usb", Fallback::NotSupported),
-            // A device outside /dev is never read raw.
-            (Backend::Ext4, "/weird", Fallback::NotSupported),
-            // The walker was asked for.
-            (Backend::Walker, "/data", Fallback::None),
-            // Readers that do not exist yet.
-            (Backend::Ntfs, "/data", Fallback::Unavailable),
-            (Backend::Btrfs, "/btr", Fallback::Unavailable),
-            (Backend::Xfs, "/data", Fallback::Unavailable),
+    fn a_volume_that_is_not_a_plain_absolute_real_folder_is_refused() {
+        let folder = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let text = folder.to_string_lossy().into_owned();
+        let sep = std::path::MAIN_SEPARATOR;
+        let wire = |text: &str| path_to_wire(std::path::Path::new(text));
+        for (volume, why) in [
+            (Vec::new(), "empty"),
+            (wire("relative"), "relative"),
+            (wire(&format!("{text}{sep}.")), "dot part"),
+            (wire(&format!("{text}{sep}..{sep}x")), "dotdot part"),
+            (wire(&format!("{text}{sep}no-such-folder-here")), "missing"),
         ] {
-            let plan = choose_for(requested, root);
-            assert_eq!(plan.backend, Backend::Walker, "{requested:?} {root}");
-            assert_eq!(plan.fallback, want, "{requested:?} {root}");
-            assert!(plan.ext4.is_none());
+            assert!(scan_root(&volume).is_err(), "{why}");
         }
+        // A NUL in the path: a zero byte on Linux, a zero unit on Windows.
+        let mut with_nul = path_to_wire(&folder);
+        with_nul.extend_from_slice(&[0, 0]);
+        assert!(scan_root(&with_nul).is_err(), "NUL");
     }
 
+    /// The NTFS reader makes up a folder for files that no folder lists and
+    /// marks it, so that nothing is ever done to its contents by path. The
+    /// mark has to survive being cut into frames and sent.
     #[test]
-    fn a_device_the_check_refuses_is_not_read() {
-        let plan = choose(Backend::Auto, Path::new("/data"), &table(), &|_| false);
-        assert_eq!(plan.backend, Backend::Walker);
-        assert!(plan.ext4.is_none());
-    }
-
-    #[test]
-    fn only_block_devices_under_dev_pass_the_real_check() {
-        let fx = Fixture::new("device-check");
-        fx.write("not-a-device", "x");
-        assert!(!is_block_device_under_dev(&fx.p("not-a-device")));
-        assert!(!is_block_device_under_dev(Path::new("/etc/passwd")));
-        assert!(!is_block_device_under_dev(Path::new("/dev/null")));
-        assert!(!is_block_device_under_dev(Path::new("/dev/does-not-exist")));
-        assert!(!is_block_device_under_dev(Path::new("/dev/../etc/passwd")));
-    }
-
-    // -------------------------------------------- Running the readers
-
-    fn ext4_image(fx: &Fixture) -> Option<PathBuf> {
-        fx.write("src/a/one.txt", "1");
-        fx.write("src/a/two.txt", "22");
-        fx.write("src/three.txt", "333");
-        let image = fx.p("disk.img");
-        let status = std::process::Command::new("mke2fs")
-            .args(["-q", "-F", "-t", "ext4", "-d"])
-            .arg(fx.p("src"))
-            .arg(&image)
-            .arg("4M")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .ok()?;
-        status.success().then_some(image)
-    }
-
-    fn run_chosen(plan: Plan, root: &Path) -> (Chosen, Aggregator, ScanEnd2) {
-        let chosen = Chosen {
-            ran: Mutex::new((plan.backend, plan.fallback)),
-            plan,
+    fn a_made_up_folder_is_still_marked_after_it_is_cut_and_sent() {
+        use bs_ipc::{Direction, FrameReader, MAX_FRAME_LEN, write_message};
+        use bs_tree::{Aggregator, DirKey, Meta, NodeFlags};
+        let meta = |flags| Meta {
+            logical: 1,
+            allocated: 4096,
+            flags,
+            ..Meta::default()
         };
-        let (ctx, batches) = ScanContext::channel(ScanOptions::default(), 1024);
-        let end = chosen.scan(root, &ctx).unwrap();
-        let mut aggregator = Aggregator::new();
-        while let Ok(batch) = batches.try_recv() {
-            aggregator.apply(&batch);
+        // Enough files in the made-up folder that the batch has to be cut.
+        let mut batch = Batch::new();
+        batch
+            .dir(DirKey(0), DirKey::NONE, b"root", &meta(NodeFlags::EMPTY))
+            .unwrap();
+        batch
+            .dir(
+                DirKey(1),
+                DirKey(0),
+                b"orphans",
+                &meta(NodeFlags::SYNTHETIC),
+            )
+            .unwrap();
+        batch
+            .dir(DirKey(2), DirKey(0), b"real", &meta(NodeFlags::EMPTY))
+            .unwrap();
+        for i in 0..30_000 {
+            let name = format!("{i:0100}");
+            batch
+                .file(
+                    NodeKind::File,
+                    DirKey(1),
+                    name.as_bytes(),
+                    &meta(NodeFlags::EMPTY),
+                )
+                .unwrap();
         }
-        aggregator.finish();
-        (chosen, aggregator, end)
-    }
-
-    type ScanEnd2 = EngineEnd;
-
-    fn files_below_root(aggregator: &mut Aggregator) -> u64 {
-        aggregator
-            .publish()
-            .root()
-            .map_or(0, |r| u64::from(r.file_count()))
-    }
-
-    #[test]
-    fn the_raw_reader_runs_when_the_plan_has_one() {
-        let fx = Fixture::new("raw-ok");
-        let Some(image) = ext4_image(&fx) else {
-            return println!("NOT RUN: mke2fs is not available");
-        };
-        let plan = Plan {
-            backend: Backend::Ext4,
-            fallback: Fallback::None,
-            ext4: Some((image, bs_scan_ext4::Ext4Options::default())),
-        };
-        let (chosen, mut tree, end) = run_chosen(plan, fx.path());
-        assert_eq!(end, EngineEnd::Completed);
-        assert_eq!(*chosen.ran.lock().unwrap(), (Backend::Ext4, Fallback::None));
-        assert_eq!(files_below_root(&mut tree), 3);
-    }
-
-    #[test]
-    fn a_filesystem_that_needs_too_much_memory_falls_back_to_the_walker() {
-        let fx = Fixture::new("raw-too-large");
-        let Some(image) = ext4_image(&fx) else {
-            return println!("NOT RUN: mke2fs is not available");
-        };
-        let options = bs_scan_ext4::Ext4Options {
-            max_memory_bytes: 1,
-            ..bs_scan_ext4::Ext4Options::default()
-        };
-        let plan = Plan {
-            backend: Backend::Ext4,
-            fallback: Fallback::None,
-            ext4: Some((image, options)),
-        };
-        // The walker reads the folder that holds the image: the fixture.
-        let (chosen, _tree, end) = run_chosen(plan, &fx.p("src"));
-        assert_eq!(end, EngineEnd::Completed);
-        assert_eq!(
-            *chosen.ran.lock().unwrap(),
-            (Backend::Walker, Fallback::TooLarge)
-        );
-    }
-
-    #[test]
-    fn a_mount_of_part_of_a_filesystem_and_a_non_ext4_device_fall_back_too() {
-        let fx = Fixture::new("raw-refused");
-        let Some(image) = ext4_image(&fx) else {
-            return println!("NOT RUN: mke2fs is not available");
-        };
-        let partial = bs_scan_ext4::Ext4Options {
-            mount_root: Some(b"/sub".to_vec()),
-            ..bs_scan_ext4::Ext4Options::default()
-        };
-        fx.write("zeros.img", &"\0".repeat(8192));
-        for (device, options, want) in [
-            (image, partial, Fallback::PartialMount),
-            (
-                fx.p("zeros.img"),
-                bs_scan_ext4::Ext4Options::default(),
-                Fallback::NotSupported,
-            ),
-            (
-                fx.p("no-such-device"),
-                bs_scan_ext4::Ext4Options::default(),
-                Fallback::NotSupported,
-            ),
-        ] {
-            let plan = Plan {
-                backend: Backend::Ext4,
-                fallback: Fallback::None,
-                ext4: Some((device, options)),
+        batch
+            .file(NodeKind::File, DirKey(2), b"ok", &meta(NodeFlags::EMPTY))
+            .unwrap();
+        for key in 0..3 {
+            batch.listing_done(DirKey(key));
+        }
+        let parts = split(batch).unwrap();
+        assert!(parts.len() > 1, "the batch must have been cut");
+        let mut wire = Vec::new();
+        for part in parts {
+            write_message(&mut wire, &Message::Batch(part)).unwrap();
+        }
+        let mut reader = FrameReader::new(&wire[..], Direction::ToInterface, MAX_FRAME_LEN);
+        let mut tree = Aggregator::new();
+        while let Some(message) = reader.read().unwrap() {
+            let Message::Batch(part) = message else {
+                panic!("only batches were sent");
             };
-            let (chosen, _tree, end) = run_chosen(plan, &fx.p("src"));
-            assert_eq!(end, EngineEnd::Completed);
-            assert_eq!(*chosen.ran.lock().unwrap(), (Backend::Walker, want));
+            assert_eq!(tree.apply(&part).rejected, 0);
         }
-    }
-
-    #[test]
-    fn what_the_raw_reader_reports_maps_to_what_the_interface_is_told() {
-        use bs_scan_ext4::Ext4Error;
-        let wrap =
-            |e: Ext4Error| ScanError::Root(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
-        assert_eq!(
-            fallback_for(&wrap(Ext4Error::TooLarge("x"))),
-            Fallback::TooLarge
-        );
-        assert_eq!(
-            fallback_for(&wrap(Ext4Error::PartialMount)),
-            Fallback::PartialMount
-        );
-        assert_eq!(
-            fallback_for(&wrap(Ext4Error::NotExt4)),
-            Fallback::NotSupported
-        );
-        assert_eq!(
-            fallback_for(&ScanError::Root(std::io::Error::other("x"))),
-            Fallback::NotSupported
-        );
+        tree.finish();
+        let snapshot = tree.snapshot();
+        let find = |name: &[u8]| {
+            (0..snapshot.len())
+                .map(bs_tree::NodeId::from_index)
+                .find(|id| snapshot.node(*id).unwrap().name() == name)
+                .map(|id| snapshot.node(id).unwrap())
+                .unwrap()
+        };
+        assert!(find(b"orphans").is_synthetic());
+        assert!(find(&format!("{:0100}", 7).into_bytes()).is_under_synthetic());
+        assert!(find(&format!("{:0100}", 29_999).into_bytes()).is_under_synthetic());
+        for real in [&b"root"[..], b"real", b"ok"] {
+            assert!(!find(real).is_under_synthetic(), "{real:?}");
+        }
     }
 }

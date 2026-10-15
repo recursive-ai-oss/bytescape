@@ -3,11 +3,9 @@
 //! The helper runs as another user (`/root` is its home under `pkexec`), so
 //! the category tables cannot be resolved against its own environment: the
 //! results would differ from what the interface shows. The interface sends its
-//! places in the scan request, and they are the only source. The scanners read
-//! them from the process environment once, as they start, so this replaces
-//! those variables with the request's values and clears the rest.
-
-#![allow(unsafe_code)]
+//! places in the scan request, and they are the only source. They are handed
+//! to the scan as its [`Environment`]; the helper's own environment is never
+//! read for them and never changed.
 
 use bs_ipc::{Place, path_from_wire};
 use bs_knowledge::Environment;
@@ -37,7 +35,7 @@ pub fn parse(places: &[Place]) -> Result<Vec<(&'static str, OsString)>, BadPlace
             return Err(BadPlace::Duplicate);
         }
         let value = path_from_wire(&place.value).map_err(|_| BadPlace::NotAbsolute)?;
-        if place.value.is_empty() || place.value.contains(&0) || !value.is_absolute() {
+        if place.value.is_empty() || bs_ipc::wire_has_nul(&place.value) || !value.is_absolute() {
             return Err(BadPlace::NotAbsolute);
         }
         out.push((name, value.into_os_string()));
@@ -45,22 +43,14 @@ pub fn parse(places: &[Place]) -> Result<Vec<(&'static str, OsString)>, BadPlace
     Ok(out)
 }
 
-/// Makes the places the whole environment the tables see: every variable they
-/// use is removed, then the requested ones are set.
-///
-/// Call it before the scan's own threads exist.
-pub fn apply(places: &[(&'static str, OsString)]) {
-    for name in Environment::variable_names() {
-        // SAFETY: nothing else reads or changes the environment while this
-        // runs. The helper's other threads only wait on pipes and sleep, and
-        // the scan's threads, which read the variables, are started after this
-        // returns.
-        unsafe { std::env::remove_var(name) };
-    }
-    for (name, value) in places {
-        // SAFETY: as above.
-        unsafe { std::env::set_var(name, value) };
-    }
+/// The environment the category tables resolve against: exactly the places of
+/// the request, and nothing from the helper's own environment.
+pub fn environment(places: &[(&'static str, OsString)]) -> Environment {
+    places
+        .iter()
+        .fold(Environment::new(), |env, (name, value)| {
+            env.with(name, value.as_encoded_bytes())
+        })
 }
 
 #[cfg(test)]
@@ -121,5 +111,40 @@ mod tests {
             parse(&[place("HOME", &ok), place("home", &absolute("b"))]),
             Err(BadPlace::Duplicate)
         );
+    }
+
+    #[test]
+    fn the_environment_holds_the_requests_places_and_nothing_else() {
+        use bs_knowledge::{Category, Knowledge};
+        let home = absolute_text("home");
+        // A place that exists only relative to a variable of the request: the
+        // user's home on Linux, the local application data folder on Windows.
+        let (variable, folder, want) = if cfg!(windows) {
+            ("LOCALAPPDATA", format!(r"{home}\Temp"), Category::CacheTemp)
+        } else {
+            (
+                "home",
+                format!("{home}/.local/share/Steam/steamapps/game"),
+                Category::AppsSystem,
+            )
+        };
+        let category = |env: &Environment| Knowledge::new(env).place_bytes(folder.as_bytes());
+        let parsed = parse(&[place(variable, &absolute("home"))]).unwrap();
+        // The request's place is the one the tables resolve against.
+        assert_eq!(
+            category(&environment(&parsed)),
+            Some(want),
+            "the places of the request are used"
+        );
+        // No places: nothing resolves, whatever the process's own variables.
+        assert_eq!(category(&environment(&[])), None);
+    }
+
+    fn absolute_text(text: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\{text}")
+        } else {
+            format!("/{text}")
+        }
     }
 }

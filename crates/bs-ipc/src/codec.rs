@@ -117,6 +117,7 @@ fn encode_into(message: &Message, out: &mut Vec<u8>) -> Result<(), EncodeError> 
                 Fallback::TooLarge => 2,
                 Fallback::PartialMount => 3,
                 Fallback::NotSupported => 4,
+                Fallback::MountNotPlaced => 5,
             });
             put_progress(&mut w, &done.progress);
         }
@@ -354,6 +355,7 @@ pub fn decode_body(body: &[u8], direction: Direction) -> Result<Message, DecodeE
                 2 => Fallback::TooLarge,
                 3 => Fallback::PartialMount,
                 4 => Fallback::NotSupported,
+                5 => Fallback::MountNotPlaced,
                 _ => return Err(DecodeError::BadValue),
             };
             Message::ScanDone(ScanDone {

@@ -1142,7 +1142,8 @@ impl ScratchCrate {
             .map(|line| {
                 let (file, word) = line.rsplit_once(": ").unwrap();
                 let file = Path::new(file).strip_prefix(&src).unwrap();
-                format!("{}: {word}", file.display())
+                // The same spelling on every system.
+                format!("{}: {word}", file.display().to_string().replace('\\', "/"))
             })
             .collect()
     }

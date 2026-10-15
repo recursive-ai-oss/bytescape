@@ -6,7 +6,9 @@ use crate::bins::BinPolicy;
 use crate::drives::{Drive, DriveKind};
 use std::path::Path;
 
-pub(crate) use bs_fsops::winpath::{fold, same_path, strip_extended_prefix};
+#[cfg(test)]
+pub(crate) use bs_fsops::winpath::same_path;
+pub(crate) use bs_fsops::winpath::{fold, strip_extended_prefix};
 
 /// Why the Recycle Bin would not take an item, if it would not.
 ///
@@ -39,6 +41,19 @@ pub(crate) fn objection(
         });
     }
     None
+}
+
+/// Whether the original path a Recycle Bin record gives is the place whose
+/// 16-bit units are `path`, ignoring case and the `\\?\` prefix.
+///
+/// The record holds text, and a path can hold a lone surrogate that no text
+/// can: compared as text, such a path would count as the same place as one
+/// with the replacement character at that spot, and the wrong bin item would
+/// be taken for the one that was recycled.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn same_place(original: &str, path: &[u16]) -> bool {
+    let original: Vec<u16> = original.encode_utf16().collect();
+    bs_fsops::winpath::same_path_units(&original, path)
 }
 
 /// Whether `path` is `root` or lies below it, comparing as Windows does:
@@ -302,6 +317,28 @@ mod tests {
         assert!(!is_inside(r"C:\Temp\fx", r"C:\Temp\fx2"));
         assert!(!is_inside(r"C:\Temp\fx", r"C:\Temp"));
         assert!(!is_inside(r"C:\Temp\fx", r"D:\Temp\fx\a"));
+    }
+
+    #[test]
+    fn a_recorded_path_is_the_same_place_only_by_its_exact_units() {
+        let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+        assert!(same_place(
+            r"C:\Users\Me\a.txt",
+            &units(r"\\?\c:\users\me\A.TXT")
+        ));
+        assert!(!same_place(
+            r"C:\Users\Me\a.txt",
+            &units(r"C:\Users\Me\b.txt")
+        ));
+        // A record is text; a path with a lone surrogate is not the file whose
+        // name has the replacement character in that place.
+        let mut lone = units(r"C:\Users\Me\a");
+        lone.push(0xD800);
+        assert!(!same_place("C:\\Users\\Me\\a\u{FFFD}", &lone));
+        assert!(same_place(
+            "C:\\Users\\Me\\a\u{FFFD}",
+            &units("C:\\Users\\Me\\a\u{FFFD}")
+        ));
     }
 
     #[test]

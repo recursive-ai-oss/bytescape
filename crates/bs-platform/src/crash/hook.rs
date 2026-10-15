@@ -20,8 +20,8 @@ use super::{AppInfo, actions, os, store};
 use std::fmt::Write;
 use std::panic::PanicHookInfo;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Reports written by one run of the program, at most. Panics beyond this are
@@ -37,6 +37,9 @@ struct State {
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
+/// The reports this run has written, so that a normal exit can say they were
+/// of panics the program survived.
+static WRITTEN_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 static WRITTEN: AtomicU32 = AtomicU32::new(0);
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
@@ -119,5 +122,24 @@ pub(crate) fn write_event(event: &Event<'_>) {
     let mut text = Bounded::new(MAX_REPORT_BYTES);
     write_report(&mut text, &facts, event, &recent, &trace);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let _ = store::write_report(&state.dir, &text.into_string(), facts.now, sequence);
+    if let Ok(path) = store::write_report(&state.dir, &text.into_string(), facts.now, sequence) {
+        // Never waits: if another thread holds the list the report is simply
+        // not remembered, and stays pending after a normal exit.
+        if let Ok(mut paths) = WRITTEN_PATHS.try_lock()
+            && paths.len() < MAX_REPORTS_PER_RUN as usize
+        {
+            paths.push(path);
+        }
+    }
+}
+
+/// Marks the reports this run wrote as seen. For a normal exit: a report
+/// written by a panic that the program caught and went on from is not a crash
+/// to tell the user about next time.
+pub(crate) fn mark_clean_exit() {
+    let paths = WRITTEN_PATHS
+        .lock()
+        .map(|mut paths| std::mem::take(&mut *paths))
+        .unwrap_or_default();
+    let _ = store::mark_seen(&paths);
 }

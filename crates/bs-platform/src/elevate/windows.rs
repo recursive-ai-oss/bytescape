@@ -21,7 +21,7 @@
 
 #![allow(unsafe_code)]
 
-use super::{ElevateError, Elevation, Launched, hex};
+use super::{ElevateError, Elevation, Launched, Unavailable, hex};
 use bs_fsops::winpipe::{PipeEnd, image_path_of_handle};
 use bs_ipc::{ClientError, NONCE_LEN, PROTOCOL_VERSION};
 use std::ffi::c_void;
@@ -89,7 +89,8 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 pub(super) fn random_bytes(buf: &mut [u8]) -> Result<(), ElevateError> {
-    let len = u32::try_from(buf.len()).map_err(|_| ElevateError::Unavailable("too many bytes"))?;
+    let len = u32::try_from(buf.len())
+        .map_err(|_| ElevateError::Unavailable(Unavailable::Other("too many bytes")))?;
     // SAFETY: `buf` is writable for `len` bytes; the system's preferred
     // generator is used with a null algorithm handle.
     let status = unsafe {
@@ -115,11 +116,13 @@ pub(super) fn helper_beside_this_program() -> Result<PathBuf, ElevateError> {
     let helper = own
         .parent()
         .map(|folder| folder.join("bytescape-helper.exe"))
-        .ok_or(ElevateError::Unavailable("this program has no folder"))?;
+        .ok_or(ElevateError::Unavailable(Unavailable::Other(
+            "this program has no folder",
+        )))?;
     if helper.is_file() {
         Ok(helper)
     } else {
-        Err(ElevateError::Unavailable("the helper is not installed"))
+        Err(ElevateError::Unavailable(Unavailable::HelperNotInstalled))
     }
 }
 
@@ -133,7 +136,9 @@ fn pipe_sddl() -> Option<String> {
 /// Creates the pipe: first instance, one instance, no remote clients, the
 /// current user only, open for overlapped I/O.
 fn create_pipe(name: &str) -> Result<PipeEnd, ElevateError> {
-    let sddl = pipe_sddl().ok_or(ElevateError::Unavailable("cannot tell who the user is"))?;
+    let sddl = pipe_sddl().ok_or(ElevateError::Unavailable(Unavailable::Other(
+        "cannot tell who the user is",
+    )))?;
     let wide_sddl = wide(&sddl);
     let mut descriptor: *mut c_void = std::ptr::null_mut();
     // SAFETY: `wide_sddl` is NUL-terminated and `descriptor` is writable; the
@@ -275,7 +280,7 @@ pub(super) fn launch(
     nonce: [u8; NONCE_LEN],
 ) -> Result<Launched, ElevateError> {
     let helper = std::fs::canonicalize(&elevation.helper)
-        .map_err(|_| ElevateError::Unavailable("the helper is not installed"))?;
+        .map_err(|_| ElevateError::Unavailable(Unavailable::HelperNotInstalled))?;
     let mut name_bytes = [0u8; 16];
     super::random_bytes(&mut name_bytes)?;
     let pipe_name = format!(r"\\.\pipe\bytescape-{}", hex(&name_bytes));
@@ -307,7 +312,12 @@ pub(super) fn launch(
         .map_err(|_| ElevateError::PeerNotVerified("the connecting program is unknown"))?;
     let image = std::fs::canonicalize(image)
         .map_err(|_| ElevateError::PeerNotVerified("the connecting program is unknown"))?;
-    if !bs_fsops::winpath::same_path(&image.to_string_lossy(), &helper.to_string_lossy()) {
+    // Compared by the 16-bit units of the names, not as text.
+    let units = |path: &std::path::Path| -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str().encode_wide().collect()
+    };
+    if !bs_fsops::winpath::same_path_units(&units(&image), &units(&helper)) {
         return Err(ElevateError::PeerNotVerified(
             "the connecting program is not the helper",
         ));

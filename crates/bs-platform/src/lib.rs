@@ -14,6 +14,7 @@ pub mod delete;
 pub mod dialog;
 pub mod drives;
 pub mod elevate;
+pub mod elevation;
 pub mod launch;
 pub mod software;
 

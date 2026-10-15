@@ -203,19 +203,20 @@ fn a_missing_item_is_reported_and_does_not_stop_the_others() {
 fn an_item_that_is_not_what_was_seen_is_left_alone() {
     let lab = Lab::new("seen");
     lab.write("work/f", "x");
-    let meta = fs::symlink_metadata(lab.p("work/f")).unwrap();
+    // What the interface sees when it selects the item.
+    let seen = bs_fsops::Target::open(&lab.p("work/f")).unwrap().identity();
     let mut wrong = item(&lab.p("work/f"));
     wrong.seen = Some(Seen {
-        volume: meta.dev(),
-        file: u128::from(meta.ino()) + 1,
+        volume: seen.volume,
+        file: seen.file + 1,
     });
     let outcomes = run(&lab.judge(), &request(vec![wrong]));
     assert_eq!(refusal(&outcomes[0]), Refusal::ChangedSinceScan);
     assert!(lab.exists("work/f"));
     let mut right = item(&lab.p("work/f"));
     right.seen = Some(Seen {
-        volume: meta.dev(),
-        file: u128::from(meta.ino()),
+        volume: seen.volume,
+        file: seen.file,
     });
     let outcomes = run(&lab.judge(), &request(vec![right]));
     assert!(matches!(outcomes[0], ItemOutcome::Deleted { .. }));
