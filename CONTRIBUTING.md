@@ -74,7 +74,7 @@ Everything in this repository is public, including comments, workflow files and 
 
 ## Tests that touch the machine
 
-Some tests move files to the Recycle Bin or Trash, or call the operating system in other ways that change state. They run only when `BYTESCAPE_DISPOSABLE_HOST=1` is set, which CI sets on its throwaway runners. Set it on your own machine only if it is a virtual machine or another disposable system. Three Linux tests need more than that: two run inside a private user namespace and one mounts file systems as root. `BYTESCAPE_DISPOSABLE_HOST=1 packaging/ci/linux-privileged-tests.sh` runs them (it needs passwordless `sudo`, `btrfs-progs`, and on Ubuntu 24.04 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`) and fails if any of them reports `NOT RUN`. CI runs it on the Linux legs.
+Some tests move files to the Recycle Bin or Trash, or call the operating system in other ways that change state. They run only when `BYTESCAPE_DISPOSABLE_HOST=1` is set, which CI sets on its throwaway runners. Set it on your own machine only if it is a virtual machine or another disposable system. Three Linux tests need more than that: two run inside a private user namespace and one mounts file systems as root. `BYTESCAPE_DISPOSABLE_HOST=1 packaging/ci/linux-privileged-tests.sh` runs them (it needs passwordless `sudo`, `btrfs-progs`, and on Ubuntu 24.04 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`) and fails if any of them reports `NOT RUN`. CI runs it on the Linux legs. The btrfs reader's image tests need a `mkfs.btrfs` that knows `--subvol`, which Ubuntu 24.04's `btrfs-progs` (6.6) does not; `packaging/ci/build-btrfs-progs.sh [PREFIX]` builds a pinned, checksummed upstream release, and CI uses it.
 
 ## Pull requests
 

@@ -18,14 +18,26 @@ loadconfig   Reads DependentLoadFlags from the load configuration and fails
              looks for its libraries in the system folder only, never beside
              itself.
 
-canary       Builds a stand-in bcryptprimitives.dll whose DllMain writes a file
-             (it also exports ProcessPrng, the function Rust's standard library
-             asks that DLL for, so the loader accepts it). First, a control: a
-             process that loads it by full path must write the file. Then the
-             helper is copied next to the DLL in a temporary folder and started
-             with no arguments; the file must not appear. Needs rustc, and an
-             elevated shell, because the helper's manifest asks for
-             administrator rights.
+canary       Shows that a program linked with the helper's DLL-search flag
+             really ignores a DLL planted beside it. The helper itself cannot
+             show this: every library it imports is a system library that
+             Windows has already loaded, or resolves by name from the system
+             folder, before the program's own folder is looked at, so no
+             planted file could be picked up even without the flag. So the
+             check uses a probe program (dependent-load-probe.rs) that imports
+             from version.dll, linked with the same /DEPENDENTLOADFLAG:0x800.
+             A stand-in version.dll (canary-dll.rs) writes a file when it is
+             loaded. Two controls come first. One: a process that loads the
+             stand-in by full path must write the file. Two: a copy of the probe
+             with DependentLoadFlags set to zero, started beside the stand-in,
+             must write it too; that shows a DLL beside a program is picked up
+             when nothing restricts the search. If either control writes
+             nothing, the check cannot tell anything and exits 2 (never "ok").
+             Then the probe as linked is started beside the stand-in: the file
+             must not appear. The helper is tied to the probe by the
+             DependentLoadFlags value the two must share, which the helper
+             file itself is read for. Needs rustc and a Windows SDK (the
+             linker finds it).
 
 Exit status: 0 good, 1 a check failed, 2 could not run the check.
 """
@@ -39,10 +51,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+# The same names as the helper's no-spawn test (crates/bytescape-helper/tests/
+# no_spawn.rs) looks for in source, as far as they can be imports of a Windows
+# program. test_check_helper.py fails when the two lists differ.
 FORBIDDEN = re.compile(
     r"^(CreateProcess\w*|CreateProcessAsUser\w*|CreateProcessWithLogonW|CreateProcessWithTokenW"
     r"|ShellExecute\w*|WinExec|NtCreateUserProcess|RtlCreateUserProcess|CreateProcessInternal\w*"
-    r"|system|_wsystem|_spawn\w*|_wspawn\w*|_exec\w*|_wexec\w*)$"
+    r"|NtCreateProcess|NtCreateProcessEx|system|_wsystem|_popen|_wpopen"
+    r"|_spawn\w*|_wspawn\w*|_exec\w*|_wexec\w*)$"
 )
 
 
@@ -132,17 +148,37 @@ class Pe:
                 at += 32
         return found
 
-    def dependent_load_flags(self):
-        """DependentLoadFlags from the load configuration, or None if absent."""
+    def dependent_load_flags_at(self):
+        """File offset of DependentLoadFlags in the load configuration, or None.
+
+        In IMAGE_LOAD_CONFIG_DIRECTORY the field is at byte 78 for a 64-bit
+        file and byte 54 for a 32-bit one (EditList follows it).
+        """
         config = self.directory(10)
         if not config:
             return None
         at = self.offset(config[0])
         size = struct.unpack_from("<I", self.data, at)[0]
-        field = 78 if self.plus else 56
+        field = 78 if self.plus else 54
         if size < field + 2:
             return None
-        return struct.unpack_from("<H", self.data, at + field)[0]
+        return at + field
+
+    def dependent_load_flags(self):
+        """DependentLoadFlags from the load configuration, or None if absent."""
+        at = self.dependent_load_flags_at()
+        if at is None:
+            return None
+        return struct.unpack_from("<H", self.data, at)[0]
+
+    def with_zeroed_load_flags(self):
+        """A copy of the file with DependentLoadFlags set to zero, or None."""
+        at = self.dependent_load_flags_at()
+        if at is None:
+            return None
+        data = bytearray(self.data)
+        data[at : at + 2] = b"\0\0"
+        return bytes(data)
 
 
 def check_imports(path: Path) -> bool:
@@ -150,7 +186,7 @@ def check_imports(path: Path) -> bool:
     found = pe.imports()
     bad = sorted({f"{dll}!{name}" for dll, name in found if FORBIDDEN.match(name)})
     dlls = sorted({dll.lower() for dll, _ in found})
-    print(f"{path.name}: {len(found)} imports from {len(dlls)} libraries")
+    print(f"{path.name}: {len(found)} imports from {len(dlls)} libraries: {', '.join(dlls)}")
     if bad:
         print("FAILED: the helper imports functions that start programs:", ", ".join(bad))
         return False
@@ -168,26 +204,62 @@ def check_loadconfig(path: Path) -> bool:
     return True
 
 
-CANARY_SOURCE = Path(__file__).with_name("bcryptprimitives-canary.rs")
+CANARY_SOURCE = Path(__file__).with_name("canary-dll.rs")
+PROBE_SOURCE = Path(__file__).with_name("dependent-load-probe.rs")
 CANARY_FILE = "canary-loaded.txt"
+
+
+def run_beside_canary(exe: Path, folder: Path, name: str):
+    """Start `exe` (copied to `folder/name`, which holds the stand-in DLL) with
+    no arguments. Exits with status 2 if it cannot be started or fails."""
+    copy = folder / name
+    shutil.copy2(exe, copy)
+    try:
+        ran = subprocess.run([str(copy)], cwd=folder, stdin=subprocess.DEVNULL,
+                             capture_output=True, timeout=60)
+    except OSError as error:
+        print(f"could not start {name}:", error)
+        sys.exit(2)
+    if ran.returncode != 0:
+        print(f"{name} did not run cleanly: status {ran.returncode & 0xFFFFFFFF:#x}")
+        sys.exit(2)
+    print(f"{name} ran and exited with status 0")
+
+
+def rustc(source: Path, out: Path, *args: str):
+    built = subprocess.run(["rustc", "--edition", "2024", "-O", *args, "-o", str(out), str(source)],
+                           capture_output=True, text=True)
+    if built.returncode != 0 or not out.exists():
+        print(f"could not build {source.name}:", built.stderr)
+        sys.exit(2)
 
 
 def check_canary(path: Path) -> bool:
     if os.name != "nt":
         print("canary: skipped (Windows only)")
         return True
+    helper_flags = Pe(path.read_bytes()).dependent_load_flags()
     work = Path(tempfile.mkdtemp(prefix="bytescape-canary-"))
     try:
-        dll = work / "bcryptprimitives.dll"
-        built = subprocess.run(
-            ["rustc", "--edition", "2024", "--crate-type", "cdylib", "-C", "panic=abort",
-             "-O", "-o", str(dll), str(CANARY_SOURCE)],
-            capture_output=True, text=True,
-        )
-        if built.returncode != 0 or not dll.exists():
-            print("could not build the canary DLL:", built.stderr)
+        dll = work / "version.dll"
+        rustc(CANARY_SOURCE, dll, "--crate-type", "cdylib", "-C", "panic=abort")
+        probe = work / "probe.exe"
+        rustc(PROBE_SOURCE, probe, "-C", "link-arg=/DEPENDENTLOADFLAG:0x800")
+        pe = Pe(probe.read_bytes())
+        flags = pe.dependent_load_flags()
+        print(f"probe: DependentLoadFlags = {flags if flags is None else hex(flags)}")
+        if flags != 0x800:
+            print("could not run the canary: the linker did not record the flag in the probe")
             sys.exit(2)
-        # Control: a process that loads the DLL by full path writes the file.
+        if helper_flags != flags:
+            print(f"FAILED: the helper's flags ({helper_flags}) are not the probe's ({flags:#x})")
+            return False
+        zeroed = pe.with_zeroed_load_flags()
+        if zeroed is None:
+            print("could not run the canary: nothing to zero in the probe")
+            sys.exit(2)
+        # Control one: a process that loads the stand-in by full path writes
+        # the file.
         control = work / "control"
         control.mkdir()
         loaded = subprocess.run(
@@ -197,25 +269,30 @@ def check_canary(path: Path) -> bool:
         if not (control / CANARY_FILE).exists():
             print("could not run the canary: loading it by full path wrote nothing", loaded.stderr)
             sys.exit(2)
-        print("control ok: the canary writes its file when it is loaded")
-        # The test: the helper, started with no arguments, beside the DLL.
-        helper = work / "bytescape-helper.exe"
-        shutil.copy2(path, helper)
-        try:
-            ran = subprocess.run([str(helper)], cwd=work, stdin=subprocess.DEVNULL,
-                                 capture_output=True, timeout=60)
-        except OSError as error:
-            print("could not start the helper (is this shell elevated?):", error)
+        print("control ok: the stand-in writes its file when it is loaded")
+        # Control two: the probe with the restriction removed, beside the
+        # stand-in, must load it. If it does not, a DLL beside a program is
+        # not picked up here at all and the real run below would prove nothing.
+        loose = work / "loose"
+        loose.mkdir()
+        shutil.copy2(dll, loose / dll.name)
+        zeroed_exe = work / "zeroed.exe"
+        zeroed_exe.write_bytes(zeroed)
+        run_beside_canary(zeroed_exe, loose, "probe.exe")
+        if not (loose / CANARY_FILE).exists():
+            print("inconclusive: the probe with DependentLoadFlags zeroed did not load a DLL "
+                  "planted beside it, so a clean result below would prove nothing")
             sys.exit(2)
-        code = ran.returncode & 0xFFFFFFFF
-        if code >= 0xC0000000:
-            print(f"the helper did not start: loader status {code:#x}")
-            sys.exit(2)
-        print(f"the helper ran and exited with status {ran.returncode}")
-        if (work / CANARY_FILE).exists():
-            print("FAILED: the helper loaded a DLL planted beside it")
+        print("control ok: without the restriction a DLL planted beside the program is loaded")
+        # The test: the probe as linked, beside the stand-in.
+        tight = work / "tight"
+        tight.mkdir()
+        shutil.copy2(dll, tight / dll.name)
+        run_beside_canary(probe, tight, "probe.exe")
+        if (tight / CANARY_FILE).exists():
+            print("FAILED: a program linked with /DEPENDENTLOADFLAG:0x800 loaded a DLL planted beside it")
             return False
-        print("ok: a bcryptprimitives.dll beside the helper was not loaded")
+        print("ok: with /DEPENDENTLOADFLAG:0x800 a version.dll beside the program was not loaded")
         return True
     finally:
         shutil.rmtree(work, ignore_errors=True)
