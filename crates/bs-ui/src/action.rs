@@ -78,6 +78,8 @@ impl Action {
 pub mod reason {
     /// The box is still being counted.
     pub const SCANNING: &str = "Still scanning";
+    /// The scan was stopped before the box was counted.
+    pub const SCAN_STOPPED: &str = "Scan stopped";
     /// The box is part of the operating system.
     pub const OPERATING_SYSTEM: &str = "Part of the operating system";
     /// Nothing is selected.
@@ -88,4 +90,7 @@ pub mod reason {
     pub const DELETED: &str = "Already deleted";
     /// Not a folder.
     pub const NOT_A_FOLDER: &str = "Not a folder";
+    /// A block that stands for free space or the like, not for a file or
+    /// folder.
+    pub const NOT_ON_DISK: &str = "Not a file or folder";
 }

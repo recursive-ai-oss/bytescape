@@ -25,6 +25,8 @@ pub struct CardData {
     pub files: u64,
     /// Still being counted: the sizes are lower bounds.
     pub in_progress: bool,
+    /// The scan was stopped before this was counted completely.
+    pub stopped: bool,
     /// The size is an estimate.
     pub estimated: bool,
     pub is_folder: bool,
@@ -175,7 +177,11 @@ pub fn why_not(data: &CardData, action: Action) -> Option<&'static str> {
             if data.blocked {
                 Some(reason::OPERATING_SYSTEM)
             } else if !data.complete {
-                Some(reason::SCANNING)
+                Some(if data.stopped {
+                    reason::SCAN_STOPPED
+                } else {
+                    reason::SCANNING
+                })
             } else {
                 gone
             }
@@ -528,6 +534,7 @@ mod tests {
             parent_bytes: Some(100_000_000_000),
             files: 1234,
             in_progress: false,
+            stopped: false,
             estimated: false,
             is_folder: true,
             modified: Some(1_709_596_800),

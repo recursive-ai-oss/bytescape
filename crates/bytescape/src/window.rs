@@ -9,14 +9,18 @@ use std::time::{Duration, Instant};
 
 use bs_layout::Metrics;
 use bs_platform::appearance::{Appearance, ColorScheme};
-use bs_platform::drives::Capacity;
+use bs_platform::bins::BinControl;
+use bs_platform::drives::{Capacity, Drive};
 use bs_render::present::Presenter;
 use bs_render::{
     Chrome, Flags, Item, ItemKind, ItemLabel, Painted, Palette, Rect, Renderer, TextEngine,
 };
+use bs_tree::Progress;
 use bs_tree::Snapshot;
-use bs_ui::capacity::{Breakdown, FakeRecycleBin, RecycleBinSource};
-use bs_ui::shell::{Look, Shell, ShellEffect};
+use bs_ui::blocks::DriveBlocks;
+use bs_ui::capacity::Breakdown;
+use bs_ui::picker::{CardScan, Picker, StartPlan, plan_start};
+use bs_ui::shell::{Look, ScanReadout, Shell, ShellEffect};
 use bs_ui::tree::{TreeSource, scan_status};
 use bs_ui::{
     App, Direction, Effect, FinishedRelayout, InputEvent, Key, Modifiers, PendingRelayout, chrome,
@@ -30,8 +34,10 @@ use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 use crate::bench::{self, FrameSink, Offscreen, Script};
 use crate::clipboard;
-use crate::live::{ScanDriver, Tick};
+use crate::folder;
+use crate::live::{RateMeter, ScanDriver, Tick};
 use crate::open;
+use crate::shots;
 use crate::synth::{LayoutParams, SynthSource, format_size};
 use crate::{Mode, ShotOptions, ZoomOptions, font_px, real};
 
@@ -440,6 +446,11 @@ fn screenshots(opts: &ShotOptions) -> Result<(), String> {
         (true, None) => vec!["map20k".into(), "showcase".into(), "swatch".into()],
         (false, _) => opts.states.clone(),
     };
+    let (picker_states, states): (Vec<String>, Vec<String>) =
+        states.into_iter().partition(|s| shots::is_picker_state(s));
+    if !picker_states.is_empty() {
+        shots::screenshots(opts, &picker_states, &text)?;
+    }
     let (nav_states, states): (Vec<String>, Vec<String>) =
         states.into_iter().partition(|s| real::is_nav_state(s));
     let (real_states, states): (Vec<String>, Vec<String>) = states
@@ -531,6 +542,30 @@ struct Live {
     drive_rx: Option<Receiver<Option<DriveState>>>,
     appearance_rx: Option<Receiver<Appearance>>,
     next_pulse: Instant,
+    /// The drives, once the platform has listed them.
+    drives: Vec<Drive>,
+    drives_rx: Option<Receiver<Vec<Drive>>>,
+    /// The scans running behind the picker, one per drive scanned from
+    /// launch.
+    pool: Vec<PoolScan>,
+    folder_rx: Option<Receiver<folder::Choice>>,
+    /// The bytes of the open drive's Recycle Bin, once measured.
+    bin_rx: Option<Receiver<u64>>,
+    /// The drive-level blocks changed and the top view must be laid out
+    /// again.
+    blocks_dirty: bool,
+    rate: RateMeter,
+    next_readout: Instant,
+    next_card_update: Instant,
+    /// What the map being scanned shows, to scan it again.
+    scan_root: Option<PathBuf>,
+}
+
+/// A background scan of one drive while the picker shows.
+struct PoolScan {
+    drive_index: usize,
+    driver: ScanDriver,
+    bin_rx: Option<Receiver<u64>>,
 }
 
 /// What is known about the drive under the scanned folder.
@@ -541,6 +576,28 @@ struct DriveState {
     /// The scan covers the whole drive, so the gap between what was counted
     /// and what the system reports as used is a real unreadable part.
     whole_drive: bool,
+    /// Bytes in the drive's Recycle Bin or Trash, once measured.
+    bin: u64,
+}
+
+impl Live {
+    /// Whether the open map was reached from the picker.
+    fn came_from_picker(&self) -> bool {
+        self.shell.picker_return()
+    }
+}
+
+/// Measures a drive's bin on a worker thread; the answer is the bytes to
+/// show.
+fn spawn_bin(drive: Drive) -> Receiver<u64> {
+    let (tx, rx) = mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("bin".into())
+        .spawn(move || {
+            let info = bs_platform::bins::measure(&drive, &BinControl::new());
+            let _ = tx.send(info.bytes_for_display());
+        });
+    rx
 }
 
 /// What the live map cost while a scan ran, for the `--bench-live` report.
@@ -585,15 +642,22 @@ struct WinApp {
     /// The scan ended and the layout of its final tree is still to come.
     final_requested: bool,
     stats: LiveStats,
+    /// A bare launch: the drive picker, or a drive's map when there is only
+    /// one.
+    launch_drives: bool,
+    /// The picker's cards are on screen but no frame has shown them yet.
+    picker_pending: bool,
 }
 
-/// Where a bare launch scans until the drive picker exists: the home folder.
-fn default_scan_root() -> PathBuf {
+/// Where the folder dialog starts: the home folder.
+fn home_folder() -> String {
     let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var_os(home)
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
         .unwrap_or_else(|| PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" }))
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn run_window(mode: Mode, t0: Instant) -> Result<(), String> {
@@ -604,8 +668,12 @@ fn run_window(mode: Mode, t0: Instant) -> Result<(), String> {
         Mode::Zoom(_) => text.load_fonts(),
         _ => text.load_fonts_in_background(),
     }
+    let launch_drives = matches!(
+        &mode,
+        Mode::Interactive { path: None } | Mode::FirstFrame { path: None }
+    );
     let scan_path = match &mode {
-        Mode::Interactive { path } => Some(path.clone().unwrap_or_else(default_scan_root)),
+        Mode::Interactive { path } => path.clone(),
         Mode::FirstFrame { path } => path.clone(),
         Mode::Live { path, .. } => Some(path.clone()),
         _ => None,
@@ -635,6 +703,8 @@ fn run_window(mode: Mode, t0: Instant) -> Result<(), String> {
         finish_pending: false,
         final_requested: false,
         stats: LiveStats::default(),
+        launch_drives,
+        picker_pending: false,
     };
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
@@ -647,12 +717,27 @@ fn run_window(mode: Mode, t0: Instant) -> Result<(), String> {
 /// Applies the app's effects to the renderer. Returns whether the view
 /// changed, so the breadcrumb needs rebuilding.
 pub(crate) fn apply(renderer: &mut Renderer, fx: Vec<Effect>, now: Duration) -> bool {
+    apply_in(renderer, fx, now, false)
+}
+
+/// Like [`apply`]. With `background`, a new view is drawn on another thread
+/// and swapped in when ready, so the event loop is never held up by a repaint
+/// of the whole window (layouts that arrive while a scan runs).
+pub(crate) fn apply_in(
+    renderer: &mut Renderer,
+    fx: Vec<Effect>,
+    now: Duration,
+    background: bool,
+) -> bool {
     let mut view_changed = false;
     for e in fx {
         match e {
             Effect::SetHover(id) => renderer.set_hover(id),
             Effect::SetSelected(id) => renderer.set_selected(id),
             Effect::SetSelection(ids) => renderer.set_selection(&ids),
+            Effect::SetView(items) if background => {
+                renderer.set_items_background(items);
+            }
             Effect::SetView(items) => renderer.set_items(items),
             Effect::Zoom {
                 direction,
@@ -668,7 +753,8 @@ pub(crate) fn apply(renderer: &mut Renderer, fx: Vec<Effect>, now: Duration) -> 
 
 /// Applies the shell's effects: the map's, the legend dimming, the link, the
 /// clipboard and stopping the scan.
-fn apply_shell(live: &mut Live, fx: Vec<ShellEffect>, now: Duration) {
+fn apply_shell(live: &mut Live, fx: Vec<ShellEffect>, now: Duration) -> Vec<ShellEffect> {
+    let mut left = Vec::new();
     for e in fx {
         match e {
             ShellEffect::Map(e) => {
@@ -691,16 +777,43 @@ fn apply_shell(live: &mut Live, fx: Vec<ShellEffect>, now: Duration) {
             }
             // Deleting, opening and the rest belong to layers that do not
             // exist yet; the shell has already said so where it matters.
-            ShellEffect::Action { .. } => {}
+            ShellEffect::Action { .. } | ShellEffect::FullScan | ShellEffect::EmptyBin => {}
+            other @ (ShellEffect::PickDrive(_)
+            | ShellEffect::ScanFolder
+            | ShellEffect::ShowPicker
+            | ShellEffect::Rescan) => left.push(other),
         }
     }
+    left
+}
+
+/// Lists the drives on a worker thread; the picker appears when the answer
+/// arrives.
+fn list_drives_in_background(live: &mut Live) {
+    let (tx, rx) = mpsc::channel();
+    live.drives_rx = Some(rx);
+    let _ = std::thread::Builder::new()
+        .name("drives".into())
+        .spawn(move || {
+            let _ = tx.send(bs_platform::drives::list_drives().unwrap_or_default());
+        });
 }
 
 /// Hands the renderer the chrome for `now`. Returns whether it changed.
 fn refresh_chrome(live: &mut Live, now: Duration) -> bool {
-    let chrome = live.shell.chrome(now);
-    let card = live.renderer.set_card(live.shell.card().cloned());
-    live.renderer.set_chrome(chrome) | card
+    refresh_shell_chrome(&mut live.renderer, &mut live.shell, now)
+}
+
+/// Hands `renderer` the chrome and the hover card of `shell`. Returns whether
+/// anything changed.
+pub(crate) fn refresh_shell_chrome(
+    renderer: &mut Renderer,
+    shell: &mut Shell<TreeSource>,
+    now: Duration,
+) -> bool {
+    let chrome = shell.chrome(now);
+    let card = renderer.set_card(shell.card().cloned());
+    renderer.set_chrome(chrome) | card
 }
 
 /// The look from the system, with `BYTESCAPE_THEME` as an override for
@@ -737,45 +850,75 @@ fn poll_appearance(live: &mut Live) {
         });
 }
 
-/// Looks up the drive under `path` on a worker thread.
+/// Looks up the drive under `path` on a worker thread, then measures its
+/// bin.
 fn query_drive(live: &mut Live, path: PathBuf) {
     let (tx, rx) = mpsc::channel();
+    let (bin_tx, bin_rx) = mpsc::channel();
     live.drive_rx = Some(rx);
+    live.bin_rx = Some(bin_rx);
     let _ = std::thread::Builder::new()
         .name("drive".into())
         .spawn(move || {
-            let state = bs_platform::drives::volume_for_path(&path)
-                .ok()
-                .and_then(|drive| {
-                    let capacity = drive.capacity?;
-                    let same = |a: &Path, b: &Path| match (
-                        std::fs::canonicalize(a),
-                        std::fs::canonicalize(b),
-                    ) {
+            let drive = bs_platform::drives::volume_for_path(&path).ok();
+            let state = drive.as_ref().and_then(|drive| {
+                let capacity = drive.capacity?;
+                let same =
+                    |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b))
+                    {
                         (Ok(a), Ok(b)) => a == b,
                         _ => a == b,
                     };
-                    Some(DriveState {
-                        capacity,
-                        whole_drive: same(&path, &drive.mount_point),
-                        root: drive.mount_point,
-                    })
-                });
+                Some(DriveState {
+                    capacity,
+                    whole_drive: same(&path, &drive.mount_point),
+                    root: drive.mount_point.clone(),
+                    bin: 0,
+                })
+            });
             let _ = tx.send(state);
+            if let Some(drive) = drive {
+                let info = bs_platform::bins::measure(&drive, &BinControl::new());
+                let _ = bin_tx.send(info.bytes_for_display());
+            }
         });
 }
 
-/// Feeds the capacity bar from the drive's sizes and what the scan counted.
-fn update_capacity(live: &mut Live, now: Duration) {
-    let (Some(drive), Some(snapshot)) = (&live.drive, &live.snapshot) else {
-        return;
-    };
+/// How the open drive's bytes divide up, from what the platform reported and
+/// what the scan has counted.
+fn breakdown(live: &Live) -> Option<Breakdown> {
+    let (drive, snapshot) = (live.drive.as_ref()?, live.snapshot.as_ref()?);
     let counted = snapshot.root().map_or(0, |r| r.allocated());
     let complete = drive.whole_drive && snapshot.scan_complete() && !snapshot.scan_stopped();
-    // The bin's size comes from a stand-in until the platform measures it.
-    let bin = FakeRecycleBin(0).bytes(&drive.root);
-    live.shell
-        .set_capacity(Breakdown::new(&drive.capacity, counted, complete, bin), now);
+    Some(Breakdown::new(
+        &drive.capacity,
+        counted,
+        complete,
+        drive.bin,
+    ))
+}
+
+/// The blocks beside a whole drive's folders. A folder scan has none.
+fn drive_blocks(live: &Live) -> Option<DriveBlocks> {
+    let drive = live.drive.as_ref().filter(|d| d.whole_drive)?;
+    breakdown(live)
+        .filter(|_| drive.whole_drive)
+        .map(|b| DriveBlocks::from(&b))
+}
+
+/// Feeds the capacity bar and the drive-level blocks.
+fn update_capacity(live: &mut Live, now: Duration) {
+    let Some(b) = breakdown(live) else {
+        return;
+    };
+    live.shell.set_capacity(b, now);
+    let blocks = drive_blocks(live);
+    if let Some(app) = live.shell.app_mut()
+        && app.source().drive_blocks().copied() != blocks
+    {
+        app.source_mut().set_drive_blocks(blocks);
+        live.blocks_dirty = true;
+    }
 }
 
 /// Starts laying the current view out on a worker thread.
@@ -789,7 +932,351 @@ fn spawn_relayout(live: &mut Live, pending: PendingRelayout) {
         });
 }
 
+/// Starts the background scans of the drives that are scanned from launch.
+fn start_pool(live: &mut Live) {
+    if live.shell.picker().is_none() || !live.pool.is_empty() {
+        return;
+    }
+    for (i, drive) in live.drives.iter().enumerate() {
+        if !drive.eligible_for_background_scan {
+            continue;
+        }
+        let used = drive.capacity.map(|c| c.used);
+        live.pool.push(PoolScan {
+            drive_index: i,
+            driver: ScanDriver::start_with(drive.mount_point.clone(), used),
+            bin_rx: Some(spawn_bin(drive.clone())),
+        });
+    }
+}
+
+/// How often the cards of the picker read the scans behind them.
+const CARD_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Reads the scans running behind the picker into its cards.
+fn pump_pool(live: &mut Live, now: Duration) {
+    let tick_now = Instant::now();
+    if tick_now < live.next_card_update {
+        return;
+    }
+    live.next_card_update = tick_now + CARD_INTERVAL;
+    let mut changed = false;
+    for ps in &mut live.pool {
+        if let Some(rx) = &ps.bin_rx
+            && let Ok(bytes) = rx.try_recv()
+        {
+            ps.bin_rx = None;
+            if let Some(card) = live
+                .shell
+                .picker_mut()
+                .and_then(|p| p.card_for_drive(ps.drive_index))
+            {
+                card.bin = bytes;
+                changed = true;
+            }
+        }
+        let outcome = match ps.driver.tick(tick_now) {
+            Tick::Finished(snapshot, problem) => Some((snapshot, problem)),
+            _ => None,
+        };
+        let running = ps.driver.running();
+        let snapshot = match &outcome {
+            Some((s, _)) => Arc::clone(s),
+            None => ps.driver.latest(),
+        };
+        let Some(card) = live
+            .shell
+            .picker_mut()
+            .and_then(|p| p.card_for_drive(ps.drive_index))
+        else {
+            continue;
+        };
+        let (files, bytes) = snapshot
+            .root()
+            .map_or((0, 0), |r| (u64::from(r.file_count()), r.allocated()));
+        let scan = if let Some((snap, problem)) = &outcome {
+            if problem.is_some() {
+                CardScan::Failed
+            } else if snap.scan_stopped() {
+                CardScan::Stopped
+            } else {
+                CardScan::Done { files }
+            }
+        } else if running && snapshot.root().is_some() {
+            CardScan::Running {
+                ratio: match snapshot.progress() {
+                    Progress::Ratio(r) => Some(r as f32),
+                    Progress::Files(_) => None,
+                },
+                files,
+                bytes,
+            }
+        } else {
+            card.scan
+        };
+        let complete = snapshot.scan_complete() && !snapshot.scan_stopped();
+        if card.scan != scan || card.counted != bytes || card.complete != complete {
+            card.scan = scan;
+            card.counted = bytes;
+            card.complete = complete;
+            changed = true;
+        }
+    }
+    if changed {
+        refresh_chrome(live, now);
+        live.window.request_redraw();
+    }
+}
+
+/// The progress overlay's figures for the scan running now.
+fn update_readout(live: &mut Live) {
+    let Some(scan) = live.scan.as_ref().filter(|s| s.running()) else {
+        live.shell.set_readout(None);
+        return;
+    };
+    let snapshot = scan.latest();
+    let counters = scan.progress().unwrap_or_default();
+    let rate = live.rate.sample(Instant::now(), counters.files);
+    live.shell.set_readout(Some(ScanReadout {
+        ratio: match snapshot.progress() {
+            Progress::Ratio(r) => Some(r as f32),
+            Progress::Files(_) => None,
+        },
+        files: snapshot.root().map_or(0, |r| u64::from(r.file_count())),
+        files_per_sec: rate,
+        elapsed: scan.elapsed(),
+    }));
+}
+
 impl WinApp {
+    /// Takes the drive list when the platform has answered, and decides what
+    /// the first screen is.
+    fn pump_drives(&mut self, now: Duration) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Some(rx) = live.folder_rx.as_ref()
+            && let Ok(choice) = rx.try_recv()
+        {
+            live.folder_rx = None;
+            match choice {
+                folder::Choice::Folder(path) => {
+                    self.open_path(path, now);
+                    return;
+                }
+                folder::Choice::Cancelled => {}
+                folder::Choice::Unavailable(text) => live.shell.notify(text, now),
+            }
+        }
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let Some(rx) = live.drives_rx.as_ref() else {
+            return;
+        };
+        let Ok(drives) = rx.try_recv() else {
+            return;
+        };
+        live.drives_rx = None;
+        live.drives = drives;
+        if matches!(self.mode, Mode::FirstFrame { .. }) {
+            println!(
+                "internal.drives_listed_ms={:.3}",
+                self.t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        match plan_start(&live.drives, None) {
+            StartPlan::OpenDrive(i) => self.open_drive(i, false, now),
+            _ => self.show_picker(now),
+        }
+    }
+
+    /// Shows the picker and starts scanning the drives that are scanned from
+    /// launch.
+    fn show_picker(&mut self, now: Duration) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if let Some(scan) = live.scan.take() {
+            drop(scan.discard());
+        }
+        for ps in live.pool.drain(..) {
+            drop(ps.driver.discard());
+        }
+        live.drive = None;
+        live.drive_rx = None;
+        live.bin_rx = None;
+        live.relayout = None;
+        live.snapshot = None;
+        live.scan_root = None;
+        live.shell.set_status(
+            "Pick a drive. Your internal drives are already being scanned.".into(),
+            false,
+        );
+        live.shell.set_crumb("Drives".into());
+        live.shell.clear_capacity();
+        live.shell.set_picker(Picker::new(&live.drives));
+        live.shell.set_picker_return(false);
+        // The scans start once the cards are on screen (see `start_pool`), so
+        // their threads never compete with drawing the first picker frame.
+        if let Some(items) = live.shell.picker_items() {
+            live.renderer.set_items(items);
+        }
+        refresh_chrome(live, now);
+        live.window.request_redraw();
+        self.picker_pending = true;
+    }
+
+    /// Opens a drive's map. Its background scan, if it has one, carries on
+    /// from where it is; every other scan is stopped and freed.
+    fn open_drive(&mut self, index: usize, from_picker: bool, now: Duration) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let Some(drive) = live.drives.get(index).cloned() else {
+            return;
+        };
+        let pooled = live
+            .pool
+            .iter()
+            .position(|p| p.drive_index == index)
+            .map(|p| live.pool.remove(p).driver);
+        for ps in live.pool.drain(..) {
+            drop(ps.driver.discard());
+        }
+        let driver = pooled.unwrap_or_else(|| {
+            ScanDriver::start_with(drive.mount_point.clone(), drive.capacity.map(|c| c.used))
+        });
+        let known = drive.capacity.map(|capacity| DriveState {
+            capacity,
+            root: drive.mount_point.clone(),
+            whole_drive: true,
+            bin: 0,
+        });
+        let root = drive.mount_point.clone();
+        self.begin_map(driver, root, known.map(|k| (k, drive)), from_picker, now);
+    }
+
+    /// Scans a folder the user chose.
+    fn open_path(&mut self, path: PathBuf, now: Duration) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let from_picker = live.shell.picker().is_some() && !live.drives.is_empty();
+        for ps in live.pool.drain(..) {
+            drop(ps.driver.discard());
+        }
+        if let Some(scan) = live.scan.take() {
+            drop(scan.discard());
+        }
+        let root = path.clone();
+        self.begin_map(ScanDriver::start(path), root, None, from_picker, now);
+    }
+
+    /// Scans the open place again from the start.
+    fn rescan(&mut self, now: Duration) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let Some(root) = live.scan_root.clone() else {
+            return;
+        };
+        let from_picker = live.came_from_picker();
+        let known = live.drive.clone();
+        let drive = known.as_ref().and_then(|k| {
+            live.drives
+                .iter()
+                .find(|d| d.mount_point == k.root)
+                .cloned()
+        });
+        if let Some(scan) = live.scan.take() {
+            drop(scan.discard());
+        }
+        let driver = match &known {
+            Some(k) if k.whole_drive => ScanDriver::start_with(root.clone(), Some(k.capacity.used)),
+            _ => ScanDriver::start(root.clone()),
+        };
+        self.begin_map(driver, root, known.zip(drive), from_picker, now);
+    }
+
+    /// Switches the window to a map being filled by `driver`.
+    fn begin_map(
+        &mut self,
+        mut driver: ScanDriver,
+        root: PathBuf,
+        known: Option<(DriveState, Drive)>,
+        from_picker: bool,
+        now: Duration,
+    ) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        driver.rewind();
+        live.scan = Some(driver);
+        live.scan_root = Some(root.clone());
+        live.relayout = None;
+        live.snapshot = None;
+        live.blocks_dirty = false;
+        live.rate = RateMeter::default();
+        live.shell.clear_app();
+        live.shell.clear_capacity();
+        live.shell.set_crumb(root.to_string_lossy().into_owned());
+        live.shell.set_status("Scanning…".into(), true);
+        live.shell.begin_scan(now);
+        live.shell.set_picker_return(from_picker);
+        live.drive_rx = None;
+        live.bin_rx = None;
+        match known {
+            Some((state, drive)) => {
+                live.drive = Some(state);
+                live.bin_rx = Some(spawn_bin(drive));
+            }
+            None => {
+                live.drive = None;
+                query_drive(live, root);
+            }
+        }
+        let map = live.shell.map_rect();
+        live.renderer
+            .set_items(Arc::new(vec![scan_placeholder(map)]));
+        refresh_chrome(live, now);
+        live.window.request_redraw();
+        self.map_seen = false;
+        self.final_requested = false;
+        self.picker_pending = false;
+    }
+
+    /// Carries out what the shell asked for beyond the window's own work.
+    fn launch_effects(&mut self, fx: Vec<ShellEffect>, now: Duration) {
+        for e in fx {
+            match e {
+                ShellEffect::PickDrive(i) => self.open_drive(i, true, now),
+                ShellEffect::ShowPicker => self.show_picker(now),
+                ShellEffect::Rescan => self.rescan(now),
+                ShellEffect::ScanFolder => {
+                    let Some(live) = self.live.as_mut() else {
+                        return;
+                    };
+                    if live.folder_rx.is_some() {
+                        continue;
+                    }
+                    let (tx, rx) = mpsc::channel();
+                    live.folder_rx = Some(rx);
+                    let start = home_folder();
+                    let _ = std::thread::Builder::new()
+                        .name("folder-dialog".into())
+                        .spawn(move || {
+                            let _ = tx.send(folder::choose(&start));
+                        });
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn initial_dark(window: &Window) -> bool {
         theme_override().unwrap_or_else(|| window.theme() == Some(Theme::Dark))
     }
@@ -836,6 +1323,8 @@ impl WinApp {
             .unwrap_or_default();
         let status = if self.scan_path.is_some() {
             "Scanning…".to_string()
+        } else if self.launch_drives {
+            "Looking for drives…".to_string()
         } else {
             String::new()
         };
@@ -878,6 +1367,16 @@ impl WinApp {
             drive_rx: None,
             appearance_rx: None,
             next_pulse: Instant::now(),
+            drives: Vec::new(),
+            drives_rx: None,
+            pool: Vec::new(),
+            folder_rx: None,
+            bin_rx: None,
+            blocks_dirty: false,
+            rate: RateMeter::default(),
+            next_readout: Instant::now(),
+            next_card_update: Instant::now(),
+            scan_root: None,
         });
         window.request_redraw();
         Ok(())
@@ -940,7 +1439,7 @@ impl WinApp {
                 }
                 println!("internal.fonts_ready={}", self.text.is_ready());
                 flush_stdout();
-                if path.is_none() {
+                if path.is_none() && !self.launch_drives {
                     el.exit();
                     return;
                 }
@@ -949,12 +1448,32 @@ impl WinApp {
             // nothing it does can delay that frame.
             if let Some(path) = &self.scan_path {
                 live.scan = Some(ScanDriver::start(path.clone()));
+                live.scan_root = Some(path.clone());
                 live.shell.begin_scan(t0.elapsed());
                 query_drive(live, path.clone());
+            } else if self.launch_drives {
+                list_drives_in_background(live);
             }
             poll_appearance(live);
         }
-        if self.map_pending && !painted.damage.is_empty() {
+        if self.picker_pending && !painted.damage.is_empty() && !live.renderer.background_pending()
+        {
+            self.picker_pending = false;
+            let shown_at = t0.elapsed().as_secs_f64() * 1000.0;
+            start_pool(live);
+            if matches!(self.mode, Mode::FirstFrame { .. }) {
+                println!("internal.picker_frame_ms={shown_at:.3}");
+                println!("internal.picker_cards={}", live.renderer.items().len());
+                println!("internal.picker_scans_started={}", live.pool.len());
+                flush_stdout();
+                for ps in live.pool.drain(..) {
+                    drop(ps.driver.discard());
+                }
+                el.exit();
+                return;
+            }
+        }
+        if self.map_pending && !painted.damage.is_empty() && !live.renderer.background_pending() {
             self.map_pending = false;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             self.stats.first_map_ms = Some(ms);
@@ -970,7 +1489,11 @@ impl WinApp {
                 return;
             }
         }
-        if self.finish_pending && !painted.damage.is_empty() && !live.renderer.is_animating() {
+        if self.finish_pending
+            && !painted.damage.is_empty()
+            && !live.renderer.is_animating()
+            && !live.renderer.background_pending()
+        {
             self.finish_pending = false;
             if matches!(self.mode, Mode::Live { .. }) {
                 self.print_live_report();
@@ -1052,7 +1575,9 @@ impl WinApp {
             .app()
             .map(|a| a.source().last_layout())
             .unwrap_or_default();
-        apply(&mut live.renderer, fx, now);
+        // The full repaint of the new layout happens on another thread; the
+        // picture on screen stays until it is ready.
+        apply_in(&mut live.renderer, fx, now, true);
         refresh_chrome(live, now);
         self.stats.layouts_us.push(stats.took.as_micros() as u64);
         self.stats.layout_boxes.push(stats.items as u64);
@@ -1107,11 +1632,37 @@ impl WinApp {
             refresh_chrome(live, now);
             live.window.request_redraw();
         }
+        if let Some(rx) = live.bin_rx.as_ref()
+            && let Ok(bytes) = rx.try_recv()
+        {
+            live.bin_rx = None;
+            if let Some(d) = live.drive.as_mut() {
+                d.bin = bytes;
+            }
+            update_capacity(live, now);
+            refresh_chrome(live, now);
+            live.window.request_redraw();
+        }
+        self.pump_drives(now);
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if live.shell.picker().is_some() {
+            pump_pool(live, now);
+            return;
+        }
         if live.scan.is_none() || live.relayout.is_some() {
             return;
         }
         // A zoom in flight finishes first; the data stays published.
         if live.renderer.is_animating() {
+            return;
+        }
+        if std::mem::take(&mut live.blocks_dirty)
+            && let Some(app) = live.shell.app_mut()
+            && let Some(pending) = app.begin_relayout()
+        {
+            spawn_relayout(live, pending);
             return;
         }
         let tick = match live.scan.as_mut() {
@@ -1130,6 +1681,18 @@ impl WinApp {
             None => scan_status(&snapshot),
         };
         live.shell.set_status(status, !done);
+        let map_moved = live.shell.set_stopped(done && snapshot.scan_stopped());
+        if done {
+            live.shell.set_readout(None);
+        }
+        if map_moved {
+            // The banner of a stopped scan takes a strip off the map. The
+            // layout below is made for the new rectangle.
+            let map = live.shell.map_rect();
+            if let Some(app) = live.shell.app_mut() {
+                app.update(InputEvent::Resized { map }, now);
+            }
+        }
         live.snapshot = Some(Arc::clone(&snapshot));
         update_capacity(live, now);
         if done {
@@ -1151,7 +1714,8 @@ impl WinApp {
                 }
             }
             None => {
-                if let Some(source) = TreeSource::new(Arc::clone(&snapshot), metrics) {
+                if let Some(mut source) = TreeSource::new(Arc::clone(&snapshot), metrics) {
+                    source.set_drive_blocks(drive_blocks(live));
                     let map = live.shell.map_rect();
                     let app = App::new(source, map);
                     let stats = app.source().last_layout();
@@ -1215,6 +1779,24 @@ impl WinApp {
             refresh_chrome(live, now);
             redraw = true;
         }
+        if live.shell.scanning() {
+            let tick = Instant::now();
+            if tick >= live.next_readout {
+                live.next_readout = tick + Duration::from_millis(250);
+                update_readout(live);
+                refresh_chrome(live, now);
+                redraw = true;
+            }
+            soonest(live.next_readout.saturating_duration_since(Instant::now()));
+        }
+        if live.renderer.background_pending() {
+            // The next paint adopts the picture once the worker is done.
+            if live.renderer.poll_background() {
+                redraw = true;
+            } else {
+                soonest(Duration::from_millis(3));
+            }
+        }
         if live.shell.pulsing() {
             let tick = Instant::now();
             if tick >= live.next_pulse {
@@ -1254,7 +1836,7 @@ impl WinApp {
         }
         let fx = live.shell.update(event, now);
         let changed = !fx.is_empty();
-        apply_shell(live, fx, now);
+        let left = apply_shell(live, fx, now);
         let chrome_changed = refresh_chrome(live, now);
         if matches!(event, InputEvent::PointerMoved { .. }) {
             live.window
@@ -1266,6 +1848,9 @@ impl WinApp {
         }
         if changed || chrome_changed {
             live.window.request_redraw();
+        }
+        if !left.is_empty() {
+            self.launch_effects(left, now);
         }
     }
 
@@ -1294,7 +1879,9 @@ impl WinApp {
         apply_shell(live, fx, now);
         let map = live.shell.map_rect();
         if !had_app {
-            if self.scan_path.is_some() {
+            if let Some(items) = live.shell.picker_items() {
+                live.renderer.set_items(items);
+            } else if self.scan_path.is_some() || live.scan.is_some() {
                 live.renderer
                     .set_items(Arc::new(vec![scan_placeholder(map)]));
             } else {

@@ -78,6 +78,17 @@ pub enum Widget {
         rect: Rect,
         parts: Vec<(SegmentKind, f32)>,
     },
+    /// A quiet filled panel with a border: the ground of a banner or an
+    /// overlay that sits over the map.
+    Panel { rect: Rect },
+    /// A button that carries words. `accent` marks the one a message asks
+    /// for.
+    Pill {
+        rect: Rect,
+        text: Box<str>,
+        accent: bool,
+        hot: bool,
+    },
 }
 
 impl Widget {
@@ -88,7 +99,9 @@ impl Widget {
             | Widget::Text { rect, .. }
             | Widget::Swatch { rect, .. }
             | Widget::Overflow { rect, .. }
-            | Widget::Capacity { rect, .. } => *rect,
+            | Widget::Capacity { rect, .. }
+            | Widget::Panel { rect }
+            | Widget::Pill { rect, .. } => *rect,
         }
     }
 }
@@ -281,6 +294,56 @@ fn draw_widget<C: Canvas>(canvas: &mut C, w: &Widget, pal: &Palette, st: &SceneS
             );
         }
         Widget::Capacity { rect, parts } => draw_capacity(canvas, *rect, parts, pal, st),
+        Widget::Panel { rect } => {
+            let r = rect.snapped();
+            canvas.fill_rect(r, pal.border);
+            canvas.fill_rect(
+                Rect::new(
+                    r.x + 1.0,
+                    r.y + 1.0,
+                    (r.w - 2.0).max(0.0),
+                    (r.h - 2.0).max(0.0),
+                ),
+                pal.bar,
+            );
+        }
+        Widget::Pill {
+            rect,
+            text,
+            accent,
+            hot,
+        } => {
+            let r = rect.snapped();
+            let edge = if *accent { pal.accent } else { pal.border };
+            canvas.fill_rect(r, edge);
+            let fill = if *hot { pal.title[1] } else { pal.bar };
+            canvas.fill_rect(
+                Rect::new(
+                    r.x + 1.0,
+                    r.y + 1.0,
+                    (r.w - 2.0).max(0.0),
+                    (r.h - 2.0).max(0.0),
+                ),
+                fill,
+            );
+            if !st.labels {
+                return;
+            }
+            let color = if *accent { pal.accent } else { pal.text };
+            let tw = canvas
+                .measure_text(text, st.em / st.scale, st.scale)
+                .unwrap_or(r.w * 0.6)
+                .min(r.w);
+            canvas.push_clip(r);
+            canvas.draw_text(
+                text,
+                style(st, color),
+                r.x + ((r.w - tw) / 2.0).round(),
+                text_y(r, st),
+                r.w.max(1.0),
+            );
+            canvas.pop_clip();
+        }
     }
 }
 

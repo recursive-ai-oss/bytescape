@@ -7,12 +7,15 @@
 //! exactly the path a user's wheel takes.
 
 pub mod action;
+pub mod blocks;
 pub mod capacity;
 pub mod card;
 pub mod chrome;
 pub mod info;
+pub mod picker;
 pub mod shell;
 pub mod spatial;
+mod squarify;
 pub mod tree;
 pub mod wheel;
 
@@ -94,6 +97,10 @@ pub trait ViewSource {
     }
     /// Everything the hover card says about box `id` of `view`.
     fn card(&self, _view: ViewId, _id: u32) -> Option<CardData> {
+        None
+    }
+    /// Which drive-level block box `id` of `view` is, if it is one.
+    fn special(&self, _view: ViewId, _id: u32) -> Option<blocks::Special> {
         None
     }
     /// What to tell about box `id` of `view`.

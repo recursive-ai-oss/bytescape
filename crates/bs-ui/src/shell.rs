@@ -3,17 +3,22 @@
 //! turns events in window coordinates into effects for the host, with no
 //! windowing code in it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bs_render::scene::{CATEGORY_COUNT, CATEGORY_NAMES};
 use bs_render::{Bar, Card, Chrome, Color, Glyph, Palette, Rect, TextEngine, TextRole, Widget};
 
+use bs_render::Item;
+
 use crate::action::{Action, reason};
+use crate::blocks::Special;
 use crate::capacity::{Breakdown, CapacityModel};
 use crate::card::{self, CardData, CardHit, CardState};
 use crate::chrome::{self, CrumbPart, Geometry, Hit, LegendMode, TextMeasure};
 use crate::info::{self, InfoLine};
-use crate::{App, Effect, InputEvent, Key, ViewId, ViewSource};
+use crate::picker::{PickTarget, Picker};
+use crate::{App, Direction, Effect, InputEvent, Key, ViewId, ViewSource};
 
 /// What the host should do after an event.
 #[derive(Clone, Debug)]
@@ -35,6 +40,79 @@ pub enum ShellEffect {
     },
     /// Stop the running scan.
     CancelScan,
+    /// Scan the same place again from the start (the banner's button).
+    Rescan,
+    /// The user picked this drive: the index into the list the picker was
+    /// made from.
+    PickDrive(usize),
+    /// "Scan a folder…": ask the system for a folder.
+    ScanFolder,
+    /// Go back from a drive's map to the drive picker.
+    ShowPicker,
+    /// The Unreadable block was clicked: scan again with the administrator
+    /// helper.
+    FullScan,
+    /// The Recycle Bin block was clicked.
+    EmptyBin,
+}
+
+/// What a running scan reads out in the progress overlay.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScanReadout {
+    /// Share of the used bytes counted, when that figure means something.
+    pub ratio: Option<f32>,
+    pub files: u64,
+    pub files_per_sec: f64,
+    pub elapsed: Duration,
+}
+
+impl ScanReadout {
+    /// "37% · 120k files/s · 0:12", or the file count in place of the
+    /// percentage when the ratio means nothing.
+    pub fn text(&self) -> String {
+        let lead = match self.ratio {
+            Some(r) => format!("{:.0}%", (r * 100.0).clamp(0.0, 99.0)),
+            None => format!("{} files", bs_layout::format_count(self.files)),
+        };
+        let secs = self.elapsed.as_secs();
+        format!(
+            "{lead} · {}/s · {}:{:02}",
+            rate_text(self.files_per_sec),
+            secs / 60,
+            secs % 60
+        )
+    }
+}
+
+fn rate_text(per_sec: f64) -> String {
+    let n = per_sec.max(0.0);
+    if n >= 1_000_000.0 {
+        format!("{:.1}M files", n / 1_000_000.0)
+    } else if n >= 1000.0 {
+        format!("{:.0}k files", n / 1000.0)
+    } else {
+        format!("{n:.0} files")
+    }
+}
+
+/// Words of the banner shown after a scan was stopped.
+pub const STOPPED_BANNER: &str = "Scan stopped — results incomplete";
+
+/// Which part of the overlay or banner the pointer is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlayHit {
+    Panel,
+    Button,
+}
+
+/// The progress overlay or the stopped banner, in window coordinates.
+struct Overlay {
+    panel: Rect,
+    text: Rect,
+    button: Rect,
+    words: String,
+    button_text: &'static str,
+    stopped: bool,
 }
 
 /// How long the pointer rests on a box before its card shows.
@@ -137,6 +215,13 @@ pub struct Shell<S: ViewSource> {
     notice: Option<(String, Duration)>,
     esc_armed: Option<Duration>,
     scan_since: Option<Duration>,
+    picker: Option<Picker>,
+    picker_hot: Option<PickTarget>,
+    picker_sel: Option<usize>,
+    picker_return: bool,
+    readout: Option<ScanReadout>,
+    stopped: bool,
+    overlay_hot: Option<OverlayHit>,
 }
 
 fn measure_for(text: &TextEngine, font_px: f32, scale: f32) -> Box<dyn TextMeasure> {
@@ -178,6 +263,13 @@ impl<S: ViewSource> Shell<S> {
             notice: None,
             esc_armed: None,
             scan_since: None,
+            picker: None,
+            picker_hot: None,
+            picker_sel: None,
+            picker_return: false,
+            readout: None,
+            stopped: false,
+            overlay_hot: None,
         }
     }
 
@@ -220,9 +312,20 @@ impl<S: ViewSource> Shell<S> {
         &self.geom
     }
 
-    /// The rectangle the map fills.
+    /// The rectangle the map fills. While the banner of a stopped scan
+    /// shows, it takes a strip off the top, so nothing is covered.
     pub fn map_rect(&self) -> Rect {
-        chrome::map_rect(self.width as f32, self.height as f32, self.scale)
+        let full = chrome::map_rect(self.width as f32, self.height as f32, self.scale);
+        let strip = self.banner_height().min(full.h);
+        Rect::new(full.x, full.y + strip, full.w, full.h - strip)
+    }
+
+    fn banner_height(&self) -> f32 {
+        if self.stopped && !self.scanning && self.app.is_some() {
+            (self.font_px * self.scale * 2.4).round()
+        } else {
+            0.0
+        }
     }
 
     pub fn app(&self) -> Option<&App<S>> {
@@ -236,7 +339,174 @@ impl<S: ViewSource> Shell<S> {
     /// Installs the map once the first data is there.
     pub fn set_app(&mut self, app: App<S>) {
         self.card = CardUi::default();
+        self.picker = None;
+        self.picker_hot = None;
+        self.picker_sel = None;
         self.app = Some(app);
+    }
+
+    /// Removes the map (a new scan is about to replace it).
+    pub fn clear_app(&mut self) {
+        self.card = CardUi::default();
+        self.app = None;
+        self.readout = None;
+        self.stopped = false;
+    }
+
+    /// Takes the capacity bar away (no drive is open).
+    pub fn clear_capacity(&mut self) {
+        self.capacity = CapacityModel::default();
+        self.drive_total = None;
+    }
+
+    /// Shows the drive picker in place of a map.
+    pub fn set_picker(&mut self, picker: Picker) {
+        self.card = CardUi::default();
+        self.app = None;
+        self.picker = Some(picker);
+        self.picker_hot = None;
+        self.picker_sel = None;
+        self.readout = None;
+        self.stopped = false;
+    }
+
+    /// The picker, while it is showing.
+    pub fn picker(&self) -> Option<&Picker> {
+        self.picker.as_ref()
+    }
+
+    pub fn picker_mut(&mut self) -> Option<&mut Picker> {
+        self.picker.as_mut()
+    }
+
+    /// The boxes of the picker's cards, for the renderer. Make them again
+    /// after a resize.
+    pub fn picker_items(&self) -> Option<Arc<Vec<Item>>> {
+        let layout = self.picker_layout()?;
+        Some(Arc::new(layout.items))
+    }
+
+    fn picker_layout(&self) -> Option<crate::picker::PickerLayout> {
+        let picker = self.picker.as_ref()?;
+        Some(picker.layout(
+            self.map_rect(),
+            self.font_px * self.scale,
+            self.scale,
+            self.measure.as_ref(),
+        ))
+    }
+
+    /// Whether a drive's map can go back to the picker (the user came from
+    /// it).
+    pub fn set_picker_return(&mut self, on: bool) {
+        self.picker_return = on;
+    }
+
+    /// Whether the open map was reached from the picker.
+    pub fn picker_return(&self) -> bool {
+        self.picker_return
+    }
+
+    /// The progress overlay's figures, or `None` to take it away.
+    pub fn set_readout(&mut self, readout: Option<ScanReadout>) {
+        self.readout = readout;
+    }
+
+    /// Whether the scan was stopped before it finished, so the banner shows.
+    pub fn set_stopped(&mut self, stopped: bool) -> bool {
+        let before = self.map_rect();
+        self.stopped = stopped;
+        self.map_rect() != before
+    }
+
+    fn overlay(&self) -> Option<Overlay> {
+        let (words, button_text, stopped) = if self.banner_height() > 0.0 {
+            (STOPPED_BANNER.to_string(), "Rescan", true)
+        } else if self.scanning && self.app.is_some() {
+            (self.readout?.text(), "Cancel", false)
+        } else {
+            return None;
+        };
+        let em = self.font_px * self.scale;
+        let gap = (10.0 * self.scale).round();
+        let pad = (em * 0.7).round();
+        let m = |t: &str| {
+            self.measure
+                .width(t)
+                .unwrap_or(t.chars().count() as f32 * em * 0.56)
+                .ceil()
+        };
+        let full = chrome::map_rect(self.width as f32, self.height as f32, self.scale);
+        let btn_w = (m(button_text) + em * 1.6).round();
+        let bh = (em * 1.7).round();
+        if stopped {
+            // A strip across the top of the map, with the button after the
+            // words.
+            let h = self.banner_height();
+            let panel = Rect::new(full.x, full.y, full.w, h);
+            let text_w = m(&words);
+            let text = Rect::new(panel.x + pad, panel.y, text_w + 2.0, h);
+            let button = Rect::new(
+                text.right() + pad,
+                panel.y + ((h - bh) / 2.0).round(),
+                btn_w,
+                bh,
+            );
+            return Some(Overlay {
+                panel,
+                text,
+                button,
+                words,
+                button_text,
+                stopped,
+            });
+        }
+        // The progress readout sits at the right end of the navigation bar,
+        // which has nothing there, so it covers no part of the map.
+        let nav_h = (chrome::NAV_HEIGHT * self.scale).round();
+        let h = (em * 2.0).round().min(nav_h);
+        let text_w = m(&words);
+        let w = (pad + text_w + pad + btn_w + (em * 0.3).round())
+            .min((self.width as f32 - 2.0 * gap).max(0.0))
+            .round();
+        let panel = Rect::new(
+            self.width as f32 - gap - w,
+            ((nav_h - h) / 2.0).round(),
+            w,
+            h,
+        );
+        let bh = bh.min(h - 2.0);
+        let button = Rect::new(
+            panel.right() - btn_w - (em * 0.3).round(),
+            panel.y + ((h - bh) / 2.0).round(),
+            btn_w,
+            bh,
+        );
+        let text = Rect::new(
+            panel.x + pad,
+            panel.y,
+            (button.x - panel.x - 2.0 * pad).max(0.0),
+            h,
+        );
+        Some(Overlay {
+            panel,
+            text,
+            button,
+            words,
+            button_text,
+            stopped,
+        })
+    }
+
+    fn overlay_at(&self, x: f32, y: f32) -> Option<OverlayHit> {
+        let o = self.overlay()?;
+        if o.button.contains(x, y) {
+            Some(OverlayHit::Button)
+        } else if o.panel.contains(x, y) {
+            Some(OverlayHit::Panel)
+        } else {
+            None
+        }
     }
 
     /// Reduced motion replaces the capacity glide and the title pulse with
@@ -281,6 +551,9 @@ impl<S: ViewSource> Shell<S> {
             .as_ref()
             .is_some_and(|s| s.state.hot.is_some())
         {
+            return true;
+        }
+        if self.picker_hot.is_some() && self.app.is_none() {
             return true;
         }
         match self.hot {
@@ -364,6 +637,77 @@ impl<S: ViewSource> Shell<S> {
     /// Whether the pulse needs frames.
     pub fn pulsing(&self) -> bool {
         self.scanning && !self.reduced_motion
+    }
+
+    // ---- the picker ------------------------------------------------------
+
+    /// Hover and clicks while the picker shows.
+    fn picker_event(&mut self, event: InputEvent) -> Vec<ShellEffect> {
+        let Some(layout) = self.picker_layout() else {
+            return Vec::new();
+        };
+        match event {
+            InputEvent::PointerMoved { x, y } => {
+                let target = layout.target_at(x, y);
+                if target == self.picker_hot {
+                    return Vec::new();
+                }
+                self.picker_hot = target;
+                let id = target.and_then(crate::picker::PickerLayout::item_id);
+                vec![ShellEffect::Map(Effect::SetHover(id))]
+            }
+            InputEvent::PointerLeft => {
+                self.picker_hot = None;
+                vec![ShellEffect::Map(Effect::SetHover(None))]
+            }
+            InputEvent::Click { x, y } | InputEvent::DoubleClick { x, y } => {
+                match layout.target_at(x, y) {
+                    Some(t) => self.picker_choose(t),
+                    None => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn picker_choose(&mut self, target: PickTarget) -> Vec<ShellEffect> {
+        match target {
+            PickTarget::Folder => vec![ShellEffect::ScanFolder],
+            PickTarget::Card(i) => match self.picker.as_ref().and_then(|p| p.cards().get(i)) {
+                Some(card) => vec![ShellEffect::PickDrive(card.drive_index)],
+                None => Vec::new(),
+            },
+        }
+    }
+
+    /// Arrows move between cards and Enter picks, while the picker shows.
+    fn picker_key(&mut self, key: Key) -> Vec<ShellEffect> {
+        let Some(picker) = self.picker.as_ref() else {
+            return Vec::new();
+        };
+        let n = picker.cards().len();
+        let current = match self.picker_hot {
+            Some(PickTarget::Card(i)) => Some(i),
+            _ => self.picker_sel,
+        };
+        match key {
+            Key::Enter => match current {
+                Some(i) => self.picker_choose(PickTarget::Card(i)),
+                None => Vec::new(),
+            },
+            Key::Arrow(d) if n > 0 => {
+                let step = matches!(d, Direction::Right | Direction::Down);
+                let next = match current {
+                    None => 0,
+                    Some(i) if step => (i + 1) % n,
+                    Some(i) => (i + n - 1) % n,
+                };
+                self.picker_sel = Some(next);
+                self.picker_hot = Some(PickTarget::Card(next));
+                vec![ShellEffect::Map(Effect::SetHover(Some(next as u32 + 1)))]
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn map_event(&mut self, event: InputEvent, now: Duration) -> Vec<ShellEffect> {
@@ -677,6 +1021,12 @@ impl<S: ViewSource> Shell<S> {
         if items.is_empty() && !matches!(action, Action::Undo | Action::ContextMenu) {
             return Some(reason::NOTHING_SELECTED);
         }
+        if items
+            .iter()
+            .any(|&id| app.source().special(view, id).is_some())
+        {
+            return Some(reason::NOT_ON_DISK);
+        }
         items.iter().find_map(|&id| {
             let data = app.source().card(view, id)?;
             card::why_not(&data, action).or(match action {
@@ -738,6 +1088,19 @@ impl<S: ViewSource> Shell<S> {
     }
 
     fn key(&mut self, key: Key, now: Duration) -> Vec<ShellEffect> {
+        if self.picker.is_some() && self.app.is_none() {
+            return match key {
+                Key::Escape => Vec::new(),
+                other => self.picker_key(other),
+            };
+        }
+        if self.picker_return
+            && matches!(key, Key::Backspace | Key::AltUp)
+            && !self.can_go_up()
+            && self.app.is_some()
+        {
+            return vec![ShellEffect::ShowPicker];
+        }
         let action = match key {
             Key::Escape => return self.escape(now),
             Key::CopyPath => Action::CopyPath,
@@ -801,11 +1164,17 @@ impl<S: ViewSource> Shell<S> {
                 self.hide_card();
                 self.card.rest = None;
                 let mut fx = self.set_hot(None);
+                fx.extend(self.picker_event(event));
                 fx.extend(self.map_event(event, now));
                 return fx;
             }
             return self.map_event(event, now);
         };
+        if let Some(hit) = self.overlay_at(x, y) {
+            return self.overlay_event(event, hit);
+        }
+        // The pointer is not on the overlay (any more).
+        self.overlay_hot = None;
         // The card and the gap beside it belong to the card: the map below
         // does not see the pointer, so the box the card describes stays
         // hovered while the pointer travels onto it.
@@ -828,6 +1197,10 @@ impl<S: ViewSource> Shell<S> {
         let Some(hit) = hit else {
             // Over the map.
             let mut fx = self.set_hot(None);
+            if self.picker.is_some() && self.app.is_none() {
+                fx.extend(self.picker_event(event));
+                return fx;
+            }
             match event {
                 InputEvent::PointerMoved { .. } => {
                     fx.extend(self.map_event(event, now));
@@ -840,6 +1213,9 @@ impl<S: ViewSource> Shell<S> {
                     self.card.rest = None;
                     fx.extend(self.map_event(event, now));
                     self.track_rest(x, y, now);
+                    if matches!(event, InputEvent::Click { .. }) {
+                        fx.extend(self.block_click(now));
+                    }
                 }
                 _ => {
                     self.hide_card();
@@ -867,6 +1243,55 @@ impl<S: ViewSource> Shell<S> {
         }
     }
 
+    /// A click that selected one of the drive-level blocks.
+    fn block_click(&mut self, now: Duration) -> Vec<ShellEffect> {
+        let Some(app) = self.app.as_ref() else {
+            return Vec::new();
+        };
+        let [id] = app.selection() else {
+            return Vec::new();
+        };
+        match app.source().special(app.current_view(), *id) {
+            Some(Special::Unreadable) => {
+                self.say(
+                    "Full scan needs the administrator helper, which this version doesn't include yet",
+                    now,
+                );
+                vec![ShellEffect::FullScan]
+            }
+            Some(Special::RecycleBin) => {
+                if cfg!(debug_assertions) {
+                    self.say("Empty Recycle Bin: not yet", now);
+                }
+                vec![ShellEffect::EmptyBin]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The pointer is over the progress overlay or the banner.
+    fn overlay_event(&mut self, event: InputEvent, hit: OverlayHit) -> Vec<ShellEffect> {
+        self.hide_card();
+        self.card.rest = None;
+        let mut fx = self.set_hot(None);
+        match event {
+            InputEvent::PointerMoved { .. } => {
+                self.overlay_hot = Some(hit);
+                fx.extend(self.map_event(InputEvent::PointerLeft, self.clock));
+            }
+            InputEvent::Click { .. } if hit == OverlayHit::Button => {
+                let stopped = self.overlay().is_some_and(|o| o.stopped);
+                fx.push(if stopped {
+                    ShellEffect::Rescan
+                } else {
+                    ShellEffect::CancelScan
+                });
+            }
+            _ => {}
+        }
+        fx
+    }
+
     fn chrome_click(&mut self, hit: Option<Hit>, now: Duration) -> Vec<ShellEffect> {
         let Some(hit) = hit else {
             return Vec::new();
@@ -875,6 +1300,9 @@ impl<S: ViewSource> Shell<S> {
             Hit::Back if self.can_go_back() => Some(Key::AltLeft),
             Hit::Forward if self.can_go_forward() => Some(Key::AltRight),
             Hit::Up if self.can_go_up() => Some(Key::AltUp),
+            Hit::Up if self.picker_return && self.app.is_some() => {
+                return vec![ShellEffect::ShowPicker];
+            }
             Hit::Refresh => Some(Key::Refresh),
             Hit::Link => return vec![ShellEffect::OpenLink(chrome::LINK_URL)],
             Hit::CrumbSeg(index) => {
@@ -892,7 +1320,10 @@ impl<S: ViewSource> Shell<S> {
 
     /// The breadcrumb as laid out now.
     fn crumb_parts(&mut self) -> Vec<CrumbPart> {
-        let area = self.geometry().crumb;
+        let mut area = self.geometry().crumb;
+        if let Some(o) = self.overlay().filter(|o| !o.stopped) {
+            area.w = (o.panel.x - area.x - (8.0 * self.scale).round()).max(0.0);
+        }
         let em = self.font_px * self.scale;
         let segs = self.crumb_segments();
         chrome::layout_crumbs(area, em, &segs, self.measure.as_ref())
@@ -952,6 +1383,7 @@ impl<S: ViewSource> Shell<S> {
             Hit::Forward if self.can_go_forward() => line("Forward (Alt+Right)"),
             Hit::Forward => line("Forward — nothing to go forward to"),
             Hit::Up if self.can_go_up() => line("Up one level (Backspace)"),
+            Hit::Up if self.picker_return => line("Back to the drives (Backspace)"),
             Hit::Up => line("Up — already at the top"),
             Hit::Refresh => line("Refresh the layout (F5)"),
             Hit::Link => line("Opens RecursiveAI.org in your browser"),
@@ -990,6 +1422,23 @@ impl<S: ViewSource> Shell<S> {
                 details: String::new(),
             };
         }
+        if self.app.is_none()
+            && let Some(picker) = &self.picker
+        {
+            let card = match self.picker_hot {
+                Some(PickTarget::Card(i)) => Some(i),
+                _ => self.picker_sel,
+            };
+            if let Some((name, details)) = card.and_then(|i| picker.describe(i)) {
+                return InfoLine { name, details };
+            }
+            if self.picker_hot == Some(PickTarget::Folder) {
+                return InfoLine {
+                    name: "Choose a folder to scan with the system's folder dialog".into(),
+                    details: String::new(),
+                };
+            }
+        }
         if let Some(app) = &self.app
             && let Some(line) = app
                 .info()
@@ -1025,7 +1474,7 @@ impl<S: ViewSource> Shell<S> {
         for (rect, glyph, enabled, h) in [
             (g.back, Glyph::Back, back, Hit::Back),
             (g.forward, Glyph::Forward, forward, Hit::Forward),
-            (g.up, Glyph::Up, up, Hit::Up),
+            (g.up, Glyph::Up, up || self.picker_return, Hit::Up),
             (g.refresh, Glyph::Refresh, true, Hit::Refresh),
         ] {
             widgets.push(Widget::Button {
@@ -1095,6 +1544,30 @@ impl<S: ViewSource> Shell<S> {
             widgets.push(Widget::Overflow {
                 rect,
                 hot: hot == Some(Hit::Overflow),
+            });
+        }
+        if let Some(layout) = self.picker_layout() {
+            let hot_folder = self.picker_hot == Some(PickTarget::Folder);
+            for mut w in layout.widgets {
+                if let Widget::Pill { hot, .. } = &mut w {
+                    *hot = hot_folder;
+                }
+                widgets.push(w);
+            }
+        }
+        if let Some(o) = self.overlay() {
+            widgets.push(Widget::Panel { rect: o.panel });
+            widgets.push(Widget::Text {
+                rect: o.text,
+                text: o.words.into(),
+                role: TextRole::Primary,
+                hot: false,
+            });
+            widgets.push(Widget::Pill {
+                rect: o.button,
+                text: o.button_text.into(),
+                accent: o.stopped,
+                hot: self.overlay_hot == Some(OverlayHit::Button),
             });
         }
         widgets.push(Widget::Text {

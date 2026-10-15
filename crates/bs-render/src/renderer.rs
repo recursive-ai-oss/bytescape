@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
 use tiny_skia::{Pixmap, PixmapMut};
@@ -44,6 +45,18 @@ struct Anim {
     start: Duration,
 }
 
+/// A full-quality picture of a new view being drawn on another thread, with
+/// what it was drawn from.
+struct Background {
+    rx: Receiver<Pixmap>,
+    items: Arc<Vec<Item>>,
+    chrome: Chrome,
+    dim: Option<u8>,
+    pulse: f32,
+    size: (u32, u32),
+    scale: f32,
+}
+
 /// What `paint` changed in the target buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Painted {
@@ -81,6 +94,7 @@ pub struct Renderer {
     dirty: Option<IRect>,
     full_dirty: bool,
     anim: Option<Anim>,
+    background: Option<Background>,
     timings: PaintTimings,
 }
 
@@ -133,6 +147,7 @@ impl Renderer {
             dirty: None,
             full_dirty: true,
             anim: None,
+            background: None,
             timings: PaintTimings::default(),
         })
     }
@@ -168,6 +183,7 @@ impl Renderer {
 
     pub fn set_palette(&mut self, palette: Palette) {
         self.palette = palette;
+        self.background = None;
         self.finish_zoom();
         self.invalidate();
     }
@@ -180,6 +196,7 @@ impl Renderer {
     /// item list afterwards; caches are keyed by scale, so nothing stale is
     /// reused.
     pub fn resize(&mut self, width: u32, height: u32, scale: f32) {
+        self.background = None;
         if let Some(front) = Pixmap::new(width, height) {
             self.front = front;
             self.width = width;
@@ -388,6 +405,7 @@ impl Renderer {
 
     /// Replaces the view without animation and repaints everything.
     pub fn set_items(&mut self, items: Arc<Vec<Item>>) {
+        self.background = None;
         self.finish_zoom();
         self.set_view(items);
         self.invalidate();
@@ -395,35 +413,148 @@ impl Renderer {
 
     /// Paints `items` into `pixmap` with horizontal bands on several threads.
     fn render_tiled(&self, pixmap: &mut Pixmap, items: &[Item], labels: bool) {
-        let (w, h) = (self.width, self.height);
-        let style = self.style(labels);
-        let stride = w as usize * 4;
-        let band_rows = (h as usize / (self.threads * 4)).clamp(16, 256);
-        let pal = &self.palette;
-        let chrome = &self.chrome;
-        parallel_bands(
-            pixmap.data_mut(),
-            stride,
-            band_rows,
-            self.threads,
-            |row0, band| {
-                let rows = band.len() / stride;
-                let Some(band_map) = PixmapMut::from_bytes(band, w, rows as u32) else {
-                    return;
-                };
-                let mut canvas = SkiaCanvas::band(
-                    band_map,
-                    (0, row0 as i32),
-                    (w, h),
-                    self.text.clone(),
-                    self.hatches.clone(),
-                );
-                let region = Rect::new(0.0, row0 as f32, w as f32, rows as f32);
-                canvas_fill_bg(&mut canvas, region, pal);
-                draw_items(&mut canvas, items, pal, &style, Some(region));
-                draw_chrome(&mut canvas, chrome, pal, &style, Some(region));
+        render_tiled_with(
+            pixmap,
+            items,
+            &Scene {
+                size: (self.width, self.height),
+                style: self.style(labels),
+                palette: &self.palette,
+                chrome: &self.chrome,
+                text: &self.text,
+                hatches: &self.hatches,
+                threads: self.threads,
             },
         );
+    }
+
+    /// Starts drawing a new view at full quality on another thread while the
+    /// picture on screen stays as it is. The next `paint` after it is done
+    /// swaps the new picture in, so the event loop is never held up by a
+    /// repaint of the whole window. Returns `false` when it cannot (a zoom
+    /// is running, the picture is not settled or fonts changed): the view is
+    /// then shown at once, as `set_items` does.
+    pub fn set_items_background(&mut self, items: Arc<Vec<Item>>) -> bool {
+        let labels = self.text.is_ready();
+        if self.anim.is_some() || self.full_dirty || self.labels_drawn != labels {
+            self.set_items(items);
+            return false;
+        }
+        let Some(mut pixmap) = self.take_pixmap() else {
+            self.set_items(items);
+            return false;
+        };
+        let (tx, rx) = mpsc::channel();
+        let job_items = Arc::clone(&items);
+        let chrome = self.chrome.clone();
+        let palette = self.palette.clone();
+        let text = self.text.clone();
+        let hatches = self.hatches.clone();
+        let style = self.style(labels);
+        let (size, threads) = ((self.width, self.height), self.threads);
+        let spawned = std::thread::Builder::new()
+            .name("paint".into())
+            .spawn(move || {
+                render_tiled_with(
+                    &mut pixmap,
+                    &job_items,
+                    &Scene {
+                        size,
+                        style,
+                        palette: &palette,
+                        chrome: &chrome,
+                        text: &text,
+                        hatches: &hatches,
+                        threads,
+                    },
+                );
+                let _ = tx.send(pixmap);
+            });
+        if spawned.is_err() {
+            self.set_items(items);
+            return false;
+        }
+        self.background = Some(Background {
+            rx,
+            items,
+            chrome: self.chrome.clone(),
+            dim: self.dim,
+            pulse: self.pulse,
+            size: (self.width, self.height),
+            scale: self.scale,
+        });
+        true
+    }
+
+    /// Whether a picture is being drawn on another thread.
+    pub fn background_pending(&self) -> bool {
+        self.background.is_some()
+    }
+
+    /// Takes the picture drawn on another thread if it is done. Returns
+    /// whether the screen needs painting.
+    pub fn poll_background(&mut self) -> bool {
+        let Some(job) = self.background.as_ref() else {
+            return false;
+        };
+        let pixmap = match job.rx.try_recv() {
+            Ok(pm) => Some(pm),
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        let Some(job) = self.background.take() else {
+            return false;
+        };
+        let Some(pixmap) = pixmap else {
+            // The drawing thread died; draw the view here instead.
+            self.set_items(job.items);
+            return true;
+        };
+        if job.size != (self.width, self.height) || job.scale != self.scale {
+            return false;
+        }
+        self.adopt(job, pixmap);
+        true
+    }
+
+    /// Makes a finished picture the one on screen. Hover and selection stay
+    /// on the boxes that still exist; chrome that changed while the picture
+    /// was being drawn is painted over it.
+    fn adopt(&mut self, job: Background, pixmap: Pixmap) {
+        let hover = self.hover;
+        let selected = std::mem::take(&mut self.selected);
+        self.set_view(job.items);
+        self.hover = hover.filter(|id| self.index.contains_key(id));
+        self.selected = selected
+            .into_iter()
+            .filter(|id| self.index.contains_key(id))
+            .collect();
+        let old = std::mem::replace(&mut self.front, pixmap);
+        if old.width() == self.width && old.height() == self.height {
+            self.pool.push(old);
+        }
+        self.labels_drawn = self.text.is_ready();
+        self.full_dirty = false;
+        self.dirty = None;
+        if job.dim != self.dim {
+            self.invalidate();
+            return;
+        }
+        let current_pulse = std::mem::replace(&mut self.pulse, job.pulse);
+        self.set_pulse(current_pulse);
+        self.paint_overlays(None);
+        match job.chrome.changed_regions(&self.chrome) {
+            Some(regions) => {
+                for r in regions {
+                    self.repaint_region(r);
+                }
+            }
+            None => {
+                self.invalidate();
+                return;
+            }
+        }
+        self.full_dirty = true;
     }
 
     /// Repaints the picture in full, with labels when fonts are available.
@@ -605,6 +736,7 @@ impl Renderer {
     ) {
         // A zoom already running ends first, so the new one starts from a real
         // picture of the view on screen.
+        self.background = None;
         self.finish_zoom();
         if self.reduced_motion {
             self.set_items(items);
@@ -680,6 +812,7 @@ impl Renderer {
                 animating: false,
             };
         }
+        self.poll_background();
         if let Some(t) = self.anim_time(now) {
             if t < 1.0 {
                 self.paint_zoom_frame(target, t);
@@ -832,16 +965,62 @@ impl Renderer {
     }
 }
 
-/// The part of the window that zooms: the root box of the view (the map),
-/// or the whole window when the view has no such box.
+/// The part of the window that zooms: the root boxes of the view (the map;
+/// a drive view has the folders and the blocks beside them), or the whole
+/// window when the view has no such box.
 fn zoom_region(items: &[Item], width: u32, height: u32) -> IRect {
     let full = IRect::new(0, 0, width as i32, height as i32);
     items
-        .first()
+        .iter()
         .filter(|i| i.depth == 0)
-        .and_then(|i| i.rect.outer_pixels().intersect(&full))
+        .map(|i| i.rect)
+        .reduce(|a, b| a.union(&b))
+        .and_then(|r| r.outer_pixels().intersect(&full))
         .filter(|r| r.w > 0 && r.h > 0)
         .unwrap_or(full)
+}
+
+/// Everything a tiled repaint reads, so it can run on any thread.
+struct Scene<'a> {
+    size: (u32, u32),
+    style: SceneStyle,
+    palette: &'a Palette,
+    chrome: &'a Chrome,
+    text: &'a TextEngine,
+    hatches: &'a HatchTiles,
+    threads: usize,
+}
+
+/// Paints `items` and the chrome into `pixmap` with horizontal bands on
+/// several threads.
+fn render_tiled_with(pixmap: &mut Pixmap, items: &[Item], scene: &Scene<'_>) {
+    let (w, h) = scene.size;
+    let stride = w as usize * 4;
+    let band_rows = (h as usize / (scene.threads * 4)).clamp(16, 256);
+    let (pal, chrome, style) = (scene.palette, scene.chrome, &scene.style);
+    parallel_bands(
+        pixmap.data_mut(),
+        stride,
+        band_rows,
+        scene.threads,
+        |row0, band| {
+            let rows = band.len() / stride;
+            let Some(band_map) = PixmapMut::from_bytes(band, w, rows as u32) else {
+                return;
+            };
+            let mut canvas = SkiaCanvas::band(
+                band_map,
+                (0, row0 as i32),
+                (w, h),
+                scene.text.clone(),
+                scene.hatches.clone(),
+            );
+            let region = Rect::new(0.0, row0 as f32, w as f32, rows as f32);
+            canvas_fill_bg(&mut canvas, region, pal);
+            draw_items(&mut canvas, items, pal, style, Some(region));
+            draw_chrome(&mut canvas, chrome, pal, style, Some(region));
+        },
+    );
 }
 
 fn canvas_fill_bg(canvas: &mut SkiaCanvas<'_>, region: Rect, pal: &Palette) {

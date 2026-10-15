@@ -4,9 +4,11 @@
 
 mod bench;
 mod clipboard;
+mod folder;
 mod live;
 mod open;
 mod real;
+mod shots;
 mod synth;
 mod window;
 

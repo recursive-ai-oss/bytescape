@@ -265,3 +265,79 @@ fn hit_testing_returns_the_topmost_box() {
     assert_eq!(r.item_at(2.0, 2.0).map(|i| i.id), Some(1));
     assert!(r.item_at(-5.0, 2.0).is_none());
 }
+
+fn wait_for_background(r: &mut Renderer) {
+    for _ in 0..2000 {
+        if r.poll_background() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("the picture drawn on another thread never arrived");
+}
+
+#[test]
+fn a_view_drawn_in_the_background_equals_one_drawn_in_place() {
+    let mut bg = renderer();
+    bg.set_items(view_a());
+    let mut t = target();
+    bg.paint(&mut t, Duration::ZERO, false);
+    assert!(bg.set_items_background(view_b()), "a settled picture");
+    assert!(bg.background_pending());
+    // Until it is done the old view stays on screen.
+    assert_eq!(bg.items().len(), view_a().len());
+    wait_for_background(&mut bg);
+    assert!(!bg.background_pending());
+    let painted = bg.paint(&mut t, Duration::ZERO, false);
+    assert_eq!(painted.damage.len(), 1);
+    assert_eq!(painted.damage[0].w, W as i32, "the whole window is copied");
+
+    let mut direct = renderer();
+    direct.set_items(view_b());
+    let mut want = target();
+    direct.paint(&mut want, Duration::ZERO, false);
+    assert_eq!(t, want);
+}
+
+#[test]
+fn hover_and_chrome_changes_made_meanwhile_land_on_the_new_picture() {
+    let mut bg = renderer();
+    bg.set_items(view_a());
+    let mut t = target();
+    bg.paint(&mut t, Duration::ZERO, false);
+    assert!(bg.set_items_background(view_b()));
+    // Both boxes exist in the new view as well.
+    bg.set_hover(Some(3));
+    bg.set_selected(Some(2));
+    wait_for_background(&mut bg);
+    bg.paint(&mut t, Duration::ZERO, false);
+
+    let mut direct = renderer();
+    direct.set_items(view_b());
+    direct.set_hover(Some(3));
+    direct.set_selected(Some(2));
+    let mut want = target();
+    direct.paint(&mut want, Duration::ZERO, false);
+    assert_eq!(t, want);
+}
+
+#[test]
+fn a_resize_discards_the_background_picture() {
+    let mut r = renderer();
+    r.set_items(view_a());
+    let mut t = target();
+    r.paint(&mut t, Duration::ZERO, false);
+    assert!(r.set_items_background(view_b()));
+    r.resize(W / 2, H / 2, 1.0);
+    assert!(!r.background_pending());
+    assert!(!r.poll_background());
+}
+
+#[test]
+fn nothing_is_started_while_the_picture_is_not_settled() {
+    let mut r = renderer();
+    // Nothing has been painted yet: the view is shown at once.
+    assert!(!r.set_items_background(view_a()));
+    assert!(!r.background_pending());
+    assert_eq!(r.items().len(), view_a().len());
+}

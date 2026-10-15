@@ -13,6 +13,13 @@ use bs_ui::shell::{CANCEL_CONFIRM_AFTER, CARD_REST, Look, Shell, ShellEffect};
 use bs_ui::tree::TreeSource;
 use bs_ui::{App, Direction, Effect, InputEvent, Key};
 
+/// The path the tree builds for `rest` under the fixture's root `/data`. The
+/// tree joins names with the platform's separator, so the expectation does too;
+/// the root itself is only a fixture name.
+fn under_data(rest: &str) -> String {
+    format!("/data{}{rest}", std::path::MAIN_SEPARATOR)
+}
+
 struct Fixed(f32);
 
 impl TextMeasure for Fixed {
@@ -204,7 +211,7 @@ fn the_card_shows_after_the_pointer_rests_and_not_before() {
     assert!(!card.rect.intersects(&folder.rect), "covers its box");
     let texts = card_texts(&shell);
     assert_eq!(texts[0], "folder1");
-    assert!(texts.contains(&"/data/folder1".to_string()), "{texts:?}");
+    assert!(texts.contains(&under_data("folder1")), "{texts:?}");
     assert!(texts.iter().any(|s| s.contains("on disk")));
     // Showing it needs no further deadline.
     assert_eq!(shell.next_deadline(t(500)), None);
@@ -378,7 +385,7 @@ fn clicking_the_path_copies_it_and_says_copied_for_a_moment() {
             _ => None,
         })
         .collect();
-    assert_eq!(copies, ["/data/folder1"]);
+    assert_eq!(copies, [under_data("folder1").as_str()]);
     assert!(copied(&shell));
     assert!(shell.next_deadline(t(520)).is_some());
     assert!(!shell.tick(t(2_000)) || copied(&shell));
@@ -524,7 +531,7 @@ fn ctrl_c_copies_the_path_of_the_selection() {
     assert_eq!(info(&shell), "Copy path: Nothing selected");
     click_at(&mut shell, title_point(fs[1].rect), 10);
     let fx = key(&mut shell, Key::CopyPath, 20);
-    assert!(matches!(&fx[..], [ShellEffect::CopyText(p)] if p == "/data/folder2"));
+    assert!(matches!(&fx[..], [ShellEffect::CopyText(p)] if *p == under_data("folder2")));
     assert_eq!(info(&shell), "Copied the path");
     // The message goes after a few seconds.
     shell.tick(t(10_000));
@@ -543,7 +550,7 @@ fn ctrl_c_copies_the_path_of_the_selection() {
     );
     let fx = key(&mut shell, Key::CopyPath, 10_200);
     assert!(
-        matches!(&fx[..], [ShellEffect::CopyText(p)] if p == "/data/folder2\n/data/folder1"),
+        matches!(&fx[..], [ShellEffect::CopyText(p)] if *p == format!("{}\n{}", under_data("folder2"), under_data("folder1"))),
         "{fx:?}"
     );
 }

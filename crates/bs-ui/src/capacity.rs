@@ -1,7 +1,6 @@
 //! The capacity bar: used, Recycle Bin, unreadable, reserved and free bytes of
 //! one drive, and the animation between two states.
 
-use std::path::Path;
 use std::time::Duration;
 
 use bs_platform::drives::{Capacity, ReservedKind};
@@ -9,23 +8,6 @@ use bs_render::SegmentKind;
 
 /// Length of a change of the bar.
 pub const CHANGE_DURATION: Duration = Duration::from_millis(250);
-
-/// Where the bytes in a drive's Recycle Bin or Trash come from.
-pub trait RecycleBinSource {
-    /// Bytes held by the bin of the drive mounted at `drive_root`.
-    fn bytes(&self, drive_root: &Path) -> u64;
-}
-
-/// A stand-in that reports a fixed amount, until the platform service that
-/// measures the real bin is wired in. It is only for tests and pictures.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FakeRecycleBin(pub u64);
-
-impl RecycleBinSource for FakeRecycleBin {
-    fn bytes(&self, _drive_root: &Path) -> u64 {
-        self.0
-    }
-}
 
 /// How the drive's bytes divide up.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

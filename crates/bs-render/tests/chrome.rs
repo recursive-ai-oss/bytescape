@@ -252,3 +252,29 @@ fn the_selection_of_one_box_is_the_same_as_set_selected() {
     b.set_selection(&[3]);
     assert_eq!(a.snapshot_rgba(), b.snapshot_rgba());
 }
+
+#[test]
+fn panels_and_pills_are_drawn_and_tracked_as_changes() {
+    use bs_render::{Chrome, Widget};
+    let a = Chrome {
+        bars: Vec::new(),
+        widgets: vec![
+            Widget::Panel {
+                rect: Rect::new(0.0, 0.0, 100.0, 24.0),
+            },
+            Widget::Pill {
+                rect: Rect::new(60.0, 2.0, 36.0, 20.0),
+                text: "Rescan".into(),
+                accent: true,
+                hot: false,
+            },
+        ],
+    };
+    let mut b = a.clone();
+    if let Widget::Pill { hot, .. } = &mut b.widgets[1] {
+        *hot = true;
+    }
+    let regions = a.changed_regions(&b).expect("same shape");
+    assert_eq!(regions.len(), 1);
+    assert_eq!(regions[0], Rect::new(60.0, 2.0, 36.0, 20.0));
+}

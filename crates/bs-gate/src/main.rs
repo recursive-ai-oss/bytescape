@@ -332,6 +332,7 @@ fn first_frame_series(
     let mut built = Vec::new();
     let mut internal = Vec::new();
     let mut first_map = Vec::new();
+    let mut picker = Vec::new();
     for _ in 0..runs {
         for f in &files {
             evict(f);
@@ -347,6 +348,9 @@ fn first_frame_series(
         }
         if let Some(v) = get("internal.first_map_frame_ms") {
             first_map.push(v);
+        }
+        if let Some(v) = get("internal.picker_frame_ms") {
+            picker.push(v);
         }
     }
     put_dist(
@@ -369,6 +373,13 @@ fn first_frame_series(
             kv,
             &format!("{prefix}.{name}.inside_binary.first_map_frame"),
             &first_map,
+        );
+    }
+    if !picker.is_empty() {
+        put_dist(
+            kv,
+            &format!("{prefix}.{name}.inside_binary.picker_frame"),
+            &picker,
         );
     }
     if cold {
@@ -688,6 +699,14 @@ fn first_frame_table(md: &mut String, kv: &Kv, prefix: &str, what: &str, with_fo
                     "{series}: inside the binary, first frame showing the folder's contents (the scan starts after the first present)"
                 ),
                 format!("{prefix}.{series}.inside_binary.first_map_frame"),
+            ));
+        }
+        if kv.contains_key(&format!("{prefix}.{series}.inside_binary.picker_frame.n")) {
+            rows.push((
+                format!(
+                    "{series}: inside the binary, first frame showing the drive picker (drives listed, scans started)"
+                ),
+                format!("{prefix}.{series}.inside_binary.picker_frame"),
             ));
         }
     }

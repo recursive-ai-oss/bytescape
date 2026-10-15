@@ -16,6 +16,7 @@ use bs_layout::{
 use bs_render::{Flags, Item, ItemKind, ItemLabel, Rect};
 use bs_tree::{DeleteState, NodeId, NodeKind, Progress, Snapshot};
 
+use crate::blocks::{DriveBlocks, Special};
 use crate::card::{CardData, DeleteMark};
 use crate::{ItemInfo, Layout, Prepared, RelayoutJob, ViewSource};
 
@@ -43,6 +44,9 @@ pub struct TreeSource {
     /// The knowledge tables resolved for this user's folders, built when the
     /// first hover card asks.
     knowledge: OnceLock<Box<Knowledge>>,
+    /// The drive-level blocks shown beside the top view, when the scan covers
+    /// a whole drive.
+    blocks: Option<DriveBlocks>,
 }
 
 /// A layout made on a worker thread, waiting to be adopted.
@@ -66,6 +70,7 @@ impl TreeSource {
             last: LayoutStats::default(),
             laid: Vec::new(),
             knowledge: OnceLock::new(),
+            blocks: None,
         })
     }
 
@@ -78,6 +83,18 @@ impl TreeSource {
     /// The snapshot views are laid out from.
     pub fn snapshot(&self) -> &Arc<Snapshot> {
         &self.snapshot
+    }
+
+    /// Sets the blocks shown beside the drive's top view (free space, what
+    /// could not be read, the reserve and the bin), or removes them. They
+    /// appear the next time the top view is laid out.
+    pub fn set_drive_blocks(&mut self, blocks: Option<DriveBlocks>) {
+        self.blocks = blocks;
+    }
+
+    /// The blocks in force.
+    pub fn drive_blocks(&self) -> Option<&DriveBlocks> {
+        self.blocks.as_ref()
     }
 
     /// Changes the font size and scale used for thresholds. Lay views out
@@ -171,12 +188,17 @@ impl ViewSource for TreeSource {
                 folders: Vec::new(),
             };
         };
-        let area = bs_layout::Rect::new(map.x, map.y, map.w, map.h);
+        let blocks = (view == self.root).then_some(self.blocks).flatten();
+        let (area, extra) = split_for_blocks(blocks.as_ref(), &self.snapshot, map);
         let laid = bs_layout::layout(&self.snapshot, &target, area, self.metrics);
         // Offers are valid until this view is registered again, which is the
         // next layout of it.
         let folders = self.table.register(view, &laid);
-        let items: Vec<Item> = laid.items().iter().map(to_item).collect();
+        let mut items: Vec<Item> = laid.items().iter().map(to_item).collect();
+        if self.snapshot.scan_stopped() {
+            end_scanning_labels(&mut items);
+        }
+        items.extend(extra);
         self.last = LayoutStats {
             items: items.len(),
             took: started.elapsed(),
@@ -258,6 +280,7 @@ impl ViewSource for TreeSource {
                 parent_bytes: Some(node.allocated()),
                 files: count,
                 in_progress: node.is_in_progress(),
+                stopped: self.snapshot.scan_stopped(),
                 estimated: false,
                 is_folder: false,
                 modified: None,
@@ -287,6 +310,7 @@ impl ViewSource for TreeSource {
                 1
             },
             in_progress: node.is_in_progress(),
+            stopped: self.snapshot.scan_stopped(),
             estimated: node.size_is_estimated(),
             is_folder,
             modified: Some(node.mtime()).filter(|&t| t != 0),
@@ -304,7 +328,18 @@ impl ViewSource for TreeSource {
         })
     }
 
+    fn special(&self, view: ViewId, id: u32) -> Option<Special> {
+        if view != self.root {
+            return None;
+        }
+        let special = DriveBlocks::special_of(id)?;
+        (self.blocks?.bytes(special) > 0).then_some(special)
+    }
+
     fn describe(&self, view: ViewId, id: u32) -> Option<ItemInfo> {
+        if self.special(view, id).is_some() {
+            return self.blocks?.info(id);
+        }
         let laid = &self.laid.iter().find(|(v, _)| *v == view)?.1;
         let bytes = laid.item(id)?.bytes;
         match laid.item_ref(id)? {
@@ -345,11 +380,16 @@ impl ViewSource for TreeSource {
         let target = self.table.target(view).cloned()?;
         let snapshot = Arc::clone(&self.snapshot);
         let metrics = self.metrics;
+        let blocks = (view == self.root).then_some(self.blocks).flatten();
         Some(Box::new(move || {
             let started = Instant::now();
-            let area = bs_layout::Rect::new(map.x, map.y, map.w, map.h);
+            let (area, extra) = split_for_blocks(blocks.as_ref(), &snapshot, map);
             let laid = bs_layout::layout(&snapshot, &target, area, metrics);
-            let items: Vec<Item> = laid.items().iter().map(to_item).collect();
+            let mut items: Vec<Item> = laid.items().iter().map(to_item).collect();
+            if snapshot.scan_stopped() {
+                end_scanning_labels(&mut items);
+            }
+            items.extend(extra);
             let done: Prepared = Box::new(Done {
                 laid,
                 items,
@@ -374,6 +414,36 @@ impl ViewSource for TreeSource {
             folders,
         })
     }
+}
+
+/// A stopped scan counts nothing any more: the titles of folders it left
+/// unfinished keep their "≥" but stop saying "Scanning…".
+fn end_scanning_labels(items: &mut [Item]) {
+    for item in items {
+        if let Some(label) = item.label.as_mut()
+            && let Some(rest) = label.size.strip_prefix("Scanning… · ")
+        {
+            let rest: Box<str> = rest.into();
+            label.size = rest;
+        }
+    }
+}
+
+/// The part of `map` the drive's folders get, and the boxes of the blocks
+/// beside them.
+fn split_for_blocks(
+    blocks: Option<&DriveBlocks>,
+    snapshot: &Snapshot,
+    map: Rect,
+) -> (bs_layout::Rect, Vec<Item>) {
+    let (files, extra) = match blocks {
+        Some(b) => b.place(snapshot.root().map_or(0, |r| r.allocated()), map),
+        None => (map, Vec::new()),
+    };
+    (
+        bs_layout::Rect::new(files.x, files.y, files.w, files.h),
+        extra,
+    )
 }
 
 /// Maps one layout box to the renderer's item. Layout state bits and the
