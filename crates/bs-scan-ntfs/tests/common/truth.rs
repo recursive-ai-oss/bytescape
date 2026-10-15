@@ -318,6 +318,12 @@ fn fetch_record(volume: &OwnedHandle, number: u64) -> Result<Vec<u8>, String> {
 }
 
 impl Oracle for SystemOracle {
+    /// The record of the file the path names now. Like every answer here it
+    /// is asked by path, not by a file reference the reader recorded (its tree
+    /// carries none); the sequence check ties the record to the file opened
+    /// by that path, and the class that uses it also needs the lengths to
+    /// agree, so a file replaced since the scan does not explain a difference
+    /// by accident.
     fn file_record(&self, path: &str) -> Result<RecordFacts, String> {
         if path.contains('\u{FFFD}') {
             return Err("the name is not valid text".into());
