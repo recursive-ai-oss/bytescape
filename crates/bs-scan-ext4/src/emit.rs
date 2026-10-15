@@ -126,6 +126,10 @@ pub(crate) struct Emitter<'a> {
     classifier: Option<Classifier>,
     skip: SkipSet,
     reached: Vec<u64>,
+    /// Records whose own bytes went into the tree. Narrower than `reached`:
+    /// what lies under a mount point of another file system is walked, and
+    /// so reached, but only added to the hidden totals.
+    counted: Vec<u64>,
     batch: Batch,
     tally: Tally,
     volume: u64,
@@ -222,6 +226,11 @@ impl<'a> Emitter<'a> {
             .try_reserve_exact(words)
             .map_err(|_| Ext4Error::TooLarge("cannot allocate the visited set"))?;
         reached.resize(words, 0u64);
+        let mut counted = Vec::new();
+        counted
+            .try_reserve_exact(words)
+            .map_err(|_| Ext4Error::TooLarge("cannot allocate the visited set"))?;
+        counted.resize(words, 0u64);
         let classifier = ctx
             .options()
             .categories
@@ -232,6 +241,7 @@ impl<'a> Emitter<'a> {
             classifier,
             skip,
             reached,
+            counted,
             batch: Batch::new(),
             tally: Tally::default(),
             volume,
@@ -257,6 +267,19 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Notes that the record's bytes are in the tree.
+    fn mark_counted(&mut self, slot: usize) {
+        if let Some(w) = self.counted.get_mut(slot / 64) {
+            *w |= 1u64 << (slot % 64);
+        }
+    }
+
+    fn is_counted(&self, slot: usize) -> bool {
+        self.counted
+            .get(slot / 64)
+            .is_some_and(|w| (*w >> (slot % 64)) & 1 == 1)
+    }
+
     fn is_reached(&self, slot: usize) -> bool {
         self.reached
             .get(slot / 64)
@@ -267,13 +290,15 @@ impl<'a> Emitter<'a> {
     /// names is in use and nothing has counted it yet, whatever it leads to
     /// (a whole subtree, for a directory) is missing from the tree, so the
     /// listing cannot be called complete. An inode that was already reached
-    /// by another name is counted, and nothing is lost. An inode reached only
-    /// later is flagged all the same: the flag errs towards "at least".
+    /// by another name is counted, and nothing is lost. One seen only under a
+    /// mount point of another file system is not: its bytes are in the hidden
+    /// totals, not in the tree. An inode reached only later is flagged all
+    /// the same: the flag errs towards "at least".
     fn lose(&mut self, frame: &Frame, slot: Option<usize>) {
         if frame.shadow {
             return;
         }
-        if slot.is_some_and(|s| self.is_reached(s)) {
+        if slot.is_some_and(|s| self.is_counted(s)) {
             return;
         }
         self.listing_lost = true;
@@ -308,6 +333,7 @@ impl<'a> Emitter<'a> {
             .next_dir_key()
             .ok_or(Ext4Error::BadRoot("no directory keys"))?;
         self.test_and_set(root_slot);
+        self.mark_counted(root_slot);
         let meta = meta_for(&root, NodeKind::Dir, ROOT_INODE, self.volume);
         self.batch
             .dir(key, DirKey::NONE, root_name, &meta)
@@ -500,6 +526,7 @@ impl<'a> Emitter<'a> {
             }
             return;
         }
+        self.mark_counted(slot);
         let mut meta = meta_for(rec, kind, ino, self.volume);
         if let Some(classifier) = &self.classifier {
             meta.category = classifier.category(place, kind, name);
@@ -577,6 +604,7 @@ impl<'a> Emitter<'a> {
         let Some(key) = self.ctx.next_dir_key() else {
             // Out of keys: it cannot be described as a directory.
             self.test_and_set(slot);
+            self.mark_counted(slot);
             let meta = Meta {
                 failure: Some(ReadFailure {
                     kind: ReadErrorKind::Other,
@@ -618,6 +646,7 @@ impl<'a> Emitter<'a> {
             });
             return;
         }
+        self.mark_counted(slot);
         let mut meta = meta_for(rec, NodeKind::Dir, ino, self.volume);
         if depth > MAX_DEPTH {
             self.diag

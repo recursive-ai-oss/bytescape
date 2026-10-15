@@ -460,18 +460,12 @@ mod tests {
     #[test]
     fn a_partition_takes_its_disks_answer() {
         let root = scratch("part");
-        fake_sys(
-            &root, "1
-",
-        );
+        fake_sys(&root, "1\n");
         let blocks = root.join("dev/block");
         assert_eq!(rotational_in(&blocks, 8, 0), Some(true), "the whole disk");
         assert_eq!(rotational_in(&blocks, 8, 3), Some(true), "its partition");
         let flash = scratch("flash");
-        fake_sys(
-            &flash, "0
-",
-        );
+        fake_sys(&flash, "0\n");
         assert_eq!(rotational_in(&flash.join("dev/block"), 8, 3), Some(false));
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&flash).unwrap();
@@ -480,10 +474,7 @@ mod tests {
     #[test]
     fn unknown_devices_and_junk_answers_are_unknown() {
         let root = scratch("unknown");
-        fake_sys(
-            &root, "maybe
-",
-        );
+        fake_sys(&root, "maybe\n");
         let blocks = root.join("dev/block");
         assert_eq!(rotational_in(&blocks, 8, 3), None, "junk");
         assert_eq!(rotational_in(&blocks, 9, 9), None, "no such device");
@@ -493,38 +484,13 @@ mod tests {
 
     #[test]
     fn mem_available_is_read_from_meminfo() {
-        let text = "MemTotal:       131072000 kB
-MemFree:  1 kB
-MemAvailable:   65536 kB
-Buffers: 3 kB
-";
+        let text = "MemTotal:       131072000 kB\nMemFree:  1 kB\nMemAvailable:   65536 kB\nBuffers: 3 kB\n";
         assert_eq!(mem_available(text), Some(65536 * 1024));
+        assert_eq!(mem_available("MemTotal: 1 kB\n"), None);
+        assert_eq!(mem_available("MemAvailable: lots kB\n"), None);
+        assert_eq!(mem_available("MemAvailable: 5 MB\n"), None);
         assert_eq!(
-            mem_available(
-                "MemTotal: 1 kB
-"
-            ),
-            None
-        );
-        assert_eq!(
-            mem_available(
-                "MemAvailable: lots kB
-"
-            ),
-            None
-        );
-        assert_eq!(
-            mem_available(
-                "MemAvailable: 5 MB
-"
-            ),
-            None
-        );
-        assert_eq!(
-            mem_available(
-                "MemAvailable: 18446744073709551615 kB
-"
-            ),
+            mem_available("MemAvailable: 18446744073709551615 kB\n"),
             None
         );
     }

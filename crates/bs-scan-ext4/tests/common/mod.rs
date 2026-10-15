@@ -158,13 +158,20 @@ fn write_item(src: &Path, item: &Item) {
     match item {
         Item::Dir(_) => fs::create_dir_all(&at).expect("create dir"),
         Item::File(_, len) => {
+            // One write, so that a `sync` run by a test building its own image
+            // at the same time cannot land halfway and make the host file system
+            // allocate the file in pieces: a file with many extents carries an
+            // extra index block, which the walker would count and the image
+            // does not have.
             let mut f = File::create(&at).expect("create file");
+            let mut data = Vec::new();
             let mut left = *len;
             while left > 0 {
                 let n = left.min(1 << 20);
-                f.write_all(&pattern(n)).expect("write");
+                data.extend_from_slice(&pattern(n));
                 left -= n;
             }
+            f.write_all(&data).expect("write");
         }
         Item::Sparse(_, len, islands) => {
             let f = File::create(&at).expect("create sparse");

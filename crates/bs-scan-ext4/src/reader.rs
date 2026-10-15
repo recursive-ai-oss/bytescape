@@ -758,7 +758,8 @@ mod tests {
         assert_eq!(pending.bytes, each as u64);
         assert!(pending.push(dir(Some(vec![0; 50]))));
         assert_eq!(pending.bytes, (each * 2 + 50) as u64);
-        // 51 more bytes of tail than the limit has room for.
+        // 50 bytes of room are left, and a third directory needs a whole
+        // record plus its tail.
         assert!(!pending.push(dir(Some(vec![0; 1]))));
         assert!(pending.bytes > pending.limit);
         assert_eq!(pending.dirs.len(), 2, "the refused one is not kept");

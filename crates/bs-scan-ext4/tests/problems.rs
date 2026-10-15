@@ -120,9 +120,13 @@ impl Image {
     }
 
     fn scan(&self) -> ImageScan {
+        self.scan_with(Ext4Options::default())
+    }
+
+    fn scan_with(&self, options: Ext4Options) -> ImageScan {
         let path = self.fixture.root.join("damaged.img");
         fs::write(&path, &self.bytes).unwrap();
-        scan_image(&path)
+        scan_image_with(&path, options, ScanOptions::default())
     }
 }
 
@@ -320,6 +324,79 @@ fn an_entry_whose_type_byte_is_wrong_loses_a_subtree_loudly() {
     let report = scan.report.clone().unwrap();
     assert_eq!(report.diagnostics.count(ProblemKind::DirentTypeMismatch), 1);
     assert_c_was_lost_loudly(&img, &scan);
+}
+
+/// A file with two names, one under `hidden` (a mount point of another file
+/// system, which the reader walks but does not report) and one, `shown/y`,
+/// in the tree. The type byte of `shown/y` is flipped, so the entry is
+/// dropped. The only copy of the file's bytes in the tree would have been
+/// that entry: the other name's bytes are in the hidden totals, so the
+/// listing must not claim to be complete.
+fn dropped_entry_whose_other_name_is_hidden(hidden: &str, shown: &str) {
+    let items = vec![
+        dir(hidden),
+        file(&format!("{hidden}/x"), 300_000),
+        dir(shown),
+        link(&format!("{shown}/y"), &format!("{hidden}/x")),
+        file(&format!("{shown}/k"), 10),
+    ];
+    let fixture = build(
+        &format!("shadow-{hidden}"),
+        &ImageSpec::new(items).size("8M"),
+    );
+    let bytes = fs::read(&fixture.img).unwrap();
+    let mut img = Image {
+        fixture,
+        bytes,
+        block_size: 4096,
+    };
+    let at = img.dirent(&format!("/{shown}"), "y");
+    assert_eq!(img.bytes[at + 7], 1);
+    img.bytes[at + 7] = 2; // says directory; the inode is a file
+    let options = Ext4Options {
+        skip: vec![hidden.as_bytes().to_vec()],
+        ..Ext4Options::default()
+    };
+    let scan = img.scan_with(options);
+    assert_sound(&scan.result);
+    let report = scan.report.clone().unwrap();
+    let infos = flatten(&scan.result.snapshot);
+    let label = format!("hidden={hidden} shown={shown}");
+    assert_eq!(
+        report.diagnostics.count(ProblemKind::DirentTypeMismatch),
+        1,
+        "{label}"
+    );
+    assert!(report.hidden_under_mounts.allocated >= 300_000, "{label}");
+    assert!(
+        !infos.contains_key(format!("{shown}/y").as_bytes()),
+        "{label}: the entry is dropped"
+    );
+    // The bytes are in the tree nowhere, so the listing that lost the entry
+    // says so, and so does everything above it.
+    let listing = &infos[shown.as_bytes()];
+    assert!(
+        listing.failed,
+        "{label}: the listing must not look complete"
+    );
+    let root = scan.result.snapshot.root().unwrap();
+    assert!(root.bytes_are_lower_bound(), "{label}");
+    assert!(root.has_unreadable_below(), "{label}");
+    let node = scan.result.snapshot.node(listing.id).unwrap();
+    assert_eq!(
+        node.read_failure().map(|f| f.kind),
+        Some(ReadErrorKind::Corrupt),
+        "{label}"
+    );
+    assert_eq!(report.unreadable_entries, 1, "{label}");
+}
+
+#[test]
+fn a_dropped_entry_whose_other_name_is_hidden_under_a_mount_is_flagged() {
+    // The hidden name is listed first, then the visible one.
+    dropped_entry_whose_other_name_is_hidden("a", "z");
+    // The visible name is listed first.
+    dropped_entry_whose_other_name_is_hidden("z", "a");
 }
 
 #[test]
