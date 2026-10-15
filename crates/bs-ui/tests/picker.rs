@@ -248,10 +248,14 @@ fn meta(size: u64) -> Meta {
     }
 }
 
+/// The root is `/data`, a name neither operating system's protection table
+/// treats as protected, so the reasons the tests look for are the ones shown
+/// (a protected root would give "Part of the operating system" instead).
 fn snap(finish: bool) -> Arc<Snapshot> {
     let mut agg = Aggregator::new();
     let mut b = Batch::new();
-    b.dir(DirKey(0), DirKey::NONE, b"/", &meta(4096)).unwrap();
+    b.dir(DirKey(0), DirKey::NONE, b"/data", &meta(4096))
+        .unwrap();
     for d in 1..=3u32 {
         b.dir(
             DirKey(d),
@@ -517,7 +521,8 @@ fn the_banner_takes_a_strip_off_the_map_instead_of_covering_it() {
 fn labels_of_a_stopped_scan_stop_saying_scanning() {
     let mut agg = Aggregator::new();
     let mut b = Batch::new();
-    b.dir(DirKey(0), DirKey::NONE, b"/", &meta(4096)).unwrap();
+    b.dir(DirKey(0), DirKey::NONE, b"/data", &meta(4096))
+        .unwrap();
     b.dir(DirKey(1), DirKey(0), b"folder1", &meta(4096))
         .unwrap();
     for f in 0..10u32 {
