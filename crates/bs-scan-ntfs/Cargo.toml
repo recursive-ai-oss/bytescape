@@ -20,6 +20,17 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 # Setting extended attributes on a mounted NTFS volume (streams, flags).
 libc = "0.2"
 
+# The live comparison asks the system about an entry through its open handle,
+# as a second opinion beside the walker's listing and the reader's table.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+
 [features]
 # Tests that build NTFS images with `mkntfs` and `ntfs-3g` and compare the
 # reader with the walker and with `ntfsinfo`. They need the ntfs-3g tools and

@@ -11,7 +11,7 @@ use crate::le::to_usize;
 use crate::mft::Model;
 use crate::parse::{F_HAS_EA, F_RESIDENT_DATA, FileRec, NONE, NS_DOS, drop_dos_aliases};
 use crate::record::split_ref;
-use crate::{Extras, Unaccounted};
+use crate::{Extras, ReparseCounts, Unaccounted};
 use bs_scan::winrules::{self, EntryClass, attr};
 use bs_scan::{Classifier, MAX_PATH_BYTES, ScanContext, ScanEnd, join_path};
 use bs_tree::{
@@ -293,6 +293,7 @@ pub(crate) struct Emitter<'a> {
     volume_key: u64,
     pub diag: Diagnostics,
     pub extras: Extras,
+    pub reparse: ReparseCounts,
     pub unreadable_entries: u64,
     pub not_entered: u64,
     pub cancelled: bool,
@@ -393,6 +394,7 @@ impl<'a> Emitter<'a> {
             volume_key: model.geo.serial & 0xFFFF_FFFF,
             diag: Diagnostics::default(),
             extras: Extras::default(),
+            reparse: ReparseCounts::default(),
             unreadable_entries: 0,
             not_entered: 0,
             cancelled: false,
@@ -682,6 +684,9 @@ impl<'a> Emitter<'a> {
         let first_sight = !self.test_and_set(edge.file);
         let (logical, allocated) = self.sizes(f, f.is_dir());
         let (kind, mut flags) = kind_and_flags(f, attrs, class);
+        if class.not_followed {
+            self.reparse.note(f.reparse_tag);
+        }
         let mut link = None;
         let names = self
             .graph
@@ -975,6 +980,9 @@ impl<'a> Emitter<'a> {
             let attrs = effective_attrs(f);
             let class = winrules::classify(attrs, f.reparse_tag);
             let (mut kind, mut flags) = kind_and_flags(f, attrs, &class);
+            if class.not_followed {
+                self.reparse.note(f.reparse_tag);
+            }
             if f.is_dir() && class.class == EntryClass::Dir {
                 kind = NodeKind::Other;
             }

@@ -207,6 +207,38 @@ pub struct Extras {
     pub directory_allocated: u64,
 }
 
+/// How many of the entries in the tree the table marks as reparse points
+/// (links, junctions, mount points, cloud placeholders and the system's own
+/// overlays), counted by the reparse tag the reader found for them (see [`ReparseCounts::by_tag`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReparseCounts {
+    /// The tags seen and how many entries carry each. The reader takes a tag
+    /// only from a `$REPARSE_POINT` attribute that is stored in the file's
+    /// base record. A tag of 0 therefore means the entry's attributes say it
+    /// is a reparse point and the reader found no tag: it may not have one,
+    /// or its attribute may be stored outside the base record (in an
+    /// extension record, or in clusters), where the reader does not look.
+    /// At most [`ReparseCounts::MAX_TAGS`] tags are kept apart.
+    pub by_tag: Vec<(u32, u64)>,
+    /// Entries whose tag did not fit in the list.
+    pub other: u64,
+}
+
+impl ReparseCounts {
+    /// Distinct tags kept apart. A damaged table can name any number.
+    pub const MAX_TAGS: usize = 64;
+
+    pub(crate) fn note(&mut self, tag: u32) {
+        if let Some(entry) = self.by_tag.iter_mut().find(|(t, _)| *t == tag) {
+            entry.1 = entry.1.saturating_add(1);
+        } else if self.by_tag.len() < Self::MAX_TAGS {
+            self.by_tag.push((tag, 1));
+        } else {
+            self.other = self.other.saturating_add(1);
+        }
+    }
+}
+
 /// What a read found besides the tree.
 #[derive(Clone, Debug, Default)]
 pub struct NtfsReport {
@@ -241,6 +273,8 @@ pub struct NtfsReport {
     pub not_entered: u64,
     /// What full accounting adds beyond the listing.
     pub extras: Extras,
+    /// The entries in the tree that the table marks as reparse points, by tag.
+    pub reparse: ReparseCounts,
     /// Entries or directories reported unreadable.
     pub unreadable_entries: u64,
     /// Attribute lists that could not be read, so their files may be missing
@@ -316,6 +350,7 @@ pub fn read_volume<S: ByteSource + ?Sized>(
     report.adopted = emitter.adopted;
     report.not_entered = emitter.not_entered;
     report.extras = emitter.extras;
+    report.reparse = std::mem::take(&mut emitter.reparse);
     report.unreadable_entries = emitter.unreadable_entries;
     report.lists_unchecked = model.lists_unchecked;
     report.attribute_lists = model.lists;
