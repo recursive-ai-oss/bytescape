@@ -9,19 +9,24 @@
 //! disks; the system-drive test also needs `BYTESCAPE_NTFS_LIVE=1`, because it
 //! takes minutes. Without the variables they say `NOT RUN`.
 //!
-//! The system-drive comparison fails on any difference that live change does
-//! not explain. `BYTESCAPE_NTFS_LIVE=report` prints the differences and does
-//! not fail on them (for finding out what a new class of difference is); any
-//! other value is the strict default. Every phase of both tests runs under a
+//! The system-drive comparison fails on any difference that no evidence
+//! explains: every difference is sorted into a cause (see `common::live`),
+//! and each cause rests on facts about that very path, such as the system's
+//! own answer when the entry is opened. `BYTESCAPE_NTFS_LIVE=report` prints
+//! the sorted differences and does not fail on the unexplained ones (for
+//! finding out what a new class of difference is); any other value is the
+//! strict default. Every phase of both tests runs under a
 //! time bound that names the phase; the walk of the system drive, which is slow
 //! when cold, is bounded by lack of progress instead, and prints its count.
 mod common;
 
 use bs_scan::{ScanOptions, ScanResult, Walker, start};
 use bs_scan_ntfs::{Accounting, NtfsOptions, NtfsReport, NtfsScanner};
-use bs_tree::{NodeFlags, NodeKind, Snapshot};
+use bs_tree::{NodeFlags, NodeKind};
 use common::compare::*;
+use common::live::{self, SYSTEM_NAMES, first_part};
 use common::testkit::{Info, flatten};
+use common::truth::SystemOracle;
 use common::watchdog::*;
 use common::windows::*;
 use std::path::{Path, PathBuf};
@@ -35,15 +40,6 @@ the entry's copy. The reader reports the file's.";
 const R_SPARSE: &str = "A directory entry's copy of a sparse file's allocated size is not kept \
 current by the file system (a listing reports 0 for a file with data in it); the reader \
 reports the clusters the file's run list backs.";
-
-const SYSTEM_NAMES: &[&str] = &[
-    "$MFT", "$MFTMirr", "$LogFile", "$Volume", "$AttrDef", "$Bitmap", "$Boot", "$BadClus",
-    "$Secure", "$UpCase", "$Extend",
-];
-
-fn first_part(path: &str) -> &str {
-    path.split('/').next().unwrap_or("")
-}
 
 /// Differences between the reader's tree and the walker's that are not bugs.
 const EXCEPTIONS: &[Exception] = &[
@@ -336,46 +332,14 @@ fn a_virtual_disk_matches_the_walker() {
 /// moment after the change.
 const LIVE_SLACK_SECS: i64 = 5;
 
-/// The fields a change made while the volume is read can explain: a size, a
-/// modification time, a name that appeared or went. Never a flag or a kind: a
-/// file does not become a link or a placeholder because it was written.
-const LIVE_FIELDS: &[&str] = &[
-    "mtime",
-    "logical",
-    "allocated",
-    "presence",
-    "link group",
-    "link group bytes",
-];
-
-fn parent_of(path: &str) -> &str {
-    path.rsplit_once('/').map_or("", |(p, _)| p)
-}
-
-/// Whether the volume changed at this path inside the scan window: the entry
-/// itself was written since `from`, or (for a name that appeared or went) the
-/// directory that holds it was.
-fn changed_in_window(
-    d: &Diff,
-    reader: &std::collections::BTreeMap<Vec<u8>, Info>,
-    walker: &std::collections::BTreeMap<Vec<u8>, Info>,
-    from: i64,
-) -> bool {
-    if !LIVE_FIELDS.contains(&d.field) {
-        return false;
-    }
-    let at = |m: &std::collections::BTreeMap<Vec<u8>, Info>, p: &str| {
-        m.get(p.as_bytes()).is_some_and(|i| i.mtime >= from)
-    };
-    let own = at(reader, &d.path) || at(walker, &d.path);
-    let by_presence = d.field.starts_with("presence") || d.field == "link group";
-    let dir = parent_of(&d.path);
-    own || (by_presence && !dir.is_empty() && (at(reader, dir) || at(walker, dir)))
-}
+/// How long the system may be asked about the differences: one open per
+/// path, a few hundred thousand at most.
+const ASK_LIMIT: std::time::Duration = std::time::Duration::from_secs(1800);
 
 /// The machine's own drive is a volume that is changing while it is read.
-/// Differences are sorted into the classes a live volume produces and
-/// reported; a difference in none of them fails.
+/// Every difference is sorted into a cause that evidence backs for that path
+/// (see `common::live`), the sorted differences are printed, and one that no
+/// cause explains fails the test.
 #[test]
 fn the_system_drive_matches_the_walker_up_to_live_changes() {
     if !allowed("the_system_drive_matches_the_walker_up_to_live_changes") {
@@ -417,6 +381,12 @@ fn the_system_drive_matches_the_walker_up_to_live_changes() {
     });
     let walker = handle.wait();
     assert_sound(&walker);
+    // The reader sees the disk, not the file system's cache. What was written
+    // since the first flush is written out now, so that the table the reader
+    // takes is not older than the walk it is compared with.
+    phase("flush the system drive again", FLUSH_LIMIT, move || {
+        flush_volume(letter)
+    });
     let raw = PathBuf::from(format!(r"\\.\{drive}"));
     let read_root = canon.clone();
     let (reader, report) = phase("read the system drive's table", READ_LIMIT, move || {
@@ -428,16 +398,81 @@ fn the_system_drive_matches_the_walker_up_to_live_changes() {
         walker.snapshot.len(),
         reader.snapshot.len()
     );
+    // What the table itself holds for the entries it marks as reparse points,
+    // to read beside the system's answers for the ones the listing lacks.
+    println!(
+        "reparse points in the reader's tree, by tag in the table: {:?} (tags past the limit: {})",
+        report
+            .reparse
+            .by_tag
+            .iter()
+            .map(|(t, n)| (format!("{t:#010x}"), *n))
+            .collect::<Vec<_>>(),
+        report.reparse.other
+    );
 
-    let unexplained = phase("compare the trees", COMPARE_LIMIT, {
-        let (r, w) = (reader.snapshot.clone(), walker.snapshot.clone());
-        move || classify_live_differences(&r, &w, window_from)
+    // The same table counted in full, every stream: the bytes of a file that
+    // the overlay layer compressed are in a named stream the listing-style
+    // count leaves out, and the full count is what the application shows.
+    let raw = PathBuf::from(format!(r"\\.\{drive}"));
+    let volume_device = raw.clone();
+    let read_root = canon.clone();
+    let (full, full_report) = phase(
+        "read the system drive's table (full)",
+        READ_LIMIT,
+        move || read_volume(&raw, &read_root, Accounting::Full, None),
+    );
+    println!(
+        "full count: {} nodes, extras {:?}",
+        full.snapshot.len(),
+        full_report.extras
+    );
+
+    // Sorting the differences asks the system about each path, so it can
+    // take a while on a large drive.
+    let (mut outcome, audit) = phase("sort the differences", ASK_LIMIT, {
+        let (r, w, f) = (
+            reader.snapshot.clone(),
+            walker.snapshot.clone(),
+            full.snapshot.clone(),
+        );
+        let oracle = SystemOracle::new(&canon).with_volume(&volume_device);
+        let geo = live::Geometry {
+            cluster_bytes: u64::from(full_report.cluster_bytes),
+            record_bytes: u64::from(full_report.record_bytes),
+        };
+        move || {
+            let outcome = live::classify(&r, &w, window_from, &oracle, Some(&f));
+            let audit =
+                live::audit_overlay_files(&flatten(&r), &flatten(&w), &flatten(&f), &oracle, geo);
+            (outcome, audit)
+        }
     });
-    println!("unexplained differences on the system drive: {unexplained}");
+    live::report_audit(&audit);
+    // A file whose compressed stream is held inside its own table record is
+    // explained by what was found for that very file.
+    for (d, evidence) in audit.resident {
+        let verdict = live::Verdict {
+            class: live::C_RESIDENT_STREAM,
+            basis: live::B_RESIDENT_STREAM,
+            detail: evidence,
+        };
+        outcome.explained.push((d, verdict));
+    }
+    live::report(&outcome);
+    // A file the overlay layer backs whose bytes the full count does not
+    // match, for no reason that holds for it, is an under- or over-count by
+    // the reader: not explained.
+    for d in audit.differ {
+        let why = "the full count is not the system's allocation for this file".to_owned();
+        outcome.unexplained.push((d, why));
+    }
+    println!("unexplained after the audit: {}", outcome.unexplained.len());
     if strict {
         assert_eq!(
-            unexplained, 0,
-            "differences that no live change explains (BYTESCAPE_NTFS_LIVE=report lists them without failing)"
+            outcome.unexplained.len(),
+            0,
+            "differences that no evidence explains (BYTESCAPE_NTFS_LIVE=report lists them without failing)"
         );
     }
     assert_eq!(report.lost_records, 0);
@@ -448,56 +483,6 @@ fn the_system_drive_matches_the_walker_up_to_live_changes() {
     // a link or mount point that neither tool enters) is printed.
     assert_eq!(report.adopted.files, 0, "files that no directory reaches");
     println!("left out on purpose: {:?}", report.unreachable);
-}
-
-/// Sorts every difference into its class, prints the classes, and returns how
-/// many are in a class that no live change explains.
-fn classify_live_differences(reader: &Snapshot, walker: &Snapshot, window_from: i64) -> usize {
-    let diffs = compare_trees(reader, walker);
-    let ra = flatten(reader);
-    let wa = flatten(walker);
-    let mut classes: std::collections::BTreeMap<&'static str, Vec<Diff>> = Default::default();
-    for d in diffs {
-        let key = d.path.as_bytes().to_vec();
-        let w = wa.get(&key);
-        let class = if d.field == "presence" && SYSTEM_NAMES.contains(&first_part(&d.path)) {
-            "system files (reader only)"
-        } else if d.field == "presence" && first_part(&d.path) == "System Volume Information" {
-            "system volume information (walker refused)"
-        } else if w.is_some_and(|i| i.failed) && !ra.contains_key(&key) {
-            "walker could not read the directory"
-        } else if changed_in_window(&d, &ra, &wa, window_from) {
-            "changed during the scan (mtime, size, presence)"
-        } else if d.field == "presence" {
-            "presence (unexplained)"
-        } else {
-            "other (unexplained)"
-        };
-        classes.entry(class).or_default().push(d);
-    }
-    let mut unexplained = 0;
-    for (class, list) in &classes {
-        let mut by_field: std::collections::BTreeMap<&str, usize> = Default::default();
-        for d in list {
-            *by_field.entry(d.field).or_default() += 1;
-        }
-        println!("{class}: {} {by_field:?}", list.len());
-        let mut shown: std::collections::BTreeMap<&str, usize> = Default::default();
-        for d in list {
-            let n = shown.entry(d.field).or_default();
-            if *n < 12 {
-                println!(
-                    "    {:?} {}: reader {} / walker {}",
-                    d.path, d.field, d.reader, d.other
-                );
-                *n += 1;
-            }
-        }
-        if class.contains("unexplained") {
-            unexplained += list.len();
-        }
-    }
-    unexplained
 }
 
 #[test]

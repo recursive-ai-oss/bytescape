@@ -215,6 +215,126 @@ fn links_and_mount_points_are_not_entered() {
     assert_eq!(report.unreachable.files, 1);
     assert_eq!(report.unreachable.allocated, 13 * CB);
     assert_eq!(report.adopted.files, 0);
+    // The report says which tags the entries in the tree carry.
+    let mut tags = report.reparse.by_tag.clone();
+    tags.sort_unstable();
+    assert_eq!(
+        tags,
+        [(0x8000_0013, 1), (0xA000_0003, 1), (0xA000_000C, 2),]
+    );
+    assert_eq!(report.reparse.other, 0);
+}
+
+/// A file the system's overlay layer compressed: the main stream is all hole
+/// and marked as a reparse point, and the data lives in a named stream.
+fn overlay_file(v: &mut Volume, name: &str, parent: u32, length: u64, packed: u64) -> u32 {
+    let rec = v.file(name, parent, length);
+    let hole = length.div_ceil(CB);
+    {
+        let e = v.ent_mut(rec);
+        e.streams[0].runs = vec![(None, hole)];
+        e.streams[0].flags = 0x8000;
+        e.streams[0].unit = 4;
+        e.attrs |= 0x200;
+    }
+    v.reparse(rec, 0x8000_0017);
+    v.stream(rec, "WofCompressedData", packed);
+    rec
+}
+
+#[test]
+fn the_bytes_of_an_overlay_compressed_file_are_in_its_named_stream_and_the_full_count_has_them() {
+    let build = || {
+        let mut v = Volume::new(Spec::default());
+        let d = v.dir("sys", ROOT);
+        // 143 clusters long, 51 clusters of compressed data.
+        overlay_file(&mut v, "a.dll", d, 143 * CB - 7, 51 * CB - 9);
+        let linked = overlay_file(&mut v, "b.dll", d, 20 * CB, 6 * CB);
+        v.link(linked, "b-again.dll", d);
+        v
+    };
+    let (_, listing_report, listing) = scan(build(), Accounting::Listing);
+    let (_, full_report, full) = scan(build(), Accounting::Full);
+    let packed = 51 * CB;
+    // Counting what a listing reports (the main stream) finds no clusters.
+    assert_eq!(listing["sys/a.dll"].allocated, 0);
+    assert_eq!(listing["sys/a.dll"].logical, 143 * CB - 7);
+    // The full count has the named stream's clusters, and nothing is lost:
+    // that is what the file holds on the disk.
+    assert_eq!(full["sys/a.dll"].allocated, packed);
+    assert_eq!(full_report.extras.stream_allocated, packed + 6 * CB);
+    assert_eq!(listing_report.extras.stream_allocated, packed + 6 * CB);
+    // A hard-linked one carries its bytes once.
+    let names = ["sys/b.dll", "sys/b-again.dll"];
+    let held: u64 = names.iter().map(|n| full[*n].allocated).sum();
+    assert_eq!(held, 6 * CB);
+    // Both counts mark it for what it is: not followed, and holding fewer
+    // bytes than its length.
+    for m in [&listing, &full] {
+        for n in ["sys/a.dll", "sys/b.dll"] {
+            assert!(m[n].flags.contains(NodeFlags::NOT_FOLLOWED), "{n}");
+            assert!(m[n].flags.contains(NodeFlags::SPARSE_OR_COMPRESSED), "{n}");
+        }
+    }
+    assert_eq!(full_report.reparse.by_tag, [(0x8000_0017, 3)]);
+}
+
+#[test]
+fn a_compressed_stream_small_enough_for_the_record_holds_no_clusters_and_its_bytes_are_counted() {
+    // A file of 6,384 bytes that the overlay layer packs into 500: the stream
+    // is a value of the file's own record, so it has no clusters. The full
+    // count holds none for the file and says how long the stream is (in the
+    // file's length); a stream of 700 bytes does not fit and is in clusters.
+    let build = || {
+        let mut v = Volume::new(Spec::default());
+        let d = v.dir("sys", ROOT);
+        overlay_file(&mut v, "small.xml", d, 6384, 500);
+        overlay_file(&mut v, "bigger.xml", d, 9000, 700);
+        v
+    };
+    let (_, report, full) = scan(build(), Accounting::Full);
+    let small = &full["sys/small.xml"];
+    assert_eq!(
+        small.allocated, 0,
+        "a stream held in the record has no clusters"
+    );
+    assert_eq!(
+        small.logical,
+        6384 + 500,
+        "the length is the main stream's plus the named stream's"
+    );
+    let bigger = &full["sys/bigger.xml"];
+    assert_eq!(
+        bigger.allocated, CB,
+        "a stream past the record is one cluster"
+    );
+    assert_eq!(bigger.logical, 9000 + 700);
+    // The extras say the same: 1,200 bytes of streams, one cluster of them.
+    assert_eq!(report.extras.stream_logical, 500 + 700);
+    assert_eq!(report.extras.stream_allocated, CB);
+    assert_eq!(report.reparse.by_tag, [(0x8000_0017, 2)]);
+}
+
+#[test]
+fn reparse_tags_are_counted_apart_up_to_a_limit() {
+    let mut counts = crate::ReparseCounts::default();
+    for tag in 0..70u32 {
+        counts.note(tag);
+        counts.note(tag);
+    }
+    // The tags seen first stay apart, the rest are pooled, and none is lost.
+    assert_eq!(counts.by_tag.len(), crate::ReparseCounts::MAX_TAGS);
+    assert!(counts.by_tag.iter().all(|&(t, n)| t < 64 && n == 2));
+    assert_eq!(counts.other, 12);
+}
+
+#[test]
+fn a_plain_volume_has_no_reparse_entries() {
+    let mut v = Volume::new(Spec::default());
+    let d = v.dir("docs", ROOT);
+    v.file("a", d, 10);
+    let (_, report, _) = full(v);
+    assert_eq!(report.reparse, crate::ReparseCounts::default());
 }
 
 #[test]
@@ -509,6 +629,12 @@ fn a_stray_is_described_like_any_other_entry() {
     v.ent_mut(strays).names[0].parent_seq = 77;
     let (result, report, _) = full(v);
     assert_eq!(report.adopted.files, 7);
+    // A stray that is a link is counted by its tag like any other; the one
+    // whose attributes say reparse point and whose table holds no tag is
+    // counted under tag 0.
+    let mut tags = report.reparse.by_tag.clone();
+    tags.sort_unstable();
+    assert_eq!(tags, [(0, 1), (0xA000_000C, 1)]);
     let folder = String::from_utf8_lossy(crate::emit::ORPHANS_NAME).into_owned();
     let made_up = root_children(&result, &folder);
     let at = |name: &str| {
@@ -748,20 +874,69 @@ fn volumes_that_are_not_ntfs_or_too_big_are_refused() {
     assert!(result.stats.error.is_some());
 }
 
-#[test]
-fn cancelling_keeps_the_partial_tree_marked_incomplete() {
+/// Reads a volume image after cancelling its own scan, so the cancel is
+/// certain to come before the read, not racing it. (A cancel sent from
+/// another thread right after the start may land after a small volume has
+/// been read whole; then the tree really is complete, and that is correct.)
+struct CancelsFirst {
+    image: Vec<u8>,
+    cancel: bool,
+}
+
+impl bs_scan::Scanner for CancelsFirst {
+    fn name(&self) -> &'static str {
+        "ntfs-cancels-first"
+    }
+
+    fn scan(
+        &self,
+        root: &std::path::Path,
+        ctx: &bs_scan::ScanContext,
+    ) -> Result<bs_scan::ScanEnd, bs_scan::ScanError> {
+        if self.cancel {
+            ctx.cancel();
+        }
+        crate::read_volume(
+            self.image.as_slice(),
+            root.to_string_lossy().as_bytes(),
+            &NtfsOptions::default(),
+            ctx,
+        )
+        .map(|(end, _)| end)
+        .map_err(|e| bs_scan::ScanError::Root(std::io::Error::other(e)))
+    }
+}
+
+fn scan_with_cancel(cancel: bool) -> bs_scan::ScanResult {
     use bs_scan::{ScanOptions, start};
     use std::sync::Arc;
     let mut v = Volume::new(Spec::default());
     for i in 0..50 {
         v.file(&format!("f{i}"), ROOT, 10);
     }
-    let scanner = crate::testkit::MemScanner::new(Arc::new(v.finish()), NtfsOptions::default());
-    let handle = start(scanner, "C:\\".into(), ScanOptions::default());
-    handle.cancel();
-    let result = handle.wait();
+    let scanner = Arc::new(CancelsFirst {
+        image: v.finish(),
+        cancel,
+    });
+    start(scanner, "C:\\".into(), ScanOptions::default()).wait()
+}
+
+#[test]
+fn cancelling_keeps_the_partial_tree_marked_incomplete() {
+    let result = scan_with_cancel(true);
     result.snapshot.verify().unwrap();
+    assert_eq!(result.stats.end, Some(bs_scan::ScanEnd::Cancelled));
+    assert!(result.stats.error.is_none(), "{:?}", result.stats.error);
     assert!(!result.snapshot.scan_complete());
+}
+
+#[test]
+fn the_same_scan_without_a_cancel_is_complete() {
+    // The control for the test above: nothing but the cancel differs.
+    let result = scan_with_cancel(false);
+    result.snapshot.verify().unwrap();
+    assert_eq!(result.stats.end, Some(bs_scan::ScanEnd::Completed));
+    assert!(result.snapshot.scan_complete());
 }
 
 #[test]
