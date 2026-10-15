@@ -27,6 +27,7 @@ use crate::blocks::Special;
 use crate::capacity::{Breakdown, CapacityModel};
 use crate::card::{self, CardData, CardHit, CardState};
 use crate::chrome::{self, CrumbPart, Geometry, Hit, LegendMode, TextMeasure};
+use crate::elevation::{self, Offer, UnreadableAs};
 use crate::info::{self, InfoLine};
 use crate::notice::{AboutInfo, CRASH_WORDS, CrashNotice};
 use crate::picker::{PickTarget, Picker};
@@ -61,8 +62,9 @@ pub enum ShellEffect {
     ScanFolder,
     /// Go back from a drive's map to the drive picker.
     ShowPicker,
-    /// The Unreadable block was clicked: scan again with the administrator
-    /// helper.
+    /// The Unreadable block or the Full scan button was pressed: read the
+    /// drive again with the administrator helper. The host runs it beside the
+    /// ordinary scan (see [`crate::elevation::Race`]).
     FullScan,
     /// Work for the disk. Run it off the UI thread and hand the result to
     /// [`Shell::job_done`].
@@ -244,6 +246,10 @@ pub struct Shell<S: ViewSource> {
     measure: Box<dyn TextMeasure>,
     geom: Geometry,
     geom_key: (u32, u32, u32, bool),
+    /// The geometry has room for the Full scan button.
+    geom_full_scan: bool,
+    /// Whether and how administrator rights are offered.
+    offer: Offer,
     crumb: String,
     status: String,
     scanning: bool,
@@ -309,6 +315,8 @@ impl<S: ViewSource> Shell<S> {
             measure,
             geom,
             geom_key: (size.0, size.1, scale.to_bits(), false),
+            geom_full_scan: false,
+            offer: Offer::Available,
             crumb: String::new(),
             status: String::new(),
             scanning: false,
@@ -372,14 +380,24 @@ impl<S: ViewSource> Shell<S> {
             self.scale.to_bits(),
             self.text.is_ready(),
         );
-        if key != self.geom_key {
+        let full_scan = self.offer.shows_button();
+        if key != self.geom_key || full_scan != self.geom_full_scan {
             self.geom_key = key;
+            self.geom_full_scan = full_scan;
             self.geom = Self::compute(
                 (self.width, self.height),
                 self.scale,
                 self.font_px,
                 self.measure.as_ref(),
             );
+            if full_scan {
+                let em = self.font_px * self.scale;
+                let w = self
+                    .measure
+                    .width(elevation::FULL_SCAN_LABEL)
+                    .unwrap_or(elevation::FULL_SCAN_LABEL.chars().count() as f32 * em * 0.56);
+                self.geom.reserve_full_scan(w, self.scale, em);
+            }
         }
         &self.geom
     }
@@ -541,15 +559,15 @@ impl<S: ViewSource> Shell<S> {
         let nav_h = (chrome::NAV_HEIGHT * self.scale).round();
         let h = (em * 2.0).round().min(nav_h);
         let text_w = m(&words);
+        // The Full scan button keeps the far end; the readout sits before it.
+        let right = self
+            .geom
+            .full_scan
+            .map_or(self.width as f32 - gap, |r| r.x - gap);
         let w = (pad + text_w + pad + btn_w + (em * 0.3).round())
-            .min((self.width as f32 - 2.0 * gap).max(0.0))
+            .min((right - gap).max(0.0))
             .round();
-        let panel = Rect::new(
-            self.width as f32 - gap - w,
-            ((nav_h - h) / 2.0).round(),
-            w,
-            h,
-        );
+        let panel = Rect::new(right - w, ((nav_h - h) / 2.0).round(), w, h);
         let bh = bh.min(h - 2.0);
         let button = Rect::new(
             panel.right() - btn_w - (em * 0.3).round(),
@@ -611,6 +629,21 @@ impl<S: ViewSource> Shell<S> {
         }
     }
 
+    /// Whether something is being scanned, without touching the status text:
+    /// a full scan that runs after the ordinary one has finished.
+    pub fn set_scanning(&mut self, scanning: bool, now: Duration) {
+        if scanning == self.scanning {
+            return;
+        }
+        self.scanning = scanning;
+        if scanning {
+            self.scan_since = Some(now);
+        } else {
+            self.scan_since = None;
+            self.esc_armed = None;
+        }
+    }
+
     /// A scan started at `now`. Esc stops a scan that is younger than a few
     /// seconds at once and asks for a second Esc after that.
     pub fn begin_scan(&mut self, now: Duration) {
@@ -635,6 +668,7 @@ impl<S: ViewSource> Shell<S> {
             Some(Hit::Link | Hit::Swatch(_) | Hit::Refresh | Hit::Overflow | Hit::CrumbSeg(_)) => {
                 true
             }
+            Some(Hit::FullScan) => self.offer.can_start(),
             Some(Hit::Back) => self.can_go_back(),
             Some(Hit::Forward) => self.can_go_forward(),
             Some(Hit::Up) => self.can_go_up(),
@@ -1404,6 +1438,73 @@ impl<S: ViewSource> Shell<S> {
         }
     }
 
+    /// Whether and how administrator rights are offered.
+    pub fn offer(&self) -> &Offer {
+        &self.offer
+    }
+
+    /// How the Unreadable block words itself now.
+    pub fn unreadable_as(&self) -> UnreadableAs {
+        self.offer.unreadable_as()
+    }
+
+    /// Sets whether and how administrator rights are offered. Returns whether
+    /// the Unreadable block must be worded again (the host lays the drive view
+    /// out once more with [`UnreadableAs`] in its blocks).
+    pub fn set_offer(&mut self, offer: Offer) -> bool {
+        let reword = self.offer.unreadable_as() != offer.unreadable_as();
+        self.offer = offer;
+        reword
+    }
+
+    /// The button or the Unreadable block was pressed.
+    fn full_scan_requested(&mut self, now: Duration) -> Vec<ShellEffect> {
+        match self.offer.clone() {
+            Offer::Available if self.busy() => {
+                // A delete or a restore that is still under way would finish
+                // into a map that the full result is about to replace.
+                self.say("Full scan: wait for the last action to finish", now);
+                Vec::new()
+            }
+            Offer::Available => {
+                self.say("Starting the administrator helper…", now);
+                vec![ShellEffect::FullScan]
+            }
+            Offer::Running => {
+                self.say("The full scan is already running", now);
+                Vec::new()
+            }
+            Offer::Done => {
+                self.say(
+                    "This map was already read with administrator rights; what is left is the filesystem's own overhead",
+                    now,
+                );
+                Vec::new()
+            }
+            Offer::Explained(text) => {
+                self.say(text, now);
+                vec![ShellEffect::OpenUrl(
+                    crate::notice::RELEASES_URL.to_string(),
+                )]
+            }
+            Offer::Unavailable(text) => {
+                self.say(text, now);
+                Vec::new()
+            }
+            Offer::DeletesOnly => {
+                self.say(
+                    "A full scan reads a whole drive; open a drive to use it",
+                    now,
+                );
+                Vec::new()
+            }
+            Offer::Hidden => {
+                self.say("Administrator scans aren't available on this computer", now);
+                Vec::new()
+            }
+        }
+    }
+
     /// A click that selected one of the drive-level blocks.
     fn block_click(&mut self, now: Duration) -> Vec<ShellEffect> {
         let Some(app) = self.app.as_ref() else {
@@ -1413,13 +1514,7 @@ impl<S: ViewSource> Shell<S> {
             return Vec::new();
         };
         match app.source().special(app.current_view(), *id) {
-            Some(Special::Unreadable) => {
-                self.say(
-                    "Full scan needs the administrator helper, which this version doesn't include yet",
-                    now,
-                );
-                vec![ShellEffect::FullScan]
-            }
+            Some(Special::Unreadable) => self.full_scan_requested(now),
             Some(Special::RecycleBin) => self.request_empty(now),
             _ => Vec::new(),
         }
@@ -1460,6 +1555,7 @@ impl<S: ViewSource> Shell<S> {
                 return vec![ShellEffect::ShowPicker];
             }
             Hit::Refresh => Some(Key::Refresh),
+            Hit::FullScan => return self.full_scan_requested(now),
             Hit::Link => return vec![ShellEffect::OpenLink(chrome::LINK_URL)],
             Hit::CrumbSeg(index) => {
                 self.hide_card();
@@ -1542,6 +1638,10 @@ impl<S: ViewSource> Shell<S> {
             Hit::Up if self.picker_return => line("Back to the drives (Backspace)"),
             Hit::Up => line("Up — already at the top"),
             Hit::Refresh => line("Refresh the layout (F5)"),
+            Hit::FullScan if self.offer.can_start() => {
+                line("Read the whole drive with administrator rights")
+            }
+            Hit::FullScan => line("A full scan is running"),
             Hit::Link => line("Opens RecursiveAI.org in your browser"),
             Hit::Swatch(c) => line(&format!(
                 "{} — other categories dimmed",
@@ -1555,7 +1655,12 @@ impl<S: ViewSource> Shell<S> {
                     .collect();
                 line(&format!("More categories: {}", hidden.join(", ")))
             }
-            Hit::Capacity => line(&self.capacity.breakdown()?.describe()),
+            Hit::Capacity => line(
+                &self
+                    .capacity
+                    .breakdown()?
+                    .describe_as(self.offer == Offer::Done),
+            ),
             Hit::CrumbSeg(i) => {
                 let segs = self.crumb_segments();
                 line(&format!("Go to {}", segs.get(i)?))
@@ -1638,6 +1743,18 @@ impl<S: ViewSource> Shell<S> {
                 glyph,
                 enabled,
                 hot: hot == Some(h),
+            });
+        }
+        if let Some(rect) = g.full_scan {
+            widgets.push(Widget::Text {
+                rect,
+                text: elevation::FULL_SCAN_LABEL.into(),
+                role: if self.offer.can_start() {
+                    TextRole::Link
+                } else {
+                    TextRole::Secondary
+                },
+                hot: hot == Some(Hit::FullScan) && self.offer.can_start(),
             });
         }
         for part in crumbs {

@@ -29,6 +29,20 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// When this test run is itself elevated (a root container, a user namespace
+/// mapped to root), the program refuses to start before it looks at any bus.
+/// Returns true after checking that the refusal, and only it, was said.
+fn refused_as_elevated(text: &str) -> bool {
+    match bs_platform::elevation::refusal() {
+        Some(message) => {
+            assert_eq!(text.matches(message).count(), 1, "{text}");
+            assert!(!text.contains(OFF), "{text}");
+            true
+        }
+        None => false,
+    }
+}
+
 fn scratch(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("bytescape-access-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -50,6 +64,9 @@ fn a_tcp_accessibility_bus_is_refused_with_one_line() {
     ] {
         let out = run("unix:path=/run/user/1/bus", Some(address), &dir);
         let text = stderr(&out);
+        if refused_as_elevated(&text) {
+            continue;
+        }
         assert_eq!(text.matches(OFF).count(), 1, "{address}: {text}");
         assert!(
             text.contains("accessibility bus address"),
@@ -70,6 +87,9 @@ fn a_tcp_session_bus_is_refused_with_one_line() {
     ] {
         let out = run(session, Some("unix:path=/run/user/1/at-spi/bus_0"), &dir);
         let text = stderr(&out);
+        if refused_as_elevated(&text) {
+            continue;
+        }
         assert_eq!(text.matches(OFF).count(), 1, "{session}: {text}");
         assert!(text.contains("session bus address"), "{session}: {text}");
     }
@@ -81,6 +101,9 @@ fn no_way_to_ask_for_the_accessibility_bus_means_no_adapter() {
     let dir = scratch("nogdbus");
     let out = run("unix:path=/run/user/1/bus", None, &dir);
     let text = stderr(&out);
+    if refused_as_elevated(&text) {
+        return;
+    }
     assert_eq!(text.matches(OFF).count(), 1, "{text}");
     assert!(text.contains("no accessibility bus is available"), "{text}");
     let _ = std::fs::remove_dir_all(dir);
@@ -100,6 +123,9 @@ fn a_tcp_reply_from_the_session_bus_is_refused() {
     let path = format!("{}:/usr/bin:/bin", dir.display());
     let out = run("unix:path=/run/user/1/bus", None, Path::new(&path));
     let text = stderr(&out);
+    if refused_as_elevated(&text) {
+        return;
+    }
     assert_eq!(text.matches(OFF).count(), 1, "{text}");
     assert!(text.contains("accessibility bus address"), "{text}");
     let _ = std::fs::remove_dir_all(dir);
@@ -113,6 +139,9 @@ fn local_buses_are_accepted_and_nothing_is_said() {
     for at_spi in [None, Some("unix:path=/run/user/1/at-spi/bus_0")] {
         let out = run("unix:path=/run/user/1/bus", at_spi, Path::new(&path));
         let text = stderr(&out);
+        if refused_as_elevated(&text) {
+            continue;
+        }
         assert!(!text.contains(OFF), "{at_spi:?}: {text}");
     }
     let _ = std::fs::remove_dir_all(dir);

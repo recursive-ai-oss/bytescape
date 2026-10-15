@@ -526,7 +526,17 @@ fn only_big_folders_near_the_top_are_handed_to_the_matcher() {
     let snap = agg.publish();
     let found = bs_ui::owners::candidates(&snap);
     let paths: Vec<&str> = found.iter().map(|(p, _)| p.to_str().unwrap()).collect();
-    assert_eq!(paths, ["/data", "/data/big", "/data/big/inner"]);
+    // Paths are joined with the platform's separator; the root keeps the name
+    // the scan gave it.
+    let sep = std::path::MAIN_SEPARATOR;
+    assert_eq!(
+        paths,
+        [
+            "/data".to_string(),
+            format!("/data{sep}big"),
+            format!("/data{sep}big{sep}inner")
+        ]
+    );
     assert!(found.iter().all(|(_, bytes)| *bytes >= 100_000_000));
 }
 
@@ -617,7 +627,7 @@ fn nothing_can_be_done_by_name_to_a_made_up_folder_from_the_keyboard_or_menu() {
     let rows = r.shell.menu_items();
     for label in [
         "Open",
-        "Show in file manager",
+        bs_ui::action::Action::ShowInFileManager.label(),
         "Copy path",
         "Rescan this folder",
         "Delete",

@@ -2,6 +2,7 @@
 //! events, and the benchmark and screenshot entry points that share its
 //! drawing path.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -17,11 +18,12 @@ use bs_render::present::Presenter;
 use bs_render::{
     Chrome, Flags, Item, ItemKind, ItemLabel, Painted, Palette, Rect, Renderer, TextEngine,
 };
-use bs_tree::Progress;
 use bs_tree::Snapshot;
+use bs_tree::{NodeId, Progress};
 use bs_ui::action::Action;
 use bs_ui::blocks::DriveBlocks;
 use bs_ui::capacity::Breakdown;
+use bs_ui::elevation::{self, FastEnd, Offer, Place, Race, Step};
 use bs_ui::notice::CrashNotice;
 use bs_ui::picker::{CardScan, Picker, StartPlan, plan_start};
 use bs_ui::shell::{BinDrive, Capabilities, JobResult, Look, ScanReadout, Shell, ShellEffect};
@@ -38,6 +40,7 @@ use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 use crate::access::{self, Access, UserEvent};
 use crate::bench::{self, FrameSink, Offscreen, Script};
+use crate::fast::{Finish, HelperScanner, SystemLauncher};
 use crate::live::{RateMeter, ScanDriver, Tick};
 use crate::shots;
 use crate::synth::{LayoutParams, SynthSource, format_size};
@@ -584,6 +587,31 @@ struct Live {
     crash_rx: Option<Receiver<Option<Report>>>,
     /// Whether the desktop has a software center, once asked.
     software_rx: Option<Receiver<bool>>,
+    /// The full scan running beside the ordinary one, if any.
+    fast: Option<FastRun>,
+    /// What this computer and edition allow, once asked.
+    probe: Option<Offer>,
+    probe_rx: Option<Receiver<Offer>>,
+    /// The open map was read by the helper with administrator rights.
+    elevated_done: bool,
+    /// Where the user was when the full result replaced the map; found again
+    /// by names in the new tree.
+    pending_place: Option<Place>,
+    /// What was moved to the bin or deleted on the open map, by names, to put
+    /// on the full result when it replaces the map.
+    marks: elevation::DeleteMarks,
+    /// The boxes the undo list holds on the map being replaced, by names, to
+    /// find again in the full result.
+    pending_undo: Vec<(NodeId, Vec<Vec<u8>>)>,
+}
+
+/// A full scan through the administrator helper, racing the ordinary scan.
+struct FastRun {
+    driver: ScanDriver,
+    finish: Arc<std::sync::Mutex<Finish>>,
+    race: Race,
+    /// When it was started, for how long Esc treats the scan as young.
+    started: Duration,
 }
 
 /// A background scan of one drive while the picker shows.
@@ -603,6 +631,20 @@ struct DriveState {
     whole_drive: bool,
     /// Bytes in the drive's Recycle Bin or Trash, once measured.
     bin: u64,
+    /// Further mounts of this drive the helper may enter: the ones no other
+    /// mount already shows (Linux; empty on Windows).
+    extra_mount_ids: Vec<u64>,
+}
+
+/// The mounts of `drive`, other than the one scans start at, that show their
+/// own part of the filesystem.
+fn extra_mounts_of(drive: &Drive) -> Vec<u64> {
+    drive
+        .mounts
+        .iter()
+        .filter(|m| !m.covered_by_other_mount && m.mount_point != drive.mount_point)
+        .filter_map(|m| m.mount_id.map(u64::from))
+        .collect()
 }
 
 impl Live {
@@ -820,9 +862,22 @@ fn apply_shell(live: &mut Live, fx: Vec<ShellEffect>, now: Duration) -> Vec<Shel
             }
             ShellEffect::CopyText(text) => system::copy_text(text, live.notices_tx.clone()),
             ShellEffect::CancelScan => {
+                // Stopping the scan stops the full scan too.
+                let had_full_scan = live.fast.is_some();
+                if let Some(fast) = live.fast.take() {
+                    drop(fast.driver.discard());
+                }
                 if let Some(scan) = &live.scan {
                     scan.cancel();
                 }
+                if had_full_scan {
+                    live.shell.notify(
+                        "The full scan was stopped. The normal scan's result stays",
+                        now,
+                    );
+                    sync_offer(live, now);
+                }
+                sync_scanning(live, now);
             }
             ShellEffect::Run(job) => {
                 let (tx, rx) = mpsc::channel();
@@ -871,8 +926,8 @@ fn apply_shell(live: &mut Live, fx: Vec<ShellEffect>, now: Duration) -> Vec<Shel
                     None => live.shell.notify("That isn't a file or folder", now),
                 }
             }
-            ShellEffect::FullScan => {}
-            other @ (ShellEffect::PickDrive(_)
+            other @ (ShellEffect::FullScan
+            | ShellEffect::PickDrive(_)
             | ShellEffect::ScanFolder
             | ShellEffect::ShowPicker
             | ShellEffect::Rescan) => left.push(other),
@@ -884,6 +939,13 @@ fn apply_shell(live: &mut Live, fx: Vec<ShellEffect>, now: Duration) -> Vec<Shel
 /// Puts delete marks on the finished tree and lays the view out again. The
 /// sizes do not change, so the boxes stay where they are.
 fn apply_tree(live: &mut Live, changes: &[bs_ui::shell::TreeChange], now: Duration) {
+    // Noted by names too: the full result is another tree.
+    if let Some(app) = live.shell.app() {
+        for change in changes {
+            live.marks
+                .note(app.source().names_below_root(change.node), change.to);
+        }
+    }
     let Some(snapshot) = live.scan.as_mut().and_then(|s| s.apply_marks(changes)) else {
         return;
     };
@@ -1019,6 +1081,7 @@ fn query_drive(live: &mut Live, path: PathBuf) {
                     whole_drive: same(&path, &drive.mount_point),
                     root: drive.mount_point.clone(),
                     bin: 0,
+                    extra_mount_ids: extra_mounts_of(drive),
                 })
             });
             let _ = tx.send(state);
@@ -1048,7 +1111,10 @@ fn drive_blocks(live: &Live) -> Option<DriveBlocks> {
     let drive = live.drive.as_ref().filter(|d| d.whole_drive)?;
     breakdown(live)
         .filter(|_| drive.whole_drive)
-        .map(|b| DriveBlocks::from(&b))
+        .map(|b| DriveBlocks {
+            unreadable_as: live.shell.unreadable_as(),
+            ..DriveBlocks::from(&b)
+        })
 }
 
 /// Feeds the capacity bar and the drive-level blocks.
@@ -1173,9 +1239,155 @@ fn pump_pool(live: &mut Live, now: Duration) {
     }
 }
 
+/// What the shell offers now: the platform's answer, narrowed by what is open
+/// and what is running.
+fn current_offer(live: &Live) -> Offer {
+    if live.elevated_done {
+        return Offer::Done;
+    }
+    if live.fast.is_some() {
+        return Offer::Running;
+    }
+    let base = live.probe.clone().unwrap_or(Offer::Hidden);
+    offer_for_map(base, live.drive.as_ref().is_some_and(|d| d.whole_drive))
+}
+
+/// A full scan reads a whole drive, and a folder map has none to read: its
+/// button is hidden, but the helper can still do a delete that needs
+/// administrator rights.
+fn offer_for_map(base: Offer, whole_drive: bool) -> Offer {
+    match base {
+        Offer::Available if !whole_drive => Offer::DeletesOnly,
+        other => other,
+    }
+}
+
+/// Brings the shell's offer in line with the state, rewording the Unreadable
+/// block when it changes.
+fn sync_offer(live: &mut Live, now: Duration) {
+    let offer = current_offer(live);
+    if *live.shell.offer() == offer {
+        return;
+    }
+    if live.shell.set_offer(offer) {
+        update_capacity(live, now);
+    }
+    refresh_chrome(live, now);
+    live.window.request_redraw();
+}
+
+/// What this computer and edition allow, worked out on a worker thread.
+fn probe_offer() -> Offer {
+    if cfg!(feature = "walk-only") {
+        return Offer::walk_only_edition();
+    }
+    match bs_platform::elevate::Elevation::system() {
+        Ok(_) => Offer::Available,
+        Err(bs_platform::elevate::ElevateError::Unavailable(why)) => Offer::for_unavailable(why),
+        Err(_) => Offer::Hidden,
+    }
+}
+
+/// Checks the full scan: when it has ended, decides the race. Returns whether
+/// the full result replaced the map (the caller then builds the new map from
+/// it at once).
+fn pump_fast(live: &mut Live, now: Duration) -> bool {
+    let Some(fast) = live.fast.as_mut() else {
+        return false;
+    };
+    // Only the end matters here: nothing of a full scan is shown until it has
+    // won.
+    if !matches!(fast.driver.tick(Instant::now()), Tick::Finished(..)) {
+        return false;
+    }
+    let end = match fast.finish.lock().map(|f| f.clone()) {
+        Ok(Finish::Ended(end)) => end,
+        _ => FastEnd::Failed("the helper scan ended without a result.".to_string()),
+    };
+    match fast.race.fast_finished(end) {
+        Step::UseFast { note } => {
+            swap_to_full(live, note, now);
+            true
+        }
+        Step::DropFast { message } => {
+            if let Some(fast) = live.fast.take() {
+                drop(fast.driver.discard());
+            }
+            if let Some(message) = message {
+                live.shell.notify(message, now);
+            }
+            sync_offer(live, now);
+            sync_scanning(live, now);
+            false
+        }
+        Step::UseWalk { .. } | Step::Nothing => false,
+    }
+}
+
+/// The full result won: it takes the place of the ordinary scan, and the
+/// user's place is found again in it by names.
+fn swap_to_full(live: &mut Live, note: Option<String>, now: Duration) {
+    let Some(mut fast) = live.fast.take() else {
+        return;
+    };
+    live.pending_place = live.shell.app().map(elevation::capture);
+    live.pending_undo = match live.shell.app() {
+        Some(app) => live
+            .shell
+            .undo_nodes()
+            .into_iter()
+            .map(|n| (n, app.source().names_below_root(n)))
+            .collect(),
+        None => Vec::new(),
+    };
+    // What was deleted before the full result came in stays deleted in it.
+    if !live.marks.is_empty() {
+        let changes = live.marks.changes_in(&fast.driver.latest());
+        let _ = fast.driver.apply_marks(&changes);
+    }
+    if let Some(old) = live.scan.take() {
+        drop(old.discard());
+    }
+    // The finished tree is offered again, as a first picture of a new map.
+    fast.driver.rewind();
+    live.scan = Some(fast.driver);
+    live.elevated_done = true;
+    // A layout being made for the old tree is for boxes that no longer exist.
+    live.relayout = None;
+    live.snapshot = None;
+    live.blocks_dirty = false;
+    live.shell.clear_app();
+    if let Some(note) = note {
+        live.shell.notify(note, now);
+    }
+    sync_offer(live, now);
+}
+
+/// Keeps the progress overlay, Cancel and Esc going while the helper reads
+/// the drive after the ordinary scan has ended: the shell counts that as a
+/// scan too, and stops counting it when the helper's run is over.
+fn sync_scanning(live: &mut Live, now: Duration) {
+    let walking = live.scan.as_ref().is_some_and(ScanDriver::running);
+    match live.fast.as_ref().map(|f| f.started) {
+        Some(started) if !walking => {
+            if !live.shell.scanning() {
+                live.shell.set_scanning(true, started.min(now));
+                update_readout(live);
+            }
+        }
+        None if !walking && live.shell.scanning() => {
+            live.shell.set_scanning(false, now);
+            live.shell.set_readout(None);
+        }
+        _ => {}
+    }
+}
+
 /// The progress overlay's figures for the scan running now.
 fn update_readout(live: &mut Live) {
-    let Some(scan) = live.scan.as_ref().filter(|s| s.running()) else {
+    // The ordinary scan's figures while it runs; after it, the full scan's.
+    let walking = live.scan.as_ref().filter(|s| s.running());
+    let Some(scan) = walking.or(live.fast.as_ref().map(|f| &f.driver)) else {
         live.shell.set_readout(None);
         return;
     };
@@ -1251,6 +1463,13 @@ impl WinApp {
         for ps in live.pool.drain(..) {
             drop(ps.driver.discard());
         }
+        if let Some(fast) = live.fast.take() {
+            drop(fast.driver.discard());
+        }
+        live.elevated_done = false;
+        live.pending_place = None;
+        live.marks.clear();
+        live.pending_undo.clear();
         live.drive = None;
         sync_bin_drive(live);
         live.drive_rx = None;
@@ -1301,6 +1520,7 @@ impl WinApp {
             root: drive.mount_point.clone(),
             whole_drive: true,
             bin: 0,
+            extra_mount_ids: extra_mounts_of(&drive),
         });
         let root = drive.mount_point.clone();
         self.begin_map(driver, root, known.map(|k| (k, drive)), from_picker, now);
@@ -1361,6 +1581,14 @@ impl WinApp {
             return;
         };
         driver.rewind();
+        // Another map: a full scan of the old one means nothing here.
+        if let Some(fast) = live.fast.take() {
+            drop(fast.driver.discard());
+        }
+        live.elevated_done = false;
+        live.pending_place = None;
+        live.marks.clear();
+        live.pending_undo.clear();
         live.scan = Some(driver);
         live.scan_root = Some(root.clone());
         live.relayout = None;
@@ -1396,6 +1624,40 @@ impl WinApp {
         self.picker_pending = false;
     }
 
+    /// Starts reading the open drive with the administrator helper, beside
+    /// the ordinary scan. The system asks for the rights while the helper
+    /// starts; nothing here waits for it.
+    fn start_full_scan(&mut self, now: Duration) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if live.fast.is_some() || live.elevated_done {
+            return;
+        }
+        let Some(drive) = live.drive.clone().filter(|d| d.whole_drive) else {
+            live.shell
+                .notify("A full scan reads a whole drive. Open a drive first", now);
+            return;
+        };
+        bs_platform::crash::record_action("full scan started");
+        let scanner = HelperScanner::new(Arc::new(SystemLauncher {
+            extra_mount_ids: drive.extra_mount_ids.clone(),
+        }));
+        let finish = scanner.finish();
+        let walking = live.scan.as_ref().is_some_and(ScanDriver::running);
+        let driver =
+            ScanDriver::start_scanner(scanner, drive.root.clone(), Some(drive.capacity.used));
+        live.fast = Some(FastRun {
+            driver,
+            finish,
+            race: Race::start(walking),
+            started: now,
+        });
+        sync_offer(live, now);
+        sync_scanning(live, now);
+        live.window.request_redraw();
+    }
+
     /// Carries out what the shell asked for beyond the window's own work.
     fn launch_effects(&mut self, fx: Vec<ShellEffect>, now: Duration) {
         for e in fx {
@@ -1403,6 +1665,7 @@ impl WinApp {
                 ShellEffect::PickDrive(i) => self.open_drive(i, true, now),
                 ShellEffect::ShowPicker => self.show_picker(now),
                 ShellEffect::Rescan => self.rescan(now),
+                ShellEffect::FullScan => self.start_full_scan(now),
                 ShellEffect::Action {
                     action: Action::Rescan,
                     view,
@@ -1507,6 +1770,9 @@ impl WinApp {
             Look { dark, accent: None },
         );
         shell.set_reduced_motion(reduced_motion_override());
+        // The offer of a full scan appears once the platform has said whether
+        // it can work here.
+        shell.set_offer(Offer::Hidden);
         shell.set_about(crate::about());
         shell.set_crumb(crumb);
         shell.set_status(status, self.scan_path.is_some());
@@ -1564,6 +1830,13 @@ impl WinApp {
             crash_report: None,
             crash_rx: None,
             software_rx: None,
+            fast: None,
+            probe: None,
+            probe_rx: None,
+            elevated_done: false,
+            pending_place: None,
+            marks: elevation::DeleteMarks::default(),
+            pending_undo: Vec::new(),
         });
         window.request_redraw();
         Ok(())
@@ -1641,6 +1914,13 @@ impl WinApp {
                 let (tx, rx) = mpsc::channel();
                 live.software_rx = Some(rx);
                 system::probe_software_center(tx);
+                let (tx, rx) = mpsc::channel();
+                live.probe_rx = Some(rx);
+                let _ = std::thread::Builder::new()
+                    .name("elevation-probe".into())
+                    .spawn(move || {
+                        let _ = tx.send(probe_offer());
+                    });
                 // A report left by a crash last time is looked for on another
                 // thread, now that the first frame is out.
                 let (tx, rx) = mpsc::channel();
@@ -1810,6 +2090,7 @@ impl WinApp {
         let Some(live) = self.live.as_mut() else {
             return;
         };
+        pump_fast(live, t0.elapsed());
         // Results of worker threads.
         if let Some(rx) = live.relayout.as_ref() {
             match rx.try_recv() {
@@ -1881,12 +2162,27 @@ impl WinApp {
             Tick::Finished(s, p) => (s, true, p),
         };
         let began = Instant::now();
+        if done
+            && let Some(fast) = live.fast.as_mut()
+            && let Step::UseWalk { message } = fast.race.walk_finished()
+        {
+            // The ordinary scan finished first: it is the result, and the
+            // full scan is stopped.
+            if let Some(fast) = live.fast.take() {
+                drop(fast.driver.discard());
+            }
+            if let Some(message) = message {
+                live.shell.notify(message, now);
+            }
+            sync_offer(live, now);
+        }
         let metrics = Metrics::from_logical(font_px(), live.renderer.scale());
         let status = match problem {
             Some(p) => p,
             None => scan_status(&snapshot),
         };
         live.shell.set_status(status, !done);
+        sync_scanning(live, now);
         let map_moved = live.shell.set_stopped(done && snapshot.scan_stopped());
         if done {
             live.shell.set_readout(None);
@@ -1933,10 +2229,33 @@ impl WinApp {
                     source.set_drive_blocks(drive_blocks(live));
                     source.set_owners(Some(live.owners.clone()));
                     let map = live.shell.map_rect();
-                    let app = App::new(source, map);
+                    let mut app = App::new(source, map);
+                    // After a full scan replaced the map the user stays where
+                    // they were: the same folder, the same selection.
+                    let restored = live
+                        .pending_place
+                        .take()
+                        .map(|place| elevation::restore(&mut app, &place))
+                        .unwrap_or_default();
                     let stats = app.source().last_layout();
                     live.renderer.set_items(app.items());
                     live.shell.set_app(app);
+                    apply(&mut live.renderer, restored, now);
+                    if !live.pending_undo.is_empty() {
+                        let old = std::mem::take(&mut live.pending_undo);
+                        let found: HashMap<NodeId, NodeId> = live
+                            .shell
+                            .app()
+                            .map(|app| {
+                                old.iter()
+                                    .filter_map(|(id, names)| {
+                                        Some((*id, app.source().folder_or_file_by_names(names)?))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        live.shell.remap_undo(&|id| found.get(&id).copied());
+                    }
                     self.stats.layouts_us.push(stats.took.as_micros() as u64);
                     self.stats.layout_boxes.push(stats.items as u64);
                     if stats.items >= 2 && !self.map_seen {
@@ -2066,6 +2385,21 @@ impl WinApp {
             live.caps_rx = None;
             live.shell.set_capabilities(Capabilities { properties });
         }
+        if let Some(rx) = live.probe_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(offer) => {
+                    live.probe_rx = None;
+                    live.probe = Some(offer);
+                }
+                Err(TryRecvError::Disconnected) => live.probe_rx = None,
+                Err(TryRecvError::Empty) => soonest(Duration::from_millis(50)),
+            }
+        }
+        if live.fast.is_some() {
+            // The full scan is checked as the loop wakes; keep it waking.
+            soonest(Duration::from_millis(50));
+        }
+        sync_offer(live, now);
         if let Some(rx) = live.software_rx.as_ref()
             && let Ok(available) = rx.try_recv()
         {
@@ -2487,5 +2821,60 @@ impl ApplicationHandler<UserEvent> for WinApp {
             Some(d) => el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + d)),
             None => el.set_control_flow(ControlFlow::Wait),
         }
+    }
+}
+
+#[cfg(test)]
+mod elevation_tests {
+    use super::*;
+    use bs_platform::drives::Mount;
+
+    fn mount(point: &str, id: Option<u32>, covered: bool) -> Mount {
+        Mount {
+            mount_point: PathBuf::from(point),
+            mount_id: id,
+            root: PathBuf::from("/"),
+            covered_by_other_mount: covered,
+        }
+    }
+
+    fn drive(mounts: Vec<Mount>) -> Drive {
+        let mut d = crate::shots::fixture_drives().remove(0);
+        d.mount_point = PathBuf::from("/");
+        d.mounts = mounts;
+        d
+    }
+
+    /// A folder map has no whole drive for a full scan to read, so it has no
+    /// button, but the helper stays available for deletes that need
+    /// administrator rights. A computer where the helper can't start offers
+    /// nothing either way.
+    #[test]
+    fn a_folder_map_keeps_the_helper_for_deletes_and_drops_only_the_button() {
+        let folder = offer_for_map(Offer::Available, false);
+        assert_eq!(folder, Offer::DeletesOnly);
+        assert!(folder.can_elevate() && !folder.shows_button() && !folder.can_start());
+        assert_eq!(offer_for_map(Offer::Available, true), Offer::Available);
+        for base in [Offer::Hidden, Offer::walk_only_edition()] {
+            let kept = offer_for_map(base.clone(), false);
+            assert_eq!(kept, base);
+            assert!(!kept.can_elevate());
+        }
+    }
+
+    /// The helper is only ever asked about mounts that the platform's own
+    /// table lists, that nothing else covers, and that the scan does not
+    /// start at. Which of them it keeps is its own check; the interface never
+    /// works out an unreadable gap from this list.
+    #[test]
+    fn only_uncovered_mounts_from_the_platform_table_are_requested() {
+        let d = drive(vec![
+            mount("/", Some(10), false),
+            mount("/home", Some(11), false),
+            mount("/bind", Some(12), true),
+            mount("/odd", None, false),
+        ]);
+        assert_eq!(extra_mounts_of(&d), vec![11]);
+        assert!(extra_mounts_of(&drive(Vec::new())).is_empty());
     }
 }

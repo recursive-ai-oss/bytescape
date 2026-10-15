@@ -123,6 +123,10 @@ impl Disposer for SystemDisposer {
             },
         }
     }
+
+    fn delete_elevated(&self, items: &[Item], held: &[PathBuf]) -> bs_ui::elevation::ElevatedEnd {
+        bs_ui::elevation::delete_with_helper(items, held)
+    }
 }
 
 /// Asks the file manager whether it has a properties window, off the window's

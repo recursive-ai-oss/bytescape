@@ -12,6 +12,12 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# For the editions that cannot ask for administrator rights (a snap with strict
+# confinement, Flatpak): the full scan is not offered, and the Unreadable block
+# says why.
+walk-only = []
+
 [dependencies]
 bs-render = { path = "../bs-render" }
 bs-knowledge = { path = "../bs-knowledge" }

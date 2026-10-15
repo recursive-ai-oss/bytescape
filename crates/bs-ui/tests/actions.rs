@@ -1453,14 +1453,22 @@ fn menu_hostile_names_do_not_break_anything() {
         "ab\u{202e}cd\u{200b}\u{0301}\n\tz".as_bytes().to_vec(),
         vec![b'f', 0xff, 0xfe, b'g'],
     ];
-    let mut r = rig_with(names, true, BinStyle::Recycle, 1.0);
+    let mut r = rig_with(names.clone(), true, BinStyle::Recycle, 1.0);
     r.fake.rule(&"x".repeat(4000), Rule::Protected(NOTE));
-    for i in 0..3 {
+    for (i, name) in names.iter().enumerate() {
         select(&mut r.shell, &[i]);
         key(&mut r.shell, Key::ContextMenu, 20);
         assert!(r.shell.modal_open());
         key(&mut r.shell, Key::Escape, 21);
         key(&mut r.shell, Key::DeletePermanently, 22);
+        // Where paths are text (Windows), a name that is not valid text has no
+        // real path: the delete is refused with a reason, never guessed at.
+        if cfg!(windows) && std::str::from_utf8(name).is_err() {
+            assert!(!r.shell.modal_open(), "no dialog for a name with no path");
+            let info = r.shell.info_line().name;
+            assert!(info.ends_with("Not a file or folder"), "{info}");
+            continue;
+        }
         let text = r.shell.dialog_text().expect("dialog");
         assert!(!text.contains('\u{0}'));
         let popup = r.shell.popup().unwrap();

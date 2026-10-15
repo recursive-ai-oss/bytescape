@@ -11,6 +11,7 @@ pub mod blocks;
 pub mod capacity;
 pub mod card;
 pub mod chrome;
+pub mod elevation;
 pub mod info;
 pub mod notice;
 pub mod owners;
@@ -425,6 +426,29 @@ impl<S: ViewSource> App<S> {
     /// The views behind the back button, oldest first.
     pub fn history(&self) -> Vec<ViewId> {
         self.history_back.iter().map(|e| e.view).collect()
+    }
+
+    /// Shows `view` straight away, as a jump (no animation, no history entry),
+    /// for a host that replaced the data behind the views and wants the user
+    /// to stay where they were.
+    pub fn show_view(&mut self, view: ViewId) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        self.jump_to(view, &mut fx);
+        fx
+    }
+
+    /// Selects exactly these boxes of the view on screen (those that are
+    /// there).
+    pub fn select(&mut self, ids: Vec<u32>) -> Vec<Effect> {
+        let present: Vec<u32> = {
+            let items = self.items();
+            ids.into_iter()
+                .filter(|id| items.iter().any(|i| i.id == *id))
+                .collect()
+        };
+        self.anchor = present.last().copied();
+        self.selected = present;
+        vec![self.selection_effect()]
     }
 
     /// Tells the app whether the renderer is still animating a zoom. Call this

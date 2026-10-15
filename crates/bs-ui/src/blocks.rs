@@ -9,6 +9,7 @@ use bs_render::{Flags, Item, ItemKind, ItemLabel, Rect};
 
 use crate::ItemInfo;
 use crate::capacity::Breakdown;
+use crate::elevation::UnreadableAs;
 use crate::squarify::squarify;
 
 /// Ids of these blocks start here, far above any folder or group id.
@@ -37,6 +38,8 @@ pub struct DriveBlocks {
     /// The reserved bytes are a per-user quota rather than a filesystem
     /// reserve.
     pub quota: bool,
+    /// What the Unreadable block says about the gap.
+    pub unreadable_as: UnreadableAs,
 }
 
 impl From<&Breakdown> for DriveBlocks {
@@ -47,6 +50,7 @@ impl From<&Breakdown> for DriveBlocks {
             reserved: b.reserved,
             recycle_bin: b.recycle_bin,
             quota: b.quota,
+            unreadable_as: UnreadableAs::Grant,
         }
     }
 }
@@ -79,9 +83,24 @@ impl DriveBlocks {
         let size = format_size(self.bytes(special));
         match special {
             Special::Free => format!("Free · {size}"),
-            Special::Unreadable => {
-                format!("Couldn't read: {size} — Grant access to see inside")
-            }
+            Special::Unreadable => match self.unreadable_as {
+                UnreadableAs::Grant => {
+                    format!("Couldn't read: {size} — Grant access to see inside")
+                }
+                UnreadableAs::Reading => {
+                    format!("Couldn't read: {size} — Reading with administrator rights…")
+                }
+                UnreadableAs::Plain => format!("Couldn't read: {size}"),
+                UnreadableAs::Overhead => {
+                    format!("Filesystem overhead: {size}")
+                }
+                UnreadableAs::Unavailable => {
+                    format!("Couldn't read: {size} — Administrator scan isn't available here")
+                }
+                UnreadableAs::Edition => format!(
+                    "Couldn't read: {size} — System folders can't be scanned in this edition"
+                ),
+            },
             Special::Reserved if self.quota => format!("Beyond your disk quota · {size}"),
             Special::Reserved => format!("Reserved by filesystem · {size}"),
             Special::RecycleBin => format!("{} · {size}", BinName::platform().as_str()),
@@ -115,6 +134,9 @@ impl DriveBlocks {
         let special = Self::special_of(id)?;
         let name = match special {
             Special::Free => "Free space".to_string(),
+            Special::Unreadable if self.unreadable_as == UnreadableAs::Overhead => {
+                "Filesystem overhead".to_string()
+            }
             Special::Unreadable => "Couldn't read".to_string(),
             Special::Reserved if self.quota => "Beyond your disk quota".to_string(),
             Special::Reserved => "Reserved by filesystem".to_string(),
@@ -183,6 +205,7 @@ mod tests {
             reserved: 18_000_000_000,
             recycle_bin: 14_100_000_000,
             quota: false,
+            unreadable_as: UnreadableAs::Grant,
         }
     }
 
@@ -290,5 +313,33 @@ mod tests {
         }
         assert_eq!(DriveBlocks::special_of(17), None);
         assert_eq!(DriveBlocks::special_of(SPECIAL_ID_BASE + 9), None);
+    }
+
+    #[test]
+    fn the_unreadable_block_words_itself_by_what_can_be_done() {
+        let mk = |unreadable_as| DriveBlocks {
+            unreadable: 23_400_000_000,
+            unreadable_as,
+            ..DriveBlocks::default()
+        };
+        let grant = mk(UnreadableAs::Grant).label(Special::Unreadable);
+        assert!(grant.contains("Grant access to see inside"), "{grant}");
+        let reading = mk(UnreadableAs::Reading).label(Special::Unreadable);
+        assert!(reading.contains("administrator rights"), "{reading}");
+        let overhead = mk(UnreadableAs::Overhead);
+        let text = overhead.label(Special::Unreadable);
+        assert!(text.starts_with("Filesystem overhead: 23.4 GB"), "{text}");
+        assert!(!text.contains("Couldn't read"));
+        assert_eq!(
+            overhead
+                .info(DriveBlocks::id(Special::Unreadable))
+                .map(|i| i.name),
+            Some("Filesystem overhead".to_string())
+        );
+        let edition = mk(UnreadableAs::Edition).label(Special::Unreadable);
+        assert!(
+            edition.contains("System folders can't be scanned in this edition"),
+            "{edition}"
+        );
     }
 }

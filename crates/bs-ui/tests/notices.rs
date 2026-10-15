@@ -785,8 +785,13 @@ fn the_hover_card_is_a_node_with_its_text_path_and_buttons() {
         .iter()
         .find(|n| n.role() == Role::Button && n.label() == Some("Copy path"))
         .expect("the path");
-    assert_eq!(path.value(), Some("/data/folder1"));
-    for label in ["Delete", "Show in file manager", "Open"] {
+    let expected = format!("/data{}folder1", std::path::MAIN_SEPARATOR);
+    assert_eq!(path.value(), Some(expected.as_str()));
+    for label in [
+        "Delete",
+        bs_ui::action::Action::ShowInFileManager.label(),
+        "Open",
+    ] {
         let b = nodes
             .iter()
             .find(|n| n.role() == Role::Button && n.label() == Some(label))

@@ -161,6 +161,57 @@ impl TreeSource {
         parts
     }
 
+    /// The names from just below the scanned root down to `node`: where a box
+    /// is, independent of the tree's node numbers.
+    pub fn names_below_root(&self, node: NodeId) -> Vec<Vec<u8>> {
+        let mut names = Vec::new();
+        let mut at = self.snapshot.node(node);
+        while let Some(n) = at {
+            if n.parent().is_none() {
+                break;
+            }
+            names.push(n.name().to_vec());
+            at = n.parent();
+        }
+        names.reverse();
+        names
+    }
+
+    /// The node reached by following `names` down from the scanned root,
+    /// whatever it is.
+    pub fn folder_or_file_by_names(&self, names: &[Vec<u8>]) -> Option<NodeId> {
+        let mut at = self.snapshot.root()?;
+        for name in names {
+            at = at.children().find(|c| c.name() == name.as_slice())?;
+        }
+        Some(at.id())
+    }
+
+    /// Like [`TreeSource::folder_or_file_by_names`], but only a folder counts.
+    pub fn folder_by_names(&self, names: &[Vec<u8>]) -> Option<NodeId> {
+        let id = self.folder_or_file_by_names(names)?;
+        (self.snapshot.node(id)?.kind() == NodeKind::Dir).then_some(id)
+    }
+
+    /// The view of a folder, made as needed along the way down from the top.
+    pub fn open_folder(&mut self, folder: NodeId) -> Option<ViewId> {
+        let chain = self.folder_chain(folder);
+        let mut at = self.root;
+        for &n in chain.iter().skip(1) {
+            at = self.table.child(at, ViewTarget::Folder(n));
+        }
+        Some(at)
+    }
+
+    /// The box of `node` in the latest layout of `view`.
+    pub fn item_for_node(&self, view: ViewId, node: NodeId) -> Option<u32> {
+        let laid = &self.laid.iter().find(|(v, _)| *v == view)?.1;
+        laid.items()
+            .iter()
+            .find(|d| matches!(laid.item_ref(d.id), Some(ItemRef::Node(n)) if n == node))
+            .map(|d| d.id)
+    }
+
     /// The folders of the trail from the scanned root, as node ids.
     fn folder_chain(&self, folder: NodeId) -> Vec<NodeId> {
         let mut chain = Vec::new();
@@ -343,6 +394,7 @@ impl ViewSource for TreeSource {
                 delete_state: DeleteMark::None,
                 complete: node.is_complete(),
                 blocked: false,
+                scan_holds: false,
                 unreal: node.is_under_synthetic(),
                 owner: Ownership::Unknown,
                 sharing: None,
@@ -392,6 +444,7 @@ impl ViewSource for TreeSource {
             },
             complete: node.is_complete(),
             blocked: knowledge.protection_bytes(&raw).level == Level::Blocked,
+            scan_holds: false,
             unreal: node.is_under_synthetic(),
             owner,
             sharing: None,

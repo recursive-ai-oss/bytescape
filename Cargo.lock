@@ -510,6 +510,7 @@ version = "0.1.0"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
+ "bs-ipc",
  "bs-knowledge",
  "bs-layout",
  "bs-platform",

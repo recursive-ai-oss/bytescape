@@ -62,6 +62,8 @@ pub struct CardData {
     pub complete: bool,
     /// Part of the operating system: never offered for deletion.
     pub blocked: bool,
+    /// A full scan is running: nothing that changes the disk may start.
+    pub scan_holds: bool,
     /// Under a folder the scan made up to hold files no folder lists: no
     /// path through it is real, so nothing may be done to it by name.
     pub unreal: bool,
@@ -210,6 +212,14 @@ pub fn why_not(data: &CardData, action: Action) -> Option<&'static str> {
     );
     if data.unreal && acts_on_disk {
         return Some(reason::NOT_A_REAL_FOLDER);
+    }
+    if data.scan_holds
+        && matches!(
+            action,
+            Action::Delete | Action::DeletePermanently | Action::Handoff(Handoff::Uninstall)
+        )
+    {
+        return Some(reason::FULL_SCAN_RUNNING);
     }
     match action {
         Action::Delete | Action::DeletePermanently => {
@@ -704,6 +714,7 @@ mod tests {
             delete_state: DeleteMark::None,
             complete: true,
             blocked: false,
+            scan_holds: false,
             unreal: false,
             owner: Ownership::Unknown,
             sharing: None,

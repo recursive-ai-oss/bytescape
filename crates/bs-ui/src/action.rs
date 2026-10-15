@@ -97,6 +97,9 @@ impl Action {
 pub mod reason {
     /// The box is still being counted.
     pub const SCANNING: &str = "Still scanning";
+    /// A full scan with administrator rights is running, and what is on disk
+    /// must not change until its result is in.
+    pub const FULL_SCAN_RUNNING: &str = "A full scan is running";
     /// The scan was stopped before the box was counted.
     pub const SCAN_STOPPED: &str = "Scan stopped";
     /// The box is part of the operating system.

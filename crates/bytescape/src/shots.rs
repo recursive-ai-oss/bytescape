@@ -20,9 +20,11 @@ use bs_render::{ItemKind, TextEngine};
 use bs_tree::{Aggregator, Batch, Category, DeleteState, DirKey, Meta, NodeKind, Snapshot};
 use bs_ui::blocks::DriveBlocks;
 use bs_ui::capacity::Breakdown;
+use bs_ui::elevation::Offer;
 use bs_ui::notice::{AboutInfo, CrashNotice};
 use bs_ui::owners::{Owners, Ownership, PackageInfo, ProgramInfo};
 use bs_ui::picker::{CardScan, Picker};
+use bs_ui::shell::BinStyle;
 use bs_ui::shell::{
     ActOutcome, Capabilities, Disposer, Look, STOPPED_BANNER, ScanReadout, Shell, ShellEffect,
     Token, TreeChange,
@@ -60,6 +62,14 @@ pub fn is_picker_state(state: &str) -> bool {
             | "card-package"
             | "card-package-nosoftware"
             | "card-sharing"
+            | "unreadable"
+            | "fullscan-midscan"
+            | "fullscan-race"
+            | "fullscan-done"
+            | "edition"
+            | "dialog-admin-linux"
+            | "dialog-admin-windows"
+            | "dialog-admin-many"
     )
 }
 
@@ -241,6 +251,8 @@ fn map_shell_with(
 /// answers as a bin would.
 struct ShotDisposer {
     bytes: HashMap<String, u64>,
+    /// The user's own rights are not enough for anything.
+    deny: bool,
     /// More folders are protected, each with a note of its own.
     many_notes: bool,
 }
@@ -357,6 +369,20 @@ impl Disposer for ShotDisposer {
         items: &[DItem],
         _confirmed: Option<&ProtectedConfirmation>,
     ) -> Vec<ActOutcome> {
+        if self.deny {
+            return items
+                .iter()
+                .map(|_| {
+                    ActOutcome::Failed(bs_platform::delete::OpError {
+                        step: "move",
+                        kind: std::io::ErrorKind::PermissionDenied,
+                        code: Some(13),
+                        removed_bytes: 0,
+                        removed_entries: 0,
+                    })
+                })
+                .collect();
+        }
         items
             .iter()
             .map(|i| ActOutcome::MovedToBin {
@@ -408,6 +434,18 @@ fn folder_point(shell: &Shell<TreeSource>, name: &str) -> Option<(f32, f32)> {
                 && i.label.as_ref().is_some_and(|l| &*l.name == name)
         })
         .map(|i| (i.rect.x + i.rect.w / 2.0, i.rect.y + 3.0))
+}
+
+/// Sets the offer and words the Unreadable block to match, as the window does.
+fn offer(shell: &mut Shell<TreeSource>, offer: Offer) {
+    shell.set_offer(offer);
+    let unreadable_as = shell.unreadable_as();
+    if let Some(app) = shell.app_mut() {
+        let blocks = app.source().drive_blocks().copied();
+        app.source_mut()
+            .set_drive_blocks(blocks.map(|b| DriveBlocks { unreadable_as, ..b }));
+        app.update(InputEvent::DataChanged, Duration::ZERO);
+    }
 }
 
 fn at(ms: u64) -> Duration {
@@ -480,6 +518,7 @@ fn actions_scene(
         .ok_or("the fixture has no folders")?;
     shell.set_disposer(Arc::new(ShotDisposer {
         bytes,
+        deny: state.starts_with("dialog-admin"),
         many_notes: state == "dialog-notes",
     }));
     let point = |shell: &Shell<TreeSource>, name: &str| {
@@ -546,6 +585,60 @@ fn actions_scene(
             shell.update(InputEvent::ClickWith { x, y, mods: ctrl }, at(180));
             let fx = shell.update(InputEvent::Key(Key::DeletePermanently), at(200));
             settle(&mut shell, &mut agg, fx, at(200));
+            now = at(300);
+        }
+        "dialog-admin-linux" | "dialog-admin-windows" => {
+            // The user's own rights fall short, so the helper is offered: the
+            // picture is the dialog that asks, with the system's own words.
+            shell.set_bin_style(if state.ends_with("linux") {
+                BinStyle::Trash
+            } else {
+                BinStyle::Recycle
+            });
+            shell.set_offer(Offer::Available);
+            let (x, y) = point(&shell, "Games")?;
+            shell.update(InputEvent::Click { x, y }, now);
+            let (x, y) = point(&shell, "Videos")?;
+            shell.update(InputEvent::ClickWith { x, y, mods: ctrl }, at(150));
+            let fx = shell.update(InputEvent::Key(Key::Delete), at(200));
+            settle(&mut shell, &mut agg, fx, at(200));
+            now = at(300);
+        }
+        "dialog-admin-many" => {
+            // More items than fit: the names scroll, and none is left out.
+            shell.set_bin_style(BinStyle::Trash);
+            shell.set_offer(Offer::Available);
+            let ids: Vec<u32> = shell
+                .app()
+                .map(|a| {
+                    let view = a.current_view();
+                    a.items()
+                        .iter()
+                        .filter(|i| i.depth == 1 && i.kind == ItemKind::FolderTitled)
+                        // The fixture's Backups and Documents folders stand for protected
+                        // places, which would ask for a hold before anything else.
+                        .filter(|i| {
+                            a.source()
+                                .target(view, i.id)
+                                .is_some_and(|t| t.name != "Backups" && t.name != "Documents")
+                        })
+                        .map(|i| i.id)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(app) = shell.app_mut() {
+                app.select(ids);
+            }
+            let fx = shell.update(InputEvent::Key(Key::Delete), at(200));
+            settle(&mut shell, &mut agg, fx, at(200));
+            shell.update(
+                InputEvent::Wheel {
+                    x: 10.0,
+                    y: 10.0,
+                    steps: -2.0,
+                },
+                at(250),
+            );
             now = at(300);
         }
         "dialog-notes" => {
@@ -851,8 +944,17 @@ pub fn screenshots(opts: &ShotOptions, states: &[String], text: &TextEngine) -> 
         for dark in [false, true] {
             let mut now = Duration::ZERO;
             let mut shell = match state.as_str() {
-                "toast" | "deleted" | "dialog-permanent" | "dialog-hold" | "dialog-notes"
-                | "menu" | "menu-blocked" | "menu-pending" => {
+                "toast"
+                | "deleted"
+                | "dialog-permanent"
+                | "dialog-hold"
+                | "dialog-notes"
+                | "dialog-admin-linux"
+                | "dialog-admin-windows"
+                | "dialog-admin-many"
+                | "menu"
+                | "menu-blocked"
+                | "menu-pending" => {
                     let (shell, at) = actions_scene(opts, dark, text, state)?;
                     now = at;
                     shell
@@ -903,6 +1005,49 @@ pub fn screenshots(opts: &ShotOptions, states: &[String], text: &TextEngine) -> 
                         false,
                     );
                     shell.set_picker(picker);
+                    shell
+                }
+                "unreadable" | "fullscan-midscan" | "fullscan-race" | "fullscan-done"
+                | "edition" => {
+                    let finish = state != "fullscan-midscan";
+                    let mut shell = map_shell(opts, dark, text, finish, false);
+                    match state.as_str() {
+                        "unreadable" => {
+                            shell.set_status("640 GB in 1.2 million files".into(), false);
+                            offer(&mut shell, Offer::Available);
+                            // The pointer rests on the button.
+                            if let Some(r) = shell.geometry().full_scan {
+                                let (x, y) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+                                shell.update(InputEvent::PointerMoved { x, y }, Duration::ZERO);
+                            }
+                        }
+                        "fullscan-midscan" => {
+                            shell.set_status(
+                                "Scanning… 62% · ≥ 397 GB in 1.2 million files".into(),
+                                true,
+                            );
+                            shell.set_readout(Some(ScanReadout {
+                                ratio: Some(0.62),
+                                files: 1_204_511,
+                                files_per_sec: 148_000.0,
+                                elapsed: Duration::from_secs(8),
+                            }));
+                            offer(&mut shell, Offer::Running);
+                            shell.notify("Starting the administrator helper…", Duration::ZERO);
+                        }
+                        "fullscan-race" => {
+                            shell.set_status("640 GB in 1.2 million files".into(), false);
+                            offer(&mut shell, Offer::Running);
+                        }
+                        "fullscan-done" => {
+                            shell.set_status("652 GB in 1.3 million files".into(), false);
+                            offer(&mut shell, Offer::Done);
+                        }
+                        _ => {
+                            shell.set_status("640 GB in 1.2 million files".into(), false);
+                            offer(&mut shell, Offer::walk_only_edition());
+                        }
+                    }
                     shell
                 }
                 "driveblocks" => {

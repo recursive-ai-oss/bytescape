@@ -23,6 +23,7 @@ use std::any::Any;
 use super::{Shell, ShellEffect};
 use crate::action::{Action, reason};
 use crate::card::{self, Metrics};
+use crate::elevation::{self, ElevatedEnd, ElevatedItem, Offer};
 use crate::notice::{CrashNotice, RELEASES_URL};
 use crate::popup::{self, Button, DialogSpec, DialogState, MenuRow, ToastSpec};
 use crate::{Direction, InputEvent, Key, Target, ViewId, ViewSource};
@@ -143,6 +144,12 @@ pub trait Disposer: Send + Sync {
     fn restore(&self, token: &Token) -> RestoreOutcome;
     /// Empties the bin of the drive mounted at `mount`.
     fn empty_bin(&self, mount: &Path) -> EmptyOutcome;
+    /// Deletes `items` for good with administrator rights, through the
+    /// helper: one prompt for the whole call. The default says it cannot be
+    /// done.
+    fn delete_elevated(&self, _items: &[DItem], _held: &[PathBuf]) -> ElevatedEnd {
+        ElevatedEnd::Unavailable("administrator deletes aren't available here".to_string())
+    }
 }
 
 impl Disposer for Disposal {
@@ -198,6 +205,10 @@ impl Disposer for Disposal {
                 reason: RefuseReason::NoBinOnDrive,
             },
         }
+    }
+
+    fn delete_elevated(&self, items: &[DItem], held: &[PathBuf]) -> ElevatedEnd {
+        elevation::delete_with_helper(items, held)
     }
 }
 
@@ -277,6 +288,12 @@ enum Work {
     },
     Restore(Vec<Token>),
     Empty(PathBuf),
+    /// Deletes for good with administrator rights, through the helper.
+    Elevated {
+        items: Vec<DItem>,
+        /// The protected paths whose hold-to-confirm was completed.
+        held: Vec<PathBuf>,
+    },
     /// Asks the platform what it thinks of deleting `items`. On Windows this
     /// can walk a whole folder, so it never runs on the UI thread.
     Check {
@@ -311,6 +328,7 @@ enum Done {
     Permanent(Vec<ActOutcome>),
     Restore(Vec<RestoreOutcome>),
     Empty(EmptyOutcome),
+    Elevated(ElevatedEnd),
     Check(Box<Plan>),
     CheckMenu(Box<(Plan, Plan)>),
 }
@@ -331,6 +349,7 @@ impl Job {
             }
             Work::Restore(tokens) => Done::Restore(tokens.iter().map(|t| d.restore(t)).collect()),
             Work::Empty(mount) => Done::Empty(d.empty_bin(mount)),
+            Work::Elevated { items, held } => Done::Elevated(d.delete_elevated(items, held)),
             Work::Check { items, permanent } => {
                 Done::Check(Box::new(d.precheck(items, *permanent, None)))
             }
@@ -373,8 +392,12 @@ enum Pending {
     Permanent(Vec<Target>),
     Restore(Vec<(Option<NodeId>, String)>),
     Empty(PathBuf),
-    /// The platform is looking at a Delete or Shift+Delete.
+    /// The helper is deleting these with administrator rights.
+    Elevated(Vec<Target>),
+    /// The platform is looking at a Delete or Shift+Delete, or at items
+    /// that need administrator rights.
     Delete {
+        elevated: bool,
         permanent: bool,
         items: Vec<DItem>,
         targets: Vec<Target>,
@@ -408,6 +431,8 @@ struct MenuUi {
 enum Confirm {
     Delete {
         permanent: bool,
+        /// Deleted by the helper with administrator rights.
+        elevated: bool,
         protected: Vec<PathBuf>,
         items: Vec<DItem>,
         targets: Vec<Target>,
@@ -430,8 +455,21 @@ pub(super) struct ReportView {
     rows: usize,
 }
 
+/// The names an administrator delete lists, which scroll when they do not all
+/// fit: the listed names are what the helper is asked to delete, so none is
+/// left out.
+struct NameList {
+    /// The first name on screen.
+    offset: usize,
+    /// How many names fit.
+    rows: usize,
+    /// The notes of the protected items, repeated in the dialog.
+    notes: Vec<&'static str>,
+}
+
 struct DialogUi {
     confirm: Confirm,
+    list: Option<NameList>,
     spec: DialogSpec,
     focus: usize,
     hold_since: Option<Duration>,
@@ -545,9 +583,22 @@ impl<S: ViewSource> Shell<S> {
                     out.push(' ');
                 }
                 out.push_str(&d.spec.title);
+                // A list that scrolls is read whole, not just the part on
+                // screen.
+                let all: Option<&[Target]> = match (&d.confirm, &d.list) {
+                    (Confirm::Delete { targets, .. }, Some(_)) => Some(targets),
+                    _ => None,
+                };
                 for (line, _) in &d.spec.lines {
+                    if all.is_some() && line.starts_with("\u{2022} ") {
+                        continue;
+                    }
                     out.push(' ');
                     out.push_str(line);
+                }
+                for t in all.into_iter().flatten() {
+                    out.push_str(" \u{2022} ");
+                    out.push_str(&t.name);
                 }
                 Some(out)
             }
@@ -884,7 +935,7 @@ impl<S: ViewSource> Shell<S> {
 
     /// Whether an action is still running. A question for the menu does not
     /// count: the menu may be closed before it is answered.
-    fn busy(&self) -> bool {
+    pub(super) fn busy(&self) -> bool {
         self.acts
             .pending
             .values()
@@ -940,7 +991,27 @@ impl<S: ViewSource> Shell<S> {
                 permanent,
             },
             Pending::Delete {
+                elevated: false,
                 permanent,
+                items,
+                targets,
+            },
+        )
+    }
+
+    /// Items the user's own rights could not delete, offered to the helper:
+    /// the platform is asked what it thinks of deleting them for good (the
+    /// strictest rule still applies), and the answer opens the dialog.
+    fn request_admin_delete(&mut self, targets: Vec<Target>) -> Vec<ShellEffect> {
+        let items = self.items_for(&targets);
+        self.dispatch(
+            Work::Check {
+                items: items.clone(),
+                permanent: true,
+            },
+            Pending::Delete {
+                elevated: true,
+                permanent: true,
                 items,
                 targets,
             },
@@ -952,6 +1023,7 @@ impl<S: ViewSource> Shell<S> {
         &mut self,
         plan: &Plan,
         permanent: bool,
+        elevated: bool,
         items: Vec<DItem>,
         targets: Vec<Target>,
         now: Duration,
@@ -980,6 +1052,29 @@ impl<S: ViewSource> Shell<S> {
                 _ => None,
             })
         };
+        if elevated {
+            let notes: Vec<&'static str> = plan.entries.iter().filter_map(|e| e.note).collect();
+            let mut list = NameList {
+                offset: 0,
+                rows: 1,
+                notes,
+            };
+            let spec = self.fitted_admin_dialog(&targets, !protected.is_empty(), &mut list);
+            self.open_dialog(
+                Confirm::Delete {
+                    permanent: true,
+                    elevated: true,
+                    protected,
+                    items,
+                    targets,
+                },
+                spec,
+            );
+            if let Some(Modal::Dialog(d)) = self.acts.modal.as_mut() {
+                d.list = Some(list);
+            }
+            return Vec::new();
+        }
         let deleting_for_good = permanent || overflow.is_some();
         if !deleting_for_good && protected.is_empty() {
             return self.start_trash(items, None, targets, now);
@@ -995,6 +1090,7 @@ impl<S: ViewSource> Shell<S> {
         self.open_dialog(
             Confirm::Delete {
                 permanent: deleting_for_good,
+                elevated: false,
                 protected,
                 items,
                 targets,
@@ -1093,6 +1189,226 @@ impl<S: ViewSource> Shell<S> {
         }
     }
 
+    /// The dialog for items that need administrator rights: what will be
+    /// deleted, that it is for good, and that the system will ask once.
+    fn admin_delete_dialog(
+        &self,
+        targets: &[Target],
+        protected: bool,
+        list: &NameList,
+    ) -> DialogSpec {
+        let notes = &list.notes;
+        let bytes = targets.iter().fold(0u64, |a, t| a.saturating_add(t.bytes));
+        let lower = targets.iter().any(|t| t.lower_bound);
+        let est = targets.iter().any(|t| t.estimated);
+        let size = size_text(bytes, lower, est);
+        let count = plural(targets.len(), "item", "items");
+        let mut lines: Vec<(String, CardRole)> = Vec::new();
+        let mut pinned: Vec<usize> = Vec::new();
+        pinned.push(lines.len());
+        lines.push((
+            if self.acts.style.unwrap_or_else(BinStyle::system) == BinStyle::Trash {
+                "Will be permanently deleted (system Trash isn't available for administrator deletes)."
+                    .to_string()
+            } else {
+                "Will be permanently deleted. This can't be undone.".to_string()
+            },
+            CardRole::Normal,
+        ));
+        lines.push((
+            "The system asks for administrator rights once, for this delete only.".into(),
+            CardRole::Secondary,
+        ));
+        if protected {
+            let mut seen: Vec<&str> = Vec::new();
+            for n in notes {
+                if !seen.contains(n) {
+                    seen.push(n);
+                }
+            }
+            if seen.is_empty() {
+                lines.push(("This is a protected location.".into(), CardRole::Normal));
+            }
+            for n in seen.iter().take(LISTED_NOTES) {
+                lines.push(((*n).to_string(), CardRole::Normal));
+            }
+            if seen.len() > LISTED_NOTES {
+                lines.push((
+                    format!("and {} more", seen.len() - LISTED_NOTES),
+                    CardRole::Secondary,
+                ));
+            }
+            lines.push((
+                format!(
+                    "Hold the button for {} seconds to confirm.",
+                    HOLD_FOR.as_secs_f32()
+                ),
+                CardRole::Secondary,
+            ));
+        }
+        // Everything above stays on screen; the names below scroll.
+        pinned.extend(1..lines.len());
+        let first = list.offset.min(targets.len());
+        let shown: Vec<&Target> = targets.iter().skip(first).take(list.rows).collect();
+        let room = self.dialog_inner_width() - self.text_width("\u{2022} ");
+        for t in &shown {
+            lines.push((
+                format!("\u{2022} {}", self.fit_line(&t.name, room)),
+                CardRole::Secondary,
+            ));
+        }
+        if shown.len() < targets.len() {
+            pinned.push(lines.len());
+            lines.push((
+                format!(
+                    "Items {}–{} of {} · wheel or arrow keys to scroll",
+                    first + 1,
+                    first + shown.len(),
+                    targets.len()
+                ),
+                CardRole::Secondary,
+            ));
+        }
+        DialogSpec {
+            lead: Some("These need administrator rights.".to_string()),
+            title: format!("Delete {count} ({size}) as administrator?"),
+            lines,
+            pinned,
+            // Room for every name that is shown and the lines around them.
+            rows: 60,
+            buttons: vec![
+                Button {
+                    label: if protected {
+                        "Hold to delete as administrator".to_string()
+                    } else {
+                        "Delete as administrator".to_string()
+                    },
+                    hold: protected,
+                },
+                Button {
+                    label: "Cancel".into(),
+                    hold: false,
+                },
+            ],
+        }
+    }
+
+    /// The width of `text` on one line, in device pixels.
+    fn text_width(&self, text: &str) -> f32 {
+        self.measure
+            .width(text)
+            .unwrap_or_else(|| text.chars().count() as f32 * self.font_px * self.scale * 0.56)
+    }
+
+    /// How wide a line of text in a dialog can be: the dialog's own width
+    /// less its padding, worked out the way the dialog is built.
+    fn dialog_inner_width(&self) -> f32 {
+        let em = self.font_px * self.scale;
+        let pad = em.round();
+        let margin = (12.0 * self.scale).round();
+        let window = self.window_rect();
+        let width = (em * 34.0)
+            .min((window.w - 2.0 * margin).max(em * 12.0))
+            .round();
+        (width - 2.0 * pad).max(em)
+    }
+
+    /// `text` on one line no wider than `width`: runs of white space become
+    /// one space, and what doesn't fit is replaced in the middle by an
+    /// ellipsis. Works on characters, never on byte positions.
+    fn fit_line(&self, text: &str, width: f32) -> String {
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if self.text_width(&text) <= width {
+            return text;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let make = |kept: usize| -> String {
+            let head = kept.div_ceil(2);
+            let tail = kept / 2;
+            let mut s: String = chars[..head].iter().collect();
+            s.push('\u{2026}');
+            s.extend(chars[chars.len() - tail..].iter());
+            s
+        };
+        // The most characters that still fit.
+        let (mut lo, mut hi) = (0usize, chars.len());
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if self.text_width(&make(mid)) <= width {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        make(lo)
+    }
+
+    /// The administrator dialog with as many names as fit in the window: the
+    /// dialog stays inside it with its buttons, and the "Items a to b of n" line
+    /// is the count that is drawn.
+    fn fitted_admin_dialog(
+        &self,
+        targets: &[Target],
+        protected: bool,
+        list: &mut NameList,
+    ) -> DialogSpec {
+        let window = self.window_rect();
+        let mut rows = self.name_rows().min(targets.len()).max(1);
+        loop {
+            list.rows = rows;
+            list.offset = list.offset.min(targets.len().saturating_sub(rows));
+            let spec = self.admin_delete_dialog(targets, protected, list);
+            let built = popup::dialog(
+                &spec,
+                window,
+                self.metrics(),
+                DialogState {
+                    focus: 0,
+                    progress: 0.0,
+                },
+            );
+            let card = built.popup.card.rect;
+            let drawn = built
+                .popup
+                .card
+                .parts
+                .iter()
+                .filter(|p| {
+                    matches!(p, bs_render::CardPart::Line { text, .. }
+                        if text.starts_with("\u{2022} "))
+                })
+                .count();
+            let shown = targets.len().saturating_sub(list.offset).min(rows);
+            if rows == 1 || (card.y >= 0.0 && card.bottom() <= window.h && drawn == shown) {
+                return spec;
+            }
+            rows -= 1;
+        }
+    }
+
+    /// The window changed size: the names that fit may be more or fewer.
+    fn refit_names(&mut self) {
+        if !matches!(&self.acts.modal, Some(Modal::Dialog(d)) if d.list.is_some()) {
+            return;
+        }
+        let Some(Modal::Dialog(mut d)) = self.acts.modal.take() else {
+            return;
+        };
+        {
+            let d = &mut *d;
+            if let (
+                Confirm::Delete {
+                    targets, protected, ..
+                },
+                Some(list),
+            ) = (&d.confirm, d.list.as_mut())
+            {
+                d.spec = self.fitted_admin_dialog(targets, !protected.is_empty(), list);
+            }
+        }
+        self.acts.modal = Some(Modal::Dialog(d));
+    }
+
     /// The first line of the dialog that explains why the bin is not used.
     fn overflow_line(&self, why: &PermanentReason) -> String {
         let bin = self.bin();
@@ -1175,8 +1491,12 @@ impl<S: ViewSource> Shell<S> {
                 self.restore_done(&entries, outcomes, scene, now)
             }
             (Pending::Empty(mount), Done::Empty(outcome)) => self.empty_done(outcome, &mount, now),
+            (Pending::Elevated(targets), Done::Elevated(end)) => {
+                self.elevated_done(&targets, end, scene, now)
+            }
             (
                 Pending::Delete {
+                    elevated,
                     permanent,
                     items,
                     targets,
@@ -1197,7 +1517,7 @@ impl<S: ViewSource> Shell<S> {
                     );
                     return Vec::new();
                 }
-                self.delete_checked(&plan, permanent, items, targets, now)
+                self.delete_checked(&plan, permanent, elevated, items, targets, now)
             }
             (Pending::Menu(seq), Done::CheckMenu(plans)) => {
                 self.menu_checked(seq, *plans);
@@ -1237,6 +1557,8 @@ impl<S: ViewSource> Shell<S> {
         let (mut gone, mut gone_lower, mut gone_est) = (0u64, false, false);
         let (mut shared, mut moved_n, mut gone_n) = (0u64, 0usize, 0usize);
         let mut problems: Vec<String> = Vec::new();
+        // Items the user's own rights could not touch, offered to the helper.
+        let mut denied: Vec<Target> = Vec::new();
         for (target, outcome) in targets.iter().zip(outcomes) {
             match outcome {
                 ActOutcome::MovedToBin {
@@ -1295,6 +1617,12 @@ impl<S: ViewSource> Shell<S> {
                     refuse_text(&reason)
                 )),
                 ActOutcome::Failed(error) => {
+                    if error.kind == std::io::ErrorKind::PermissionDenied
+                        && error.removed_entries == 0
+                        && same_map
+                    {
+                        denied.push(target.clone());
+                    }
                     let verb = if asked_permanent {
                         "delete".to_string()
                     } else {
@@ -1359,13 +1687,172 @@ impl<S: ViewSource> Shell<S> {
             fx.push(ShellEffect::Tree(changes));
         }
         fx.push(ShellEffect::BinChanged);
+        if !denied.is_empty() && self.offer.can_elevate() && !self.busy() {
+            fx.extend(self.request_admin_delete(denied));
+        }
+        fx
+    }
+
+    /// The helper finished (or broke off) an administrator delete.
+    fn elevated_done(
+        &mut self,
+        targets: &[Target],
+        end: ElevatedEnd,
+        scene: u64,
+        now: Duration,
+    ) -> Vec<ShellEffect> {
+        let same_map = scene == self.acts.scene;
+        let mut lines: Vec<(String, CardRole)> = Vec::new();
+        let outcomes: Vec<Option<ElevatedItem>>;
+        let mut broke_off: Option<String> = None;
+        match end {
+            ElevatedEnd::Declined => {
+                self.show_toast(
+                    vec![(elevation::DECLINED_TEXT.into(), CardRole::Normal)],
+                    false,
+                    now,
+                );
+                return Vec::new();
+            }
+            ElevatedEnd::NoAccount => {
+                self.show_toast(
+                    vec![(elevation::NO_ACCOUNT_TEXT.into(), CardRole::Normal)],
+                    false,
+                    now,
+                );
+                return Vec::new();
+            }
+            ElevatedEnd::Unavailable(why) => {
+                self.show_toast(
+                    vec![(
+                        format!("Couldn't delete as administrator: {why}. Nothing was deleted."),
+                        CardRole::Normal,
+                    )],
+                    false,
+                    now,
+                );
+                return Vec::new();
+            }
+            ElevatedEnd::Done(items) => {
+                outcomes = (0..targets.len()).map(|i| items.get(i).cloned()).collect();
+            }
+            ElevatedEnd::Failed { message, completed } => {
+                let mut slots: Vec<Option<ElevatedItem>> = vec![None; targets.len()];
+                for (i, item) in completed {
+                    if let Some(slot) = slots.get_mut(i) {
+                        *slot = Some(item);
+                    }
+                }
+                outcomes = slots;
+                broke_off = Some(message);
+            }
+        }
+        let mut changes = Vec::new();
+        let (mut gone, mut gone_n, mut shared) = (0u64, 0usize, 0u64);
+        let (mut lower, mut est) = (false, false);
+        let mut problems: Vec<String> = Vec::new();
+        let mut unknown = 0usize;
+        for (target, outcome) in targets.iter().zip(outcomes) {
+            match outcome {
+                Some(ElevatedItem::Deleted {
+                    bytes,
+                    shared_files,
+                }) => {
+                    gone = gone.saturating_add(bytes);
+                    gone_n += 1;
+                    lower |= target.lower_bound;
+                    est |= target.estimated;
+                    shared = shared.saturating_add(shared_files);
+                    if let Some(node) = target.node.filter(|_| same_map) {
+                        changes.push(TreeChange {
+                            node,
+                            to: DeleteState::Deleted,
+                        });
+                    }
+                }
+                Some(ElevatedItem::Refused(why)) => {
+                    problems.push(format!("“{}” wasn't touched: {why}.", target.name));
+                }
+                Some(ElevatedItem::Failed(why)) => {
+                    problems.push(format!("Couldn't delete “{}”: {why}.", target.name));
+                }
+                None => unknown += 1,
+            }
+        }
+        if gone_n > 0 {
+            lines.push((
+                format!("Deleted · {}", size_text(gone, lower, est)),
+                CardRole::Normal,
+            ));
+        }
+        if shared > 0 {
+            lines.push((
+                format!(
+                    "{} also {} another name, so {} data stays on the drive.",
+                    plural(shared as usize, "file", "files"),
+                    if shared == 1 { "has" } else { "have" },
+                    if shared == 1 { "its" } else { "their" }
+                ),
+                CardRole::Secondary,
+            ));
+        }
+        for p in problems {
+            lines.push((p, CardRole::Secondary));
+        }
+        if let Some(message) = broke_off {
+            let text = if unknown > 0 {
+                format!(
+                    "The helper stopped before it finished ({message}). {} may or may not be deleted; rescan the folder to see what is left.",
+                    plural(unknown, "item", "items")
+                )
+            } else {
+                format!("The helper stopped after it had dealt with every item ({message}).")
+            };
+            lines.push((text, CardRole::Secondary));
+        }
+        if let Some(first) = lines.first_mut() {
+            first.1 = CardRole::Normal;
+            self.show_toast(lines, false, now);
+        }
+        let mut fx = Vec::new();
+        if !changes.is_empty() {
+            fx.push(ShellEffect::Tree(changes));
+        }
         fx
     }
 
     // ---- undo -----------------------------------------------------------------
 
+    /// The boxes the undo list can mark again, so the same items can be found
+    /// in another tree of the same place when the full result replaces the map.
+    pub fn undo_nodes(&self) -> Vec<NodeId> {
+        self.acts
+            .undo
+            .iter()
+            .flat_map(|g| g.entries.iter().filter_map(|e| e.node))
+            .collect()
+    }
+
+    /// Points the undo list at the boxes of the map now on screen: `find`
+    /// answers, for a box of the old map, the same box here. An item that
+    /// isn't there keeps its entry (it can still be put back) but marks
+    /// nothing.
+    pub fn remap_undo(&mut self, find: &dyn Fn(NodeId) -> Option<NodeId>) {
+        let scene = self.acts.scene;
+        for group in &mut self.acts.undo {
+            group.scene = scene;
+            for entry in &mut group.entries {
+                entry.node = entry.node.and_then(find);
+            }
+        }
+    }
+
     /// Puts the last delete back, if it is still in the bin.
     pub(super) fn undo_last(&mut self, now: Duration) -> Vec<ShellEffect> {
+        if self.offer == Offer::Running {
+            self.say(format!("Undo: {}", reason::FULL_SCAN_RUNNING), now);
+            return Vec::new();
+        }
         if self.busy() {
             self.say("Undo: wait for the last action to finish", now);
             return Vec::new();
@@ -1472,6 +1959,10 @@ impl<S: ViewSource> Shell<S> {
         let bin = self.bin();
         if self.acts.disposer.is_none() || self.acts.bin_drive.is_none() {
             self.say(format!("Empty {bin}: not available here"), now);
+            return Vec::new();
+        }
+        if self.offer == Offer::Running {
+            self.say(format!("Empty {bin}: {}", reason::FULL_SCAN_RUNNING), now);
             return Vec::new();
         }
         if self.busy() {
@@ -1613,6 +2104,7 @@ impl<S: ViewSource> Shell<S> {
         );
         self.acts.modal = Some(Modal::Dialog(Box::new(DialogUi {
             confirm,
+            list: None,
             spec,
             focus,
             hold_since: None,
@@ -1623,6 +2115,7 @@ impl<S: ViewSource> Shell<S> {
     /// Builds the open dialog or menu again: after a resize, a focus change or
     /// as a hold fills.
     pub(super) fn rebuild_modal(&mut self, now: Duration) {
+        self.refit_names();
         let window = self.window_rect();
         let built = match self.acts.modal.as_ref() {
             Some(Modal::Dialog(d)) => {
@@ -1686,13 +2179,17 @@ impl<S: ViewSource> Shell<S> {
             }
             Confirm::Delete {
                 permanent,
+                elevated,
                 protected,
                 items,
                 targets,
             } => {
+                let held = protected.clone();
                 let confirmed =
                     (!protected.is_empty()).then(|| ProtectedConfirmation::for_paths(protected));
-                if permanent {
+                if elevated {
+                    self.dispatch(Work::Elevated { items, held }, Pending::Elevated(targets))
+                } else if permanent {
                     self.dispatch(
                         Work::Permanent { items, confirmed },
                         Pending::Permanent(targets),
@@ -1725,8 +2222,10 @@ impl<S: ViewSource> Shell<S> {
                 self.modal_click(x, y, now)
             }
             InputEvent::Wheel { steps, .. } | InputEvent::Touchpad { steps, .. } => {
-                // The crash report scrolls; everything else ignores the wheel.
+                // The crash report and a long list of names scroll; everything
+                // else ignores the wheel.
                 self.scroll_report(-(steps * 3.0).round() as i64);
+                self.scroll_names(-(steps * 3.0).round() as i64);
                 Vec::new()
             }
             InputEvent::RightClick { .. } => {
@@ -1830,20 +2329,27 @@ impl<S: ViewSource> Shell<S> {
         match self.acts.modal.as_mut() {
             Some(Modal::Dialog(d)) => {
                 let n = d.spec.buttons.len().max(1);
-                if matches!(d.confirm, Confirm::Report(_)) {
-                    // Up and Down move through the report; Left, Right and
-                    // Tab move between the buttons.
+                let long_list = match (&d.confirm, &d.list) {
+                    (Confirm::Delete { targets, .. }, Some(l)) => targets.len() > l.rows,
+                    _ => false,
+                };
+                if matches!(d.confirm, Confirm::Report(_)) || long_list {
+                    // Up and Down move through the report or the names; Left,
+                    // Right and Tab move between the buttons.
                     match key {
                         Key::Arrow(Direction::Up) => {
                             self.scroll_report(-1);
+                            self.scroll_names(-1);
                             return Vec::new();
                         }
                         Key::Arrow(Direction::Down) => {
                             self.scroll_report(1);
+                            self.scroll_names(1);
                             return Vec::new();
                         }
                         Key::Home => {
                             self.scroll_report(i64::MIN / 2);
+                            self.scroll_names(i64::MIN / 2);
                             return Vec::new();
                         }
                         _ => {}
@@ -2399,6 +2905,39 @@ impl<S: ViewSource> Shell<S> {
         }
     }
 
+    /// How many names an administrator delete dialog lists at once: what fits
+    /// in about half the window, after the lines that stay on screen.
+    fn name_rows(&self) -> usize {
+        let line_h = (self.font_px * self.scale * 1.5).round().max(1.0);
+        let lines = ((self.height as f32 * 0.6) / line_h).floor() as usize;
+        lines.saturating_sub(10).clamp(3, 40)
+    }
+
+    /// Moves the names of an administrator delete dialog up or down by `by`.
+    fn scroll_names(&mut self, by: i64) {
+        let Some(Modal::Dialog(mut d)) = self.acts.modal.take() else {
+            return;
+        };
+        {
+            let d = &mut *d;
+            if let (
+                Confirm::Delete {
+                    targets, protected, ..
+                },
+                Some(list),
+            ) = (&d.confirm, d.list.as_mut())
+            {
+                let last = targets.len().saturating_sub(list.rows) as i64;
+                let to = (list.offset as i64).saturating_add(by).clamp(0, last) as usize;
+                if to != list.offset {
+                    list.offset = to;
+                    d.spec = self.fitted_admin_dialog(targets, !protected.is_empty(), list);
+                }
+            }
+        }
+        self.acts.modal = Some(Modal::Dialog(d));
+    }
+
     /// The words of the open crash report viewer, as one text (for tests).
     pub fn report_text(&self) -> Option<String> {
         match self.acts.modal.as_ref()? {
@@ -2522,7 +3061,7 @@ fn refuse_text(why: &RefuseReason) -> String {
 fn error_text(e: &OpError) -> String {
     let base = match e.kind {
         std::io::ErrorKind::PermissionDenied => {
-            "permission denied; administrator deletes aren't available yet".to_string()
+            "permission denied; it needs administrator rights".to_string()
         }
         std::io::ErrorKind::NotFound => "it is already gone".to_string(),
         _ => match e.code {

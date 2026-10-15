@@ -235,6 +235,7 @@ impl<S: ViewSource> Shell<S> {
         let source = self.app.as_ref()?.source();
         let mut data = source.card(view, id)?;
         data.software_center = self.acts.software_center;
+        data.scan_holds = self.offer == crate::elevation::Offer::Running;
         if with_sharing {
             data.sharing = source.sharing(view, id);
         }

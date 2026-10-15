@@ -4,6 +4,7 @@
 
 mod access;
 mod bench;
+mod fast;
 mod live;
 mod real;
 mod shots;
@@ -282,6 +283,13 @@ fn main() -> ExitCode {
         }
         _ => {}
     }
+    // The window never runs with administrator rights. A full scan and a delete
+    // that needs them go through the helper, which the system asks for.
+    if is_refused_when_elevated(&mode)
+        && refuse_if_elevated(&bs_platform::elevation::ThisProcess, &mut std::io::stderr())
+    {
+        return ExitCode::FAILURE;
+    }
     // Still the only thread: the screen-reader setup changes the environment.
     access::prepare(
         no_access
@@ -298,12 +306,39 @@ fn main() -> ExitCode {
         about().build_epoch().unwrap_or(0),
         env!("BYTESCAPE_TARGET"),
     ));
-    match window::run(mode, t0) {
+    let result = window::run(mode, t0);
+    // Reaching here is a normal shutdown: a crash report written by a panic
+    // that was caught on the way is not something to tell the user about next
+    // time.
+    bs_platform::crash::mark_clean_exit();
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("bytescape: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Whether this run is refused when the process has administrator rights:
+/// every run that scans or draws, pictures and measurements included. Only
+/// printing the version or the help is harmless.
+fn is_refused_when_elevated(mode: &Mode) -> bool {
+    !matches!(mode, Mode::Version | Mode::Help)
+}
+
+/// Says why the program will not run when its process has administrator
+/// rights, once, on `out`. Returns whether it refused.
+fn refuse_if_elevated(
+    rights: &dyn bs_platform::elevation::ProcessRights,
+    out: &mut dyn std::io::Write,
+) -> bool {
+    match bs_platform::elevation::refusal_for(rights) {
+        Some(message) => {
+            let _ = writeln!(out, "bytescape: {message}");
+            true
+        }
+        None => false,
     }
 }
 
@@ -313,6 +348,54 @@ mod tests {
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
+    }
+
+    struct Rights(bool);
+
+    impl bs_platform::elevation::ProcessRights for Rights {
+        fn is_elevated(&self) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn an_elevated_process_is_refused_once_with_the_reason() {
+        let mut out = Vec::new();
+        assert!(refuse_if_elevated(&Rights(true), &mut out));
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(
+            text.contains("never does") && text.contains("start it again"),
+            "{text}"
+        );
+        let mut out = Vec::new();
+        assert!(!refuse_if_elevated(&Rights(false), &mut out));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn only_runs_with_a_window_are_refused() {
+        let interactive = Mode::Interactive { path: None };
+        assert!(is_refused_when_elevated(&interactive));
+        assert!(!is_refused_when_elevated(&Mode::Version));
+        assert!(!is_refused_when_elevated(&Mode::Help));
+        // Pictures and measurements scan and draw too.
+        assert!(is_refused_when_elevated(&Mode::FontInit));
+        for argv in [
+            &["--screenshot", "dir", "--path", "/"][..],
+            &["--bench-first-frame"],
+            &["--bench-font-init"],
+            &["--bench-zoom"],
+            &["--bench-live", "/some/folder"],
+            &["/some/folder"],
+        ] {
+            let mode = parse_args(&args(argv)).expect("parses");
+            assert!(is_refused_when_elevated(&mode), "{argv:?}");
+        }
+        for argv in [&["--version"][..], &["--help"]] {
+            let mode = parse_args(&args(argv)).expect("parses");
+            assert!(!is_refused_when_elevated(&mode), "{argv:?}");
+        }
     }
 
     #[test]

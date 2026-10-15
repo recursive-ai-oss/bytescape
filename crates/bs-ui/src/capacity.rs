@@ -63,6 +63,13 @@ impl Breakdown {
 
     /// The text for the bar's tooltip.
     pub fn describe(&self) -> String {
+        self.describe_as(false)
+    }
+
+    /// The tooltip text. After a full scan the gap that remains is the
+    /// filesystem's own overhead, not bytes that could not be read
+    /// (`overhead`).
+    pub fn describe_as(&self, overhead: bool) -> String {
         let size = bs_layout::format_size;
         let reserved = if self.quota {
             "Beyond your disk quota"
@@ -74,7 +81,12 @@ impl Breakdown {
             parts.push(format!("Recycle Bin {}", size(self.recycle_bin)));
         }
         if self.unreadable > 0 {
-            parts.push(format!("Couldn't read {}", size(self.unreadable)));
+            let what = if overhead {
+                "Filesystem overhead"
+            } else {
+                "Couldn't read"
+            };
+            parts.push(format!("{what} {}", size(self.unreadable)));
         }
         if self.reserved > 0 {
             parts.push(format!("{reserved} {}", size(self.reserved)));

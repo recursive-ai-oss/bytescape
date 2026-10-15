@@ -17,6 +17,7 @@ use bs_render::scene::CATEGORY_NAMES;
 use bs_render::{Flags, Item, ItemKind, Rect};
 
 use super::{Shell, chrome};
+use crate::elevation::Offer;
 use crate::info::percent;
 use crate::picker::{FOLDER_BUTTON, OTHER_HEADING, PickTarget};
 use crate::{InputEvent, ItemInfo, ViewId, ViewSource};
@@ -49,6 +50,7 @@ const CRASH: NodeId = NodeId(23);
 const CRASH_TEXT: NodeId = NodeId(24);
 const CRASH_BUTTON_BASE: u64 = 25;
 const HOVER_CARD: NodeId = NodeId(30);
+const FULL_SCAN: NodeId = NodeId(31);
 const POPUP_BASE: u64 = 2_000;
 const HOVER_BASE: u64 = 3_000;
 const CRUMB_BASE: u64 = 100;
@@ -84,6 +86,8 @@ pub enum AccessTarget {
     Forward,
     Up,
     Refresh,
+    /// The Full scan button.
+    FullScan,
     /// A clickable part of the breadcrumb, by its position in the trail.
     Crumb(usize),
     Link,
@@ -568,6 +572,22 @@ impl<S: ViewSource> Shell<S> {
             }
             nav_children.push(id);
         }
+        if let Some(rect) = g.full_scan {
+            let can = self.offer.can_start();
+            out.push((
+                FULL_SCAN,
+                button(
+                    crate::elevation::FULL_SCAN_LABEL,
+                    rect,
+                    can,
+                    "A full scan is running",
+                ),
+            ));
+            if can {
+                targets.insert(FULL_SCAN, AccessTarget::FullScan);
+            }
+            nav_children.push(FULL_SCAN);
+        }
         let parts = self.crumb_parts();
         let mut crumbs = node(Role::Navigation, Some("Location"), g.crumb);
         for (i, part) in parts.iter().enumerate().take(CRUMB_LIMIT) {
@@ -595,7 +615,7 @@ impl<S: ViewSource> Shell<S> {
         // The capacity bar, as a labelled value.
         if let Some(b) = self.capacity.breakdown() {
             let mut n = node(Role::Meter, Some("Drive capacity"), g.capacity);
-            n.set_value(b.describe());
+            n.set_value(b.describe_as(self.offer == Offer::Done));
             if b.total > 0 {
                 n.set_min_numeric_value(0.0);
                 n.set_max_numeric_value(100.0);

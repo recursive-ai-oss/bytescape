@@ -54,6 +54,8 @@ pub enum Hit {
     Forward,
     Up,
     Refresh,
+    /// The "Full scan" button at the right end of the navigation bar.
+    FullScan,
     Crumb,
     /// A clickable segment of the breadcrumb, by position.
     CrumbSeg(usize),
@@ -95,6 +97,9 @@ pub struct Geometry {
     pub forward: Rect,
     pub up: Rect,
     pub refresh: Rect,
+    /// The "Full scan" button, when it is offered. It sits at the right end
+    /// of the navigation bar and the breadcrumb gives it the room.
+    pub full_scan: Option<Rect>,
     pub crumb: Rect,
     pub capacity: Rect,
     pub map: Rect,
@@ -229,6 +234,7 @@ pub fn geometry(
         forward,
         up,
         refresh,
+        full_scan: None,
         crumb,
         capacity,
         map,
@@ -316,6 +322,24 @@ pub fn layout_crumbs(area: Rect, em: f32, segs: &[String], m: &dyn TextMeasure) 
 }
 
 impl Geometry {
+    /// Makes room for the "Full scan" button of `text_w` device pixels of
+    /// text at the right end of the navigation bar, taking the room from the
+    /// breadcrumb.
+    pub fn reserve_full_scan(&mut self, text_w: f32, scale: f32, em: f32) {
+        let pad = (8.0 * scale).round();
+        let w = (text_w.ceil() + 2.0 * pad).max(em * 4.0);
+        let h = self.nav.h;
+        let x = (self.nav.right() - pad - w).max(self.refresh.right() + pad);
+        let rect = Rect::new(x, 0.0, (self.nav.right() - pad - x).max(0.0), h);
+        self.crumb = Rect::new(
+            self.crumb.x,
+            self.crumb.y,
+            (rect.x - pad - self.crumb.x).max(0.0),
+            self.crumb.h,
+        );
+        self.full_scan = Some(rect);
+    }
+
     /// What is under the point, if it is over chrome rather than the map.
     pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
         if self.map.contains(x, y) {
@@ -333,6 +357,9 @@ impl Geometry {
         }
         if at(&self.refresh) {
             return Some(Hit::Refresh);
+        }
+        if self.full_scan.as_ref().is_some_and(at) {
+            return Some(Hit::FullScan);
         }
         if at(&self.crumb) {
             return Some(Hit::Crumb);

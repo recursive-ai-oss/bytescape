@@ -17,6 +17,7 @@ bs-render = { path = "../bs-render" }
 bs-knowledge = { path = "../bs-knowledge" }
 bs-layout = { path = "../bs-layout" }
 bs-platform = { path = "../bs-platform" }
+bs-ipc = { path = "../bs-ipc" }
 bs-tree = { path = "../bs-tree" }
 accesskit = { workspace = true }
 
