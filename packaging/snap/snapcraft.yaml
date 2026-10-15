@@ -9,6 +9,7 @@
 #
 # Build from the repository root: packaging/snap/build-snap.sh strict
 name: bytescape
+title: Bytescape
 base: core24
 adopt-info: bytescape
 summary: See where the space on a drive is used

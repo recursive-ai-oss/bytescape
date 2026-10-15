@@ -18,26 +18,27 @@ loadconfig   Reads DependentLoadFlags from the load configuration and fails
              looks for its libraries in the system folder only, never beside
              itself.
 
-canary       Shows that a program linked with the helper's DLL-search flag
-             really ignores a DLL planted beside it. The helper itself cannot
-             show this: every library it imports is a system library that
-             Windows has already loaded, or resolves by name from the system
-             folder, before the program's own folder is looked at, so no
-             planted file could be picked up even without the flag. So the
-             check uses a probe program (dependent-load-probe.rs) that imports
-             from version.dll, linked with the same /DEPENDENTLOADFLAG:0x800.
-             A stand-in version.dll (canary-dll.rs) writes a file when it is
-             loaded. Two controls come first. One: a process that loads the
-             stand-in by full path must write the file. Two: a copy of the probe
-             with DependentLoadFlags set to zero, started beside the stand-in,
-             must write it too; that shows a DLL beside a program is picked up
+canary       Shows that the DLL-search flag works the way `loadconfig` assumes.
+             Observed on a hosted Windows runner: the helper's own libraries
+             (kernel32, ntdll, bcryptprimitives and an api-ms-win set) did not
+             pick up a stand-in planted beside it even with the flag zeroed,
+             so the helper cannot show the flag working. A probe program
+             (dependent-load-probe.rs) that imports from version.dll, linked
+             with the same /DEPENDENTLOADFLAG:0x800, can. A stand-in
+             version.dll (canary-dll.rs) writes a file when it is loaded. Two
+             controls come first. One: a process that loads the stand-in by
+             full path must write the file. Two: a copy of the probe with
+             DependentLoadFlags set to zero, started beside the stand-in, must
+             write it too, which shows a DLL beside a program is picked up
              when nothing restricts the search. If either control writes
-             nothing, the check cannot tell anything and exits 2 (never "ok").
+             nothing the check cannot tell anything and exits 2, never "ok".
              Then the probe as linked is started beside the stand-in: the file
-             must not appear. The helper is tied to the probe by the
-             DependentLoadFlags value the two must share, which the helper
-             file itself is read for. Needs rustc and a Windows SDK (the
-             linker finds it).
+             must not appear (exit 1 if it does, whatever the exit status of
+             the probe). The helper is tied to the probe only by the
+             DependentLoadFlags value they must share, so the claim for the
+             helper is: its flag is 0x800 (read from the file) and a program
+             with that flag ignores a DLL beside it (shown on the probe).
+             Needs rustc and a Windows SDK (the linker finds it).
 
 Exit status: 0 good, 1 a check failed, 2 could not run the check.
 """
@@ -209,9 +210,11 @@ PROBE_SOURCE = Path(__file__).with_name("dependent-load-probe.rs")
 CANARY_FILE = "canary-loaded.txt"
 
 
-def run_beside_canary(exe: Path, folder: Path, name: str):
+def run_beside_canary(exe: Path, folder: Path, name: str, marker_decides: bool = False):
     """Start `exe` (copied to `folder/name`, which holds the stand-in DLL) with
-    no arguments. Exits with status 2 if it cannot be started or fails."""
+    no arguments. Exits with status 2 if it cannot be started or fails, unless
+    `marker_decides` is set and the stand-in wrote its marker file: then the
+    caller judges by the file."""
     copy = folder / name
     shutil.copy2(exe, copy)
     try:
@@ -220,6 +223,8 @@ def run_beside_canary(exe: Path, folder: Path, name: str):
     except OSError as error:
         print(f"could not start {name}:", error)
         sys.exit(2)
+    if marker_decides and (folder / CANARY_FILE).exists():
+        return
     if ran.returncode != 0:
         print(f"{name} did not run cleanly: status {ran.returncode & 0xFFFFFFFF:#x}")
         sys.exit(2)
@@ -288,7 +293,7 @@ def check_canary(path: Path) -> bool:
         tight = work / "tight"
         tight.mkdir()
         shutil.copy2(dll, tight / dll.name)
-        run_beside_canary(probe, tight, "probe.exe")
+        run_beside_canary(probe, tight, "probe.exe", marker_decides=True)
         if (tight / CANARY_FILE).exists():
             print("FAILED: a program linked with /DEPENDENTLOADFLAG:0x800 loaded a DLL planted beside it")
             return False

@@ -36,6 +36,17 @@ check test -f /usr/share/nautilus-python/extensions/bytescape-nautilus.py
 # The main entry never claims to open folders.
 check sh -c '! grep -qi "^MimeType" /usr/share/applications/org.recursiveai.bytescape.desktop'
 
+echo "== refuses administrator rights"
+# This script runs as root, so the installed program must refuse, say why, and
+# fail. It never reaches the window code, so no display is needed.
+status=0
+refusal="$(/usr/bin/bytescape --bench-first-frame /tmp 2>&1)" || status=$?
+echo "$refusal"
+check test "$status" -ne 0
+check grep -q 'running with administrator rights, which it never does' <<< "$refusal"
+# Printing the version is harmless and still works as root.
+check /usr/bin/bytescape --version
+
 echo "== polkit"
 check xmllint --noout /usr/share/polkit-1/actions/org.recursiveai.bytescape.helper.policy
 mkdir -p /run/dbus

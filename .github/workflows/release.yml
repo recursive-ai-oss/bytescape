@@ -322,7 +322,7 @@ jobs:
       - name: Make the portable zip
         run: packaging/windows/build-windows.sh zip --arch ${{ matrix.arch }}
       - name: Install Inno Setup
-        timeout-minutes: 10
+        timeout-minutes: 6
         run: packaging/windows/build-windows.sh install-inno
       - name: Make the installer
         run: packaging/windows/build-windows.sh installer --arch ${{ matrix.arch }}

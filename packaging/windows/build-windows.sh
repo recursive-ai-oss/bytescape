@@ -61,7 +61,14 @@ need_arch() {
 }
 
 # A Windows path for tools that need one (Inno Setup), whatever shell we are in.
-win_path() { if command -v cygpath > /dev/null; then cygpath -w "$1"; elif command -v winepath > /dev/null; then winepath -w "$1"; else echo "$1"; fi; }
+# A path as the Windows tools want it: absolute, with backslashes. The Inno
+# compiler resolves a relative path against the folder of the script it reads,
+# not against this one, so every path handed to it is made absolute first.
+win_path() {
+  local p="$1"
+  case "$p" in /* | ?:*) ;; *) p="$PWD/$p" ;; esac
+  if command -v cygpath > /dev/null; then cygpath -aw "$p"; elif command -v winepath > /dev/null; then winepath -w "$p"; else echo "$p"; fi
+}
 
 case "$command" in
   stage)
@@ -98,7 +105,22 @@ case "$command" in
       curl -fsSL -o "$installer_file" "https://github.com/jrsoftware/issrc/releases/download/is-${INNO_VERSION//./_}/innosetup-$INNO_VERSION-x64.exe"
     fi
     echo "$INNO_SHA256  $installer_file" | sha256sum -c -
-    "$installer_file" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- "/DIR=$(win_path "$tools/inno")"
+    # Git's bash rewrites an argument that starts with a slash into a Windows
+    # path (/VERYSILENT would become C:/Program Files/Git/VERYSILENT), so the
+    # installer would not see its switches and would wait for a click. The two
+    # variables below turn that rewriting off. Standard input is closed, the
+    # per-user mode is named (no administrator prompt, no mode question), the
+    # run is bounded, and the installer's own log is printed when it fails.
+    log="$(win_path "$tools/inno-install.log")"
+    status=0
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' timeout 300 "$installer_file" \
+      /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /CURRENTUSER "/LOG=$log" \
+      "/DIR=$(win_path "$tools/inno")" < /dev/null || status=$?
+    if [ "$status" -ne 0 ] || [ ! -f "$tools/inno/ISCC.exe" ]; then
+      echo "the Inno Setup installer failed (status $status); its log:" >&2
+      cat "$tools/inno-install.log" >&2 || echo "(no log was written)" >&2
+      exit 1
+    fi
     ls "$tools/inno/ISCC.exe"
     ;;
   installer)

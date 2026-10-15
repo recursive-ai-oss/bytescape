@@ -47,6 +47,33 @@ PY
 fi
 
 command -v snapcraft > /dev/null || { echo "snapcraft is not installed" >&2; exit 2; }
+# The rust plugin drives the build through rustup and installs the toolchain
+# named in rust-toolchain.toml. The plugin looks for rustup from inside
+# snapcraft's own process, where the rustup snap cannot be started, so rustup
+# is installed the ordinary way instead, into the home folder of the account
+# running this script (the plugin adds ~/.cargo/bin to its path). The installer
+# is a pinned release, checked against its SHA-256. No toolchain is installed
+# here: rustup fetches the one rust-toolchain.toml names when the build asks.
+rustup_version=1.29.0
+case "$(uname -m)" in
+  x86_64) rustup_triple=x86_64-unknown-linux-gnu
+    rustup_sha=4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10 ;;
+  aarch64) rustup_triple=aarch64-unknown-linux-gnu
+    rustup_sha=9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792 ;;
+  *) echo "unsupported machine $(uname -m)" >&2; exit 2 ;;
+esac
+if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+  # The program decides what to do by its own name, so it must be called
+  # rustup-init.
+  initdir="$(mktemp -d)"
+  init="$initdir/rustup-init"
+  curl --proto '=https' --tlsv1.2 -fsSL -o "$init" "https://static.rust-lang.org/rustup/archive/$rustup_version/$rustup_triple/rustup-init"
+  echo "$rustup_sha  $init" | sha256sum -c -
+  chmod +x "$init"
+  "$init" -y --no-modify-path --profile minimal --default-toolchain none
+  rm -rf "$initdir"
+fi
+"$HOME/.cargo/bin/rustup" dump-testament > /dev/null
 rm -rf snap
 mkdir snap
 cp "$manifest" snap/snapcraft.yaml

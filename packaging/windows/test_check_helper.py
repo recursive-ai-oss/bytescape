@@ -133,9 +133,42 @@ class ImportList(unittest.TestCase):
         for name in ("CreateFileW", "CloseHandle", "ProcessPrng", "NtCreateFile", "systemx"):
             self.assertFalse(check_helper.FORBIDDEN.match(name), name)
 
-    def test_the_names_the_review_asked_for_are_caught(self):
+    def test_pipe_and_process_creation_names_are_caught(self):
         for name in ("_popen", "_wpopen", "NtCreateProcess", "NtCreateProcessEx"):
             self.assertTrue(check_helper.FORBIDDEN.match(name), name)
+
+
+class RunBesideCanary(unittest.TestCase):
+    """The planted-file check comes before the exit status (a stand-in `exe` is
+    a shell script, so this runs on Linux only)."""
+
+    def run_script(self, body, marker_decides):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / "fake.sh"
+            script.write_text("#!/bin/sh\n" + body + "\n")
+            script.chmod(0o755)
+            work = Path(folder) / "work"
+            work.mkdir()
+            try:
+                check_helper.run_beside_canary(script, work, "probe", marker_decides=marker_decides)
+            except SystemExit as stop:
+                return stop.code, (work / check_helper.CANARY_FILE).exists()
+            return 0, (work / check_helper.CANARY_FILE).exists()
+
+    @unittest.skipIf(sys.platform == "win32", "needs a shell")
+    def test_a_marker_wins_over_a_failing_exit_status(self):
+        body = f"touch {check_helper.CANARY_FILE}; exit 3"
+        self.assertEqual(self.run_script(body, True), (0, True))
+        # Without the marker rule a failing exit stops the check as unusable.
+        self.assertEqual(self.run_script(body, False)[0], 2)
+
+    @unittest.skipIf(sys.platform == "win32", "needs a shell")
+    def test_a_failing_exit_without_a_marker_is_unusable(self):
+        self.assertEqual(self.run_script("exit 3", True), (2, False))
+        self.assertEqual(self.run_script("exit 0", True), (0, False))
 
 
 if __name__ == "__main__":

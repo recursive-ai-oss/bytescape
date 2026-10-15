@@ -10,6 +10,7 @@
 #
 # Build from the repository root: packaging/snap/build-snap.sh classic
 name: bytescape
+title: Bytescape
 base: core24
 adopt-info: bytescape
 summary: See where the space on a drive is used
@@ -31,8 +32,9 @@ compression: lzo
 
 apps:
   bytescape:
+    # No gnome extension here: it does not support classic confinement. A classic
+    # snap uses the system's own display and font libraries.
     command: bin/bytescape
-    extensions: [gnome]
     common-id: org.recursiveai.bytescape
     desktop: usr/share/applications/org.recursiveai.bytescape.desktop
 
@@ -43,6 +45,9 @@ parts:
     # The interface and the helper.
     rust-path: [crates/bytescape, crates/bytescape-helper]
     rust-channel: "1.99.0"
+    # A classic snap runs against the base snap's C library: point the programs
+    # at it, as the store's classic check asks.
+    build-attributes: [enable-patchelf]
     build-packages:
       - pkg-config
     build-environment:

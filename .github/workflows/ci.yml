@@ -207,11 +207,15 @@ jobs:
         run: bash packaging/ci/linux-privileged-tests.sh
 
   # The finished Windows helper, read as a file: it imports nothing that starts
-  # another program, it is linked to look for DLLs in the system folder only,
-  # and a DLL planted beside it (a bcryptprimitives.dll whose DllMain writes a
-  # file) is not loaded when it starts. The release build is the one that
-  # counts, so this builds it. The runner is an elevated account, which the
-  # helper's manifest needs for the last check.
+  # another program, and it is linked to look for DLLs in the system folder
+  # only (DependentLoadFlags is 0x800). The helper's own libraries are all
+  # ones Windows has loaded before the program's folder is searched, so a
+  # planted file could not show the flag working on the helper. A small probe
+  # program linked with the same flag shows it instead: with the flag zeroed it
+  # loads a stand-in version.dll placed beside it (a control), and as linked it
+  # does not. Two controls must pass first, or the check stops as
+  # inconclusive, and the helper must carry the same flag value as the probe.
+  # The release build is the one that counts, so this builds it.
   windows-helper-binary:
     name: windows helper binary
     runs-on: windows-2025
@@ -717,8 +721,14 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Built in release mode: one test walks the runner's whole system drive
       # with the directory walker, and a debug build is far slower at that.
+      # Release mode drops overflow checks and debug assertions unless they are
+      # asked for, and this is the run that reads real disk structures, so both
+      # stay on.
       - name: Reader tests on virtual disks and the system drive
         timeout-minutes: 120
+        env:
+          CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
         run: |
           cargo test --locked --release --no-fail-fast -p bs-scan-ntfs -- --nocapture --test-threads=1 2>&1 | tee ntfs-test.log
           # A test that cannot do its job prints NOT RUN and still passes, and

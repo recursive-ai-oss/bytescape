@@ -102,7 +102,7 @@ helper_ns_test="$(find_helper_test mounts_namespace)"
 helper_root_test="$(find_helper_test root)"
 
 echo "== in a user and mount namespace"
-cargo test --locked -p bs-scan --test huge_sizes --test mount_race \
+cargo test --locked --no-fail-fast -p bs-scan --test huge_sizes --test mount_race \
   -- --nocapture --test-threads=1 2>&1 | tee -a "$log"
 # The helper's delete code around other mounts, in a namespace of its own.
 ( cd crates/bytescape-helper
