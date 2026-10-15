@@ -330,6 +330,9 @@ fn seeded_hostile_stream_reaches_every_refusal_path() {
                     E::NodeIdsExhausted => "NodeIdsExhausted",
                     E::NamePoolFull => "NamePoolFull",
                     E::SizeOverflow => "SizeOverflow",
+                    // Only a rescan produces these (see tests/rescan.rs).
+                    E::RescanRootMismatch => "RescanRootMismatch",
+                    E::RescanInconsistent => "RescanInconsistent",
                 });
             }
             let snap = agg.publish();

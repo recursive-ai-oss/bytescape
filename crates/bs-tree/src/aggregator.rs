@@ -1,6 +1,8 @@
 //! The owner side of the tree: applies batches, keeps counters and
 //! completeness, handles delete marks and publishes snapshots.
 
+mod rescan;
+
 use crate::batch::{Batch, Entry, Record};
 use crate::error::{ApplyError, DeleteError};
 use crate::hash::FastMap;
@@ -13,6 +15,9 @@ use crate::types::{
 use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
+
+pub use rescan::RescanReport;
+use rescan::{Phase, Rescan};
 
 /// Caps that keep hostile or broken input from using unbounded memory.
 #[derive(Clone, Copy, Debug)]
@@ -169,6 +174,16 @@ pub struct Aggregator {
     open: FastMap<u32, OpenDir>,
     /// First sighting of each hard-linked file.
     links: FastMap<FileKey, u32>,
+    /// What `links` held for the files with more than one name when the scan
+    /// finished, so a rescan can tell that a name it finds is a file already
+    /// counted elsewhere in the tree.
+    link_keys: FastMap<FileKey, u32>,
+    /// The rescan in progress, if any.
+    rescan: Option<Rescan>,
+    /// What the last finished rescan did.
+    last_rescan: Option<RescanReport>,
+    /// Records of a refused rescan that were ignored, not lost.
+    rescan_ignored: u64,
     /// Records waiting for the directory with this key.
     parked: FastMap<u32, Vec<Parked>>,
     /// For parked directory entries: their key to the key they wait for.
@@ -219,6 +234,10 @@ impl Aggregator {
             keys: FastMap::default(),
             open: FastMap::default(),
             links: FastMap::default(),
+            link_keys: FastMap::default(),
+            rescan: None,
+            last_rescan: None,
+            rescan_ignored: 0,
             parked: FastMap::default(),
             wait_links: FastMap::default(),
             parked_records: 0,
@@ -258,10 +277,21 @@ impl Aggregator {
     pub fn apply(&mut self, batch: &Batch) -> ApplyReport {
         let mut report = ApplyReport::default();
         let mut pending = Pending::new();
+        let ignored_before = self.rescan_ignored;
         for (index, rec) in batch.records().iter().enumerate() {
             let index = u32::try_from(index).ok();
             if self.finished {
                 self.refuse(&mut report, index, rec, ApplyError::ScanFinished);
+                continue;
+            }
+            if self
+                .rescan
+                .as_ref()
+                .is_some_and(|r| r.phase == Phase::Refused)
+            {
+                // The scan is of another folder than the one being
+                // rescanned: nothing of it belongs in the tree.
+                self.refuse(&mut report, index, rec, ApplyError::RescanRootMismatch);
                 continue;
             }
             let name: &[u8] = match rec {
@@ -285,9 +315,11 @@ impl Aggregator {
             self.drain_ready(&mut pending, &mut report);
         }
         self.settle(&mut pending);
+        // A refused rescan's records were ignored, not lost.
+        let ignored = self.rescan_ignored.saturating_sub(ignored_before);
         self.rejected_total = self
             .rejected_total
-            .saturating_add(u64::from(report.rejected));
+            .saturating_add(u64::from(report.rejected).saturating_sub(ignored));
         report
     }
 
@@ -310,13 +342,24 @@ impl Aggregator {
         }
         self.rejected_total = self.rejected_total.saturating_add(unresolved);
         if unresolved > 0 {
-            self.mark_lost(None);
+            // In a rescan the lost records belonged to the rescanned folder.
+            let place = self
+                .rescan
+                .as_ref()
+                .filter(|r| r.phase == Phase::Bound)
+                .map(|r| r.node);
+            self.mark_lost(place);
         }
         self.finished = true;
-        // Dropped, not cleared: clearing keeps the table's memory.
+        if let Some(rescan) = self.rescan.take() {
+            self.last_rescan = Some(rescan.report);
+        }
+        // Dropped, not cleared: clearing keeps the table's memory. Of the
+        // hard-link identities only those of files with several names stay.
         self.keys = FastMap::default();
         self.open = FastMap::default();
-        self.links = FastMap::default();
+        let links = std::mem::take(&mut self.links);
+        self.link_keys = self.keep_link_keys(links);
         self.parked = FastMap::default();
         self.wait_links = FastMap::default();
         self.ready = Vec::new();
@@ -415,6 +458,13 @@ impl Aggregator {
         rec: &Record,
         error: ApplyError,
     ) {
+        if error == ApplyError::RescanRootMismatch {
+            // Not a loss: the records belong to another folder and were
+            // left out on purpose.
+            self.rescan_ignored = self.rescan_ignored.saturating_add(1);
+            report.reject(index, error);
+            return;
+        }
         let place = match rec {
             Record::Entry(e) => e.parent.0,
             Record::ListingDone { dir } | Record::Unreadable { dir, .. } => dir.0,
@@ -537,6 +587,9 @@ impl Aggregator {
             }
         }
         if e.parent == crate::DirKey::NONE {
+            if self.rescan.is_some() {
+                return self.bind_rescan_root(e, name);
+            }
             if self.store.len() != 0 || !self.keys.is_empty() {
                 return Step::Reject(ApplyError::RootAlreadyPresent);
             }
@@ -838,7 +891,7 @@ impl Aggregator {
             return Err(DeleteError::NoState);
         }
         let node = id.0;
-        if !self.store.contains(node) {
+        if !self.store.contains(node) || self.store.is_detached(node) {
             return Err(DeleteError::UnknownNode(id));
         }
         if !self.store.flags(node).contains(NodeFlags::COMPLETE) {

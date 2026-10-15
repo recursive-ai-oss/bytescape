@@ -8,6 +8,9 @@
 //! * [`Walker`] is the one that always works: unprivileged, parallel, never
 //!   crossing into another drive, never following links, never opening cloud
 //!   placeholders, recording what it cannot read instead of failing.
+//! * [`start_rescan`] replaces one folder of a finished tree with a fresh scan
+//!   of it, keeping the folder where it is; [`node_path`] gives the folder's
+//!   path.
 //! * [`Boundary`] says which mounts count as the same drive.
 //! * Each file gets its category (what colors it on the map) while it is read:
 //!   by its extension, or by the place it lies in when the category tables
@@ -36,6 +39,7 @@ mod classify;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod dirent;
 mod pool;
+mod rescan;
 mod scanner;
 mod threads;
 mod volume;
@@ -54,6 +58,7 @@ pub use bs_knowledge::Environment;
 /// The category lookup the walker uses, and the path joining it expects, for
 /// other producers that must give the same entries the same categories.
 pub use classify::{Classifier, MAX_PATH_BYTES, join as join_path};
+pub use rescan::{RescanRefused, node_path, start_rescan};
 pub use scanner::{
     ScanContext, ScanEnd, ScanError, ScanHandle, ScanOptions, ScanProgress, ScanResult, ScanStats,
     Scanner, start,
@@ -67,7 +72,7 @@ pub use volume::{FixedVolume, StatvfsVolume, VolumeInfo};
 pub mod winrules {
     pub use crate::wininfo::{
         Classified, EntryClass, attr, classify, entry_flags, filetime_to_unix, is_plain_component,
-        wtf8_from_utf16,
+        utf16_from_wtf8, wtf8_from_utf16,
     };
 }
 

@@ -18,5 +18,9 @@ stats_alloc = "0.1"
 name = "memory"
 harness = false
 
+[[bench]]
+name = "large_dirs"
+harness = false
+
 [lints]
 workspace = true

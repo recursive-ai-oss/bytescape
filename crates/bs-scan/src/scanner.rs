@@ -24,11 +24,14 @@
 //!
 //! Cancelling keeps what was counted: the final snapshot is marked stopped
 //! and everything unfinished stays incomplete.
+//!
+//! [`start_rescan`] runs the same machinery over a finished tree to replace
+//! one folder's contents.
 
 use crate::boundary::Boundary;
 use crate::classify::Classifier;
 use bs_knowledge::Environment;
-use bs_tree::{Aggregator, Batch, DirKey, SnapshotReader};
+use bs_tree::{Aggregator, Batch, DirKey, ReadErrorKind, ReadFailure, SnapshotReader};
 use std::fmt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -430,6 +433,28 @@ impl ScanHandle {
     }
 }
 
+/// The failure a rescan that ended on `error` leaves on its folder.
+fn failure_of(error: &ScanError) -> ReadFailure {
+    match error {
+        ScanError::Root(e) => ReadFailure {
+            kind: match e.kind() {
+                io::ErrorKind::PermissionDenied => ReadErrorKind::PermissionDenied,
+                io::ErrorKind::NotFound => ReadErrorKind::NotFound,
+                _ => ReadErrorKind::Other,
+            },
+            code: e.raw_os_error().unwrap_or(0),
+        },
+        ScanError::NotADirectory(_) => ReadFailure {
+            kind: ReadErrorKind::NotFound,
+            code: 0,
+        },
+        ScanError::Unsupported | ScanError::Threads(_) | ScanError::Panicked(_) => ReadFailure {
+            kind: ReadErrorKind::Other,
+            code: 0,
+        },
+    }
+}
+
 /// The text of a panic payload.
 pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -485,9 +510,20 @@ fn failed_result(
 /// started ends it with [`ScanError::Threads`]. Both show up in
 /// [`ScanStats::error`] of the result.
 pub fn start(scanner: Arc<dyn Scanner>, root: PathBuf, options: ScanOptions) -> ScanHandle {
-    let name = scanner.name();
     let mut aggregator = Aggregator::new();
     aggregator.set_os_used_bytes(options.os_used_bytes);
+    launch(scanner, root, options, aggregator)
+}
+
+/// Starts the threads of a scan that feeds `aggregator`, which is either
+/// empty or has had a rescan begun on it.
+pub(crate) fn launch(
+    scanner: Arc<dyn Scanner>,
+    root: PathBuf,
+    options: ScanOptions,
+    aggregator: Aggregator,
+) -> ScanHandle {
+    let name = scanner.name();
     let reader = aggregator.reader();
     let interval = options.publish_interval;
     let (ctx, rx) = ScanContext::channel(options, 64);
@@ -495,6 +531,7 @@ pub fn start(scanner: Arc<dyn Scanner>, root: PathBuf, options: ScanOptions) -> 
     let counters = Arc::clone(&ctx.counters);
     let done = Arc::new(AtomicBool::new(false));
     let done_flag = Arc::clone(&done);
+    let cancel_for_applier = Arc::clone(&cancel);
     let counters_for_thread = Arc::clone(&counters);
 
     let run = std::thread::Builder::new()
@@ -502,7 +539,16 @@ pub fn start(scanner: Arc<dyn Scanner>, root: PathBuf, options: ScanOptions) -> 
         .spawn(move || {
             let begun = Instant::now();
             let result = catch_unwind(AssertUnwindSafe(|| {
-                run_scan(&*scanner, &root, ctx, aggregator, rx, interval, begun)
+                run_scan(
+                    &*scanner,
+                    &root,
+                    ctx,
+                    aggregator,
+                    rx,
+                    interval,
+                    begun,
+                    cancel_for_applier,
+                )
             }))
             .unwrap_or_else(|panic| {
                 failed_result(
@@ -531,6 +577,7 @@ pub fn start(scanner: Arc<dyn Scanner>, root: PathBuf, options: ScanOptions) -> 
 
 /// The coordinator's work: runs the scanner while the applier thread builds
 /// the tree, then collects both.
+#[allow(clippy::too_many_arguments)]
 fn run_scan(
     scanner: &dyn Scanner,
     root: &Path,
@@ -539,12 +586,13 @@ fn run_scan(
     rx: Receiver<Batch>,
     interval: Duration,
     begun: Instant,
+    cancel: Arc<AtomicBool>,
 ) -> ScanResult {
     let stopped = Arc::new(AtomicBool::new(false));
     let stopped_for_applier = Arc::clone(&stopped);
     let applier = match std::thread::Builder::new()
         .name("bs-scan-applier".into())
-        .spawn(move || run_applier(aggregator, rx, interval, &stopped_for_applier))
+        .spawn(move || run_applier(aggregator, rx, interval, &stopped_for_applier, &cancel))
     {
         Ok(handle) => handle,
         Err(e) => {
@@ -574,7 +622,7 @@ fn run_scan(
     let threads = usize::try_from(ctx.counters.threads.load(Ordering::Relaxed)).unwrap_or(0);
     // Closing the channel lets the applier finish.
     drop(ctx);
-    let (aggregator, snapshot, applied) = match applier.join() {
+    let (mut aggregator, mut snapshot, applied) = match applier.join() {
         Ok(done) => done,
         Err(panic) => {
             // The tree itself failed; what readers last saw stays published,
@@ -587,6 +635,13 @@ fn run_scan(
             (aggregator, snapshot, Applied::default())
         }
     };
+    // A rescan that stopped on an error after it had replaced the folder's
+    // contents leaves the folder unreadable, not complete and not missing.
+    if let Some(e) = &error
+        && aggregator.mark_rescan_failed(failure_of(e))
+    {
+        snapshot = aggregator.publish();
+    }
     ScanResult {
         aggregator,
         snapshot,
@@ -616,6 +671,7 @@ fn run_applier(
     rx: Receiver<Batch>,
     interval: Duration,
     stopped: &AtomicBool,
+    cancel: &AtomicBool,
 ) -> (Aggregator, Arc<bs_tree::Snapshot>, Applied) {
     let mut totals = Applied::default();
     let mut dirty = false;
@@ -627,6 +683,11 @@ fn run_applier(
                 totals.parked += u64::from(report.parked);
                 totals.rejected += u64::from(report.rejected);
                 dirty = true;
+                if agg.rescan_refused() {
+                    // The scan is of another folder than the one being
+                    // rescanned; there is no point in finishing it.
+                    cancel.store(true, Ordering::Relaxed);
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -635,7 +696,9 @@ fn run_applier(
             dirty = false;
         }
     }
-    if stopped.load(Ordering::Relaxed) {
+    // A refused rescan is cancelled by the applier itself and changed
+    // nothing, so it does not make the tree "stopped".
+    if stopped.load(Ordering::Relaxed) && !agg.rescan_refused() {
         agg.mark_stopped();
     }
     // `parked` counts records held back when they arrived; those that later

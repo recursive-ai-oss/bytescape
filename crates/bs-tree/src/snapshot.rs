@@ -1,7 +1,7 @@
 //! Immutable, internally consistent views of the tree.
 
 use crate::error::Violation;
-use crate::store::{NONE, Store};
+use crate::store::{DETACHED, NONE, Store};
 use crate::types::{
     ByteCount, Category, DeleteState, DeleteTotals, NodeFlags, NodeId, NodeKind, ReadFailure,
 };
@@ -41,6 +41,28 @@ impl FreeEstimate {
     }
 }
 
+/// A directory found by [`Snapshot::large_dirs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LargeDir {
+    /// The directory.
+    pub id: NodeId,
+    /// Levels below the node the search started at (its children are 1).
+    pub depth: u32,
+    /// Its allocated size as counted.
+    pub allocated: u64,
+}
+
+/// The answer of [`Snapshot::large_dirs`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LargeDirs {
+    /// The directories found, largest first (ties by lower node id), at most
+    /// the limit asked for.
+    pub dirs: Vec<LargeDir>,
+    /// More directories met the conditions than the limit allowed; the
+    /// smaller ones were left out.
+    pub more: bool,
+}
+
 /// A point-in-time copy of the whole tree. Never changes after it is
 /// published; share it freely between threads.
 ///
@@ -59,9 +81,18 @@ impl Snapshot {
         self.epoch
     }
 
-    /// Number of nodes.
+    /// Number of nodes in the arena, including those a rescan cut off (see
+    /// [`Snapshot::detached_nodes`]). Ids are below this number.
     pub fn len(&self) -> u32 {
         self.store.len()
+    }
+
+    /// How many nodes in the arena a rescan replaced and cut off from the
+    /// tree. They keep their ids and their numbers, but nothing reachable
+    /// from the root leads to them. Space is not given back until the tree is
+    /// built again by a full scan.
+    pub fn detached_nodes(&self) -> u64 {
+        self.store.meta.detached
     }
 
     /// Whether the tree has no nodes (the scan root has not arrived).
@@ -187,11 +218,29 @@ impl Snapshot {
             node: NodeId(node),
             what,
         };
+        // Nodes a rescan cut off: their tops have a detached parent, and so
+        // does everything below. They are not part of the tree and are left
+        // out of the checks below, except that they must be accounted for.
+        let mut cut_off = vec![false; s.len() as usize];
+        let mut cut_off_count = 0u64;
         for id in 0..s.len() {
             let Some(me) = self.node(NodeId(id)) else {
                 return Err(bad(id, "node missing from its chunk"));
             };
             let parent = s.parent(id).unwrap_or(NONE);
+            let below_cut = parent != NONE
+                && parent != DETACHED
+                && cut_off.get(parent as usize).copied().unwrap_or(false);
+            if parent == DETACHED || below_cut {
+                if id == 0 {
+                    return Err(bad(id, "the root is cut off"));
+                }
+                if let Some(slot) = cut_off.get_mut(id as usize) {
+                    *slot = true;
+                }
+                cut_off_count += 1;
+                continue;
+            }
             if (id == 0) != (parent == NONE) {
                 return Err(bad(id, "only the root may lack a parent"));
             }
@@ -294,7 +343,87 @@ impl Snapshot {
                 return Err(bad(id, "deleted bytes exceed the counted bytes"));
             }
         }
+        if cut_off_count != s.meta.detached {
+            return Err(bad(0, "count of cut-off nodes is wrong"));
+        }
         Ok(())
+    }
+
+    /// The directories below `from` that hold at least `min_allocated` bytes
+    /// (as counted, size on disk), at most `max_depth` levels down, the
+    /// largest `limit` of them.
+    ///
+    /// `from` itself is not reported, and neither is a directory marked
+    /// moved-to-bin or deleted, nor anything below one, nor a folder the
+    /// reader made up. A directory and its large subdirectories are all
+    /// reported. `None` for unknown or cut-off nodes.
+    ///
+    /// A directory is never smaller than anything below it, so the search
+    /// does not enter a directory under `min_allocated`. Its cost is the
+    /// number of children of the directories that qualify, not the size of
+    /// the tree, plus a heap of `limit` entries.
+    pub fn large_dirs(
+        &self,
+        from: NodeId,
+        min_allocated: u64,
+        max_depth: u32,
+        limit: usize,
+    ) -> Option<LargeDirs> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        self.node(from)?;
+        if self.store.is_detached(from.0) {
+            return None;
+        }
+        // The worst entry kept is on top: smallest size, then highest id.
+        let mut heap: BinaryHeap<Reverse<(u64, Reverse<u32>, u32)>> = BinaryHeap::new();
+        let mut more = false;
+        let mut stack: Vec<(u32, u32)> = vec![(from.0, 0)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth >= max_depth {
+                continue;
+            }
+            let mut next = self.store.first_child(dir).unwrap_or(NONE);
+            while next != NONE {
+                let child = next;
+                next = self.store.next_sibling(child).unwrap_or(NONE);
+                if self.store.kind(child) != NodeKind::Dir
+                    || self.store.allocated(child) < min_allocated
+                    || self.store.delete_state(child) != DeleteState::None
+                    || self.store.synthetic.contains_key(&child)
+                {
+                    continue;
+                }
+                let found = (
+                    self.store.allocated(child),
+                    Reverse(child),
+                    depth.saturating_add(1),
+                );
+                if heap.len() < limit {
+                    heap.push(Reverse(found));
+                } else {
+                    more = true;
+                    match heap.peek() {
+                        Some(Reverse(worst)) if found > *worst => {
+                            heap.pop();
+                            heap.push(Reverse(found));
+                        }
+                        _ => {}
+                    }
+                }
+                stack.push((child, depth.saturating_add(1)));
+            }
+        }
+        let mut dirs: Vec<LargeDir> = heap
+            .into_iter()
+            .map(|Reverse((allocated, Reverse(id), depth))| LargeDir {
+                id: NodeId(id),
+                depth,
+                allocated,
+            })
+            .collect();
+        dirs.sort_by(|a, b| b.allocated.cmp(&a.allocated).then(a.id.0.cmp(&b.id.0)));
+        Some(LargeDirs { dirs, more })
     }
 
     /// Bytes of name data stored (including each name's length prefix).
@@ -403,11 +532,19 @@ impl<'a> NodeRef<'a> {
 
     /// The containing directory; `None` for the root.
     pub fn parent(&self) -> Option<NodeRef<'a>> {
-        let p = self.store.parent(self.id.0)?;
-        (p != NONE).then_some(NodeRef {
+        let p = self.store.live_parent(self.id.0)?;
+        Some(NodeRef {
             store: self.store,
             id: NodeId(p),
         })
+    }
+
+    /// A rescan replaced this node: it is still in the arena, with the
+    /// numbers it had, but no longer part of the tree. A view that holds its
+    /// id must move to a folder that is. Costs a walk up the node's
+    /// ancestors.
+    pub fn is_detached(&self) -> bool {
+        self.store.is_detached(self.id.0)
     }
 
     /// The children, most recently added first. Empty for non-directories.

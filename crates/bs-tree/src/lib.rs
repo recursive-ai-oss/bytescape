@@ -30,6 +30,10 @@
 //! * A hard-linked file is counted once, at the first name seen; later names
 //!   are flagged and add zero bytes. Entries without a file identity (some
 //!   filesystems have none) are never treated as hard links.
+//! * A finished tree can have one folder's contents replaced by a fresh scan
+//!   ([`Aggregator::begin_rescan`]). The folder keeps its id, name and place;
+//!   the old contents stay in the arena, cut off from the tree
+//!   ([`NodeRef::is_detached`]).
 //! * Deleting never removes nodes. Marks move bytes into "in bin" or
 //!   "deleted" totals that sit beside the counted sizes, so a layout built
 //!   from counted sizes stays valid, and undo restores everything exactly.
@@ -52,10 +56,12 @@ mod snapshot;
 mod store;
 mod types;
 
-pub use aggregator::{Aggregator, ApplierLimits, ApplyReport, FinishReport, SnapshotReader};
+pub use aggregator::{
+    Aggregator, ApplierLimits, ApplyReport, FinishReport, RescanReport, SnapshotReader,
+};
 pub use batch::{BATCH_FORMAT_VERSION, Batch, DECODE_MAX_EXPANSION, Entry, Meta, NameSpan, Record};
-pub use error::{ApplyError, BatchFull, DecodeError, DeleteError, Violation};
-pub use snapshot::{Children, FreeEstimate, NodeRef, Progress, Snapshot};
+pub use error::{ApplyError, BatchFull, DecodeError, DeleteError, RescanError, Violation};
+pub use snapshot::{Children, FreeEstimate, LargeDir, LargeDirs, NodeRef, Progress, Snapshot};
 pub use types::{
     ByteCount, Category, DeleteState, DeleteTotals, DirKey, FileKey, MAX_NAME_LEN, Moved,
     NodeFlags, NodeId, NodeKind, ReadErrorKind, ReadFailure,

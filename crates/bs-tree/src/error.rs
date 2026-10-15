@@ -34,6 +34,13 @@ pub enum ApplyError {
     NamePoolFull,
     /// The sum of all sizes does not fit in 64 bits.
     SizeOverflow,
+    /// A rescan was told which folder it covers, and the root record names a
+    /// different one (a link or mount may have replaced a part of the path
+    /// since). Nothing of that scan is applied and the tree is unchanged.
+    RescanRootMismatch,
+    /// A rescan could not replace the folder's contents because the tree's
+    /// own accounting did not add up. Nothing was changed.
+    RescanInconsistent,
 }
 
 impl fmt::Display for ApplyError {
@@ -53,6 +60,8 @@ impl fmt::Display for ApplyError {
             ApplyError::NodeIdsExhausted => "tree is full (node ids exhausted)",
             ApplyError::NamePoolFull => "name pool is full",
             ApplyError::SizeOverflow => "total size overflows 64 bits",
+            ApplyError::RescanRootMismatch => "the rescan root is not the folder being rescanned",
+            ApplyError::RescanInconsistent => "the folder's accounting did not add up",
         };
         f.write_str(text)
     }
@@ -101,6 +110,49 @@ impl fmt::Display for DeleteError {
 }
 
 impl std::error::Error for DeleteError {}
+
+/// Why a rescan could not begin. Nothing changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RescanError {
+    /// No such node.
+    UnknownNode(NodeId),
+    /// Only directories can be rescanned.
+    NotADirectory(NodeId),
+    /// The node was replaced by an earlier rescan (or lies below a node that
+    /// was), so it is no longer part of the tree.
+    Detached(NodeId),
+    /// The node or a folder above it is marked moved-to-bin or deleted.
+    /// There is nothing to rescan on disk, and the marks would be lost.
+    Marked(NodeId),
+    /// The scan that built the tree has not been finished yet; call
+    /// [`Aggregator::finish`](crate::Aggregator::finish) first.
+    ScanRunning,
+    /// Another rescan is in progress.
+    Busy,
+}
+
+impl fmt::Display for RescanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RescanError::UnknownNode(n) => write!(f, "no node {}", n.index()),
+            RescanError::NotADirectory(n) => write!(f, "node {} is not a directory", n.index()),
+            RescanError::Detached(n) => {
+                write!(f, "node {} was replaced by an earlier rescan", n.index())
+            }
+            RescanError::Marked(n) => {
+                write!(
+                    f,
+                    "node {} or a folder above it is marked deleted",
+                    n.index()
+                )
+            }
+            RescanError::ScanRunning => f.write_str("the scan has not been finished"),
+            RescanError::Busy => f.write_str("another rescan is in progress"),
+        }
+    }
+}
+
+impl std::error::Error for RescanError {}
 
 /// Why a serialized batch could not be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

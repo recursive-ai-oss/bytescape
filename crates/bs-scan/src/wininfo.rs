@@ -349,6 +349,54 @@ pub fn wtf8_from_utf16(units: impl IntoIterator<Item = u16>, out: &mut Vec<u8>) 
     }
 }
 
+/// The UTF-16 units of WTF-8 text, the inverse of [`wtf8_from_utf16`]. Bytes
+/// that are not well-formed (the text comes from a tree, which a damaged
+/// disk can fill with anything) become U+FFFD one at a time.
+pub fn utf16_from_wtf8(bytes: &[u8]) -> Vec<u16> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0usize;
+    while let Some(&lead) = bytes.get(at) {
+        let (len, first) = match lead {
+            0..=0x7F => (1usize, u32::from(lead)),
+            0xC2..=0xDF => (2, u32::from(lead & 0x1F)),
+            0xE0..=0xEF => (3, u32::from(lead & 0x0F)),
+            0xF0..=0xF4 => (4, u32::from(lead & 0x07)),
+            _ => (0, 0),
+        };
+        let mut code = first;
+        let mut ok = len != 0;
+        for k in 1..len {
+            match bytes.get(at.saturating_add(k)) {
+                Some(&c) if c & 0xC0 == 0x80 => code = (code << 6) | u32::from(c & 0x3F),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        let shortest = match len {
+            2 => 0x80,
+            3 => 0x800,
+            4 => 0x1_0000,
+            _ => 0,
+        };
+        if !ok || code < shortest || code > 0x10_FFFF {
+            out.push(0xFFFD);
+            at = at.saturating_add(1);
+            continue;
+        }
+        at = at.saturating_add(len);
+        if code >= 0x1_0000 {
+            let c = code - 0x1_0000;
+            out.push(0xD800 + (c >> 10) as u16);
+            out.push(0xDC00 + (c & 0x3FF) as u16);
+        } else {
+            out.push(code as u16);
+        }
+    }
+    out
+}
+
 fn push_code(code: u32, out: &mut Vec<u8>) {
     if code < 0x80 {
         out.push(code as u8);
@@ -683,6 +731,33 @@ mod tests {
         assert_eq!(utf8(&[0xD83D, b'x' as u16]), [0xED, 0xA0, 0xBD, b'x']);
     }
 
+    #[test]
+    fn wtf8_decodes_back_to_the_units_it_came_from() {
+        for s in [
+            "",
+            "plain",
+            "caf\u{e9}",
+            "\u{65e5}\u{672c}",
+            "emoji \u{1F600} end",
+        ] {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            assert_eq!(utf16_from_wtf8(&utf8(&units)), units, "{s}");
+        }
+        for units in [
+            vec![0xD800u16],
+            vec![0xDFFF, 0x61],
+            vec![0xD83D, 0x78],
+            vec![0xDC00, 0xD800],
+        ] {
+            assert_eq!(utf16_from_wtf8(&utf8(&units)), units);
+        }
+        // Not WTF-8: each bad byte stands for one replacement character.
+        assert_eq!(utf16_from_wtf8(&[0xFF, 0x61]), [0xFFFD, 0x61]);
+        assert_eq!(utf16_from_wtf8(&[0xE2, 0x82]), [0xFFFD, 0xFFFD]);
+        assert_eq!(utf16_from_wtf8(&[0xC0, 0x80]), [0xFFFD, 0xFFFD]);
+        assert_eq!(utf16_from_wtf8(&[0xF4, 0x90, 0x80, 0x80]).len(), 4);
+    }
+
     proptest! {
         #[test]
         fn any_buffer_is_handled_without_panic(buf in proptest::collection::vec(any::<u8>(), 0..400), extended in any::<bool>()) {
@@ -697,6 +772,12 @@ mod tests {
                     let _ = name_units(&buf, &r).count();
                 }
             }
+        }
+
+        #[test]
+        fn utf16_survives_the_round_trip_and_any_bytes_decode(units in proptest::collection::vec(any::<u16>(), 0..60), junk in proptest::collection::vec(any::<u8>(), 0..60)) {
+            prop_assert_eq!(utf16_from_wtf8(&utf8(&units)), units);
+            let _ = utf16_from_wtf8(&junk);
         }
 
         #[test]

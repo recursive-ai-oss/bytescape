@@ -14,6 +14,10 @@ use crate::types::{
 use std::sync::Arc;
 
 pub(crate) const NONE: u32 = u32::MAX;
+/// The parent of a node whose directory was rescanned and replaced: the node
+/// is still in the arena (ids are never reused) but no longer part of the
+/// tree. Never a valid node id.
+pub(crate) const DETACHED: u32 = u32::MAX - 1;
 
 pub(crate) const CHUNK_BITS: u32 = 10;
 pub(crate) const CHUNK_LEN: usize = 1 << CHUNK_BITS;
@@ -167,6 +171,8 @@ pub(crate) struct Meta {
     pub os_used: Option<u64>,
     pub rejected: u64,
     pub parked: u64,
+    /// Nodes left in the arena by rescans: no longer reachable from the root.
+    pub detached: u64,
 }
 
 /// Everything a reader needs. Cheap to clone: pointers to chunks and maps.
@@ -315,7 +321,7 @@ impl Store {
         max_nodes: u32,
     ) -> Result<NodeId, ApplyError> {
         let id = self.len;
-        if id >= max_nodes || id == NONE {
+        if id >= max_nodes || id >= DETACHED {
             return Err(ApplyError::NodeIdsExhausted);
         }
         let name = self.pool.intern(node.name)?;
@@ -347,6 +353,64 @@ impl Store {
             c.first_child[i & CHUNK_MASK as usize] = id;
         }
         Ok(NodeId(id))
+    }
+
+    /// Whether `id` is a node that a rescan replaced, or lies below one.
+    /// `false` for unknown ids.
+    pub(crate) fn is_detached(&self, id: u32) -> bool {
+        let mut at = id;
+        for _ in 0..=self.len {
+            match self.parent(at) {
+                None | Some(NONE) => return false,
+                Some(DETACHED) => return true,
+                Some(parent) => at = parent,
+            }
+        }
+        false
+    }
+
+    /// The parent of `id` if it is a node of the tree: `None` for the root,
+    /// for unknown ids and for the top of a detached subtree.
+    pub(crate) fn live_parent(&self, id: u32) -> Option<u32> {
+        self.parent(id).filter(|&p| p != NONE && p != DETACHED)
+    }
+
+    pub(crate) fn set_parent(&mut self, id: u32, parent: u32) {
+        if let Some((c, i)) = self.slot_mut(id) {
+            c.parent[i & CHUNK_MASK as usize] = parent;
+        }
+    }
+
+    pub(crate) fn set_first_child(&mut self, id: u32, child: u32) {
+        if let Some((c, i)) = self.slot_mut(id) {
+            c.first_child[i & CHUNK_MASK as usize] = child;
+        }
+    }
+
+    pub(crate) fn clear_flag(&mut self, id: u32, flag: NodeFlags) {
+        if let Some((c, i)) = self.slot_mut(id) {
+            c.bits[i & CHUNK_MASK as usize] &= !(flag.bits() & FLAG_BITS);
+        }
+    }
+
+    /// Overwrites what the scanner reports about a node itself.
+    pub(crate) fn set_description(&mut self, id: u32, mtime: i64, category: u8) {
+        if let Some((c, i)) = self.slot_mut(id) {
+            let i = i & CHUNK_MASK as usize;
+            c.mtime[i] = mtime;
+            c.category[i] = category;
+        }
+    }
+
+    /// Takes `delta` out of the totals of `id` only. The caller has checked
+    /// that the totals hold it.
+    pub(crate) fn sub_from(&mut self, id: u32, delta: ByteCount) {
+        if let Some((c, i)) = self.slot_mut(id) {
+            let i = i & CHUNK_MASK as usize;
+            c.logical[i] = c.logical[i].saturating_sub(delta.logical);
+            c.allocated[i] = c.allocated[i].saturating_sub(delta.allocated);
+            c.files[i] = c.files[i].saturating_sub(u32::try_from(delta.files).unwrap_or(u32::MAX));
+        }
     }
 
     /// Adds `delta` to the totals of `id` only.
