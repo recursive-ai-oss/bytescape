@@ -621,7 +621,8 @@ jobs:
     name: iouring-cold
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # 15 minutes for checkout and toolchain, 20 for the build, 60 for the run.
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -643,9 +644,13 @@ jobs:
         if: steps.script.outputs.present == 'true'
         timeout-minutes: 20
         run: cargo build --release --locked -p bs-scan --features iouring-bench --examples
+      # Two runs of the script, ten timed runs per case, caches dropped before
+      # each. On hosted runners it has taken 28 to 30 minutes and more (one run
+      # passed at 28; two stopped at a 30-minute limit after printing every
+      # table), so the limit is twice the fastest observed time.
       - name: io_uring statx experiment (cold, page cache + dentries + inodes dropped before every run)
         if: steps.script.outputs.present == 'true'
-        timeout-minutes: 30
+        timeout-minutes: 60
         env:
           BYTESCAPE_DISPOSABLE_HOST: "1"
           BENCH_RESULTS: ${{ runner.temp }}/uring-bench
