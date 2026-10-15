@@ -401,6 +401,24 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_whose_folder_moved_says_so_and_can_be_tried_again() {
+        let launcher = Arc::new(Launcher {
+            script: Mutex::new(Some(Err(ElevateError::Protocol(
+                bs_ipc::ClientError::Helper(bs_ipc::ErrorReport {
+                    code: bs_ipc::ErrorCode::RootMoved,
+                    message: "moved".into(),
+                }),
+            )))),
+        });
+        let scanner = HelperScanner::new(launcher);
+        let (_, finish) = run(&scanner);
+        let Finish::Ended(FastEnd::Failed(text)) = finish else {
+            panic!("{finish:?}");
+        };
+        assert_eq!(text, bs_ui::elevation::ROOT_MOVED);
+    }
+
+    #[test]
     fn a_helper_that_vanishes_part_way_is_a_failure_and_never_a_complete_tree() {
         let events: Vec<_> = batches().into_iter().map(|e| Ok(Some(e))).collect();
         let (scanner, _) = scripted(events, false);

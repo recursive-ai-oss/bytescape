@@ -416,6 +416,12 @@ pub enum ElevatedEnd {
     },
 }
 
+/// What to tell when the folder to scan was not the folder the helper had
+/// checked. Nothing was read; asking again judges the folder afresh, which
+/// the Full scan button (or the Unreadable block) offers again at once.
+pub const ROOT_MOVED: &str =
+    "The folder changed while it was being checked, so nothing was scanned. Try again.";
+
 /// What to tell when the administrator helper refuses a volume: a network
 /// share or remote file system, or a volume it could not identify. Used for
 /// a refused scan and a refused delete alike.
@@ -431,8 +437,38 @@ pub fn elevate_error_words(error: &bs_platform::elevate::ElevateError) -> Option
         {
             Some(REMOTE_VOLUME.to_string())
         }
+        ElevateError::Protocol(bs_ipc::ClientError::Helper(report))
+            if report.code == bs_ipc::ErrorCode::RootMoved =>
+        {
+            Some(ROOT_MOVED.to_string())
+        }
+        // These two carry a plain, path-free sentence from the helper that
+        // says why nothing was scanned; it is shown as a sentence, without the
+        // technical lead-in.
+        ElevateError::Protocol(bs_ipc::ClientError::Helper(report))
+            if matches!(
+                report.code,
+                bs_ipc::ErrorCode::Unsupported | bs_ipc::ErrorCode::Refused
+            ) =>
+        {
+            sentence(&report.message)
+        }
         _ => None,
     }
+}
+
+/// A helper's short message as a sentence: first letter up, a full stop at
+/// the end. `None` when there is nothing to say.
+fn sentence(message: &str) -> Option<String> {
+    let text = message.trim();
+    let mut chars = text.chars();
+    let first = chars.next()?;
+    let mut out: String = first.to_uppercase().collect();
+    out.push_str(chars.as_str());
+    if !out.ends_with(['.', '!', '?']) {
+        out.push('.');
+    }
+    Some(out)
 }
 
 /// What a refused item says.
@@ -550,6 +586,14 @@ pub fn end_from_error(
         {
             ElevatedEnd::Failed {
                 message: REMOTE_VOLUME.to_string(),
+                completed: done,
+            }
+        }
+        ElevateError::Protocol(bs_ipc::ClientError::Helper(report))
+            if report.code == bs_ipc::ErrorCode::RootMoved =>
+        {
+            ElevatedEnd::Failed {
+                message: ROOT_MOVED.to_string(),
                 completed: done,
             }
         }
@@ -685,6 +729,7 @@ mod tests {
             refusal_words(bs_platform::elevate::Refusal::Blocked),
             refusal_words(bs_platform::elevate::Refusal::RemoteVolume),
             REMOTE_VOLUME,
+            ROOT_MOVED,
         ];
         for text in all {
             let lower = text.to_lowercase();
@@ -701,6 +746,54 @@ mod tests {
                 message: "technical text from the helper".into(),
             },
         ))
+    }
+
+    #[test]
+    fn a_moved_root_says_so_and_invites_another_try() {
+        let words = elevate_error_words(&helper_error(bs_ipc::ErrorCode::RootMoved))
+            .expect("words of its own");
+        assert_eq!(words, ROOT_MOVED);
+        assert!(words.ends_with("Try again."));
+        // The full scan's failure keeps the normal result and names the cause.
+        let mut race = Race::start(true);
+        let Step::DropFast { message: Some(m) } = race.fast_finished(FastEnd::Failed(words)) else {
+            panic!("expected a message");
+        };
+        assert!(
+            m.contains("nothing was scanned") && m.contains("Try again."),
+            "{m}"
+        );
+        // The words do not depend on the helper's own text.
+        let end = end_from_error(helper_error(bs_ipc::ErrorCode::RootMoved), Vec::new());
+        assert!(matches!(end, ElevatedEnd::Failed { ref message, .. } if message == ROOT_MOVED));
+    }
+
+    #[test]
+    fn unsupported_and_refused_scans_show_the_helpers_sentence() {
+        for code in [bs_ipc::ErrorCode::Unsupported, bs_ipc::ErrorCode::Refused] {
+            let error = bs_platform::elevate::ElevateError::Protocol(bs_ipc::ClientError::Helper(
+                bs_ipc::ErrorReport {
+                    code,
+                    message:
+                        "this system cannot hold the scan to the folder, so nothing was scanned"
+                            .into(),
+                },
+            ));
+            let words = elevate_error_words(&error).expect("words");
+            assert_eq!(
+                words,
+                "This system cannot hold the scan to the folder, so nothing was scanned."
+            );
+            assert!(!words.contains("could not do it"));
+        }
+        // An empty message gives no words, so the generic line is used.
+        let empty = bs_platform::elevate::ElevateError::Protocol(bs_ipc::ClientError::Helper(
+            bs_ipc::ErrorReport {
+                code: bs_ipc::ErrorCode::Refused,
+                message: "  ".into(),
+            },
+        ));
+        assert_eq!(elevate_error_words(&empty), None);
     }
 
     #[test]
