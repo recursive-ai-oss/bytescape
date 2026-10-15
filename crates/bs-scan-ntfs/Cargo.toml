@@ -1,6 +1,6 @@
 [package]
 name = "bs-scan-ntfs"
-description = "Bytescape NTFS reader (Windows)."
+description = "Bytescape NTFS master file table reader."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,31 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[dependencies]
+bs-tree = { path = "../bs-tree" }
+bs-scan = { path = "../bs-scan" }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Setting extended attributes on a mounted NTFS volume (streams, flags).
+libc = "0.2"
+
+[features]
+# Tests that build NTFS images with `mkntfs` and `ntfs-3g` and compare the
+# reader with the walker and with `ntfsinfo`. They need the ntfs-3g tools and
+# a usable /dev/fuse, and fail loudly without them.
+image-tests = []
+
+[[test]]
+name = "differential"
+required-features = ["image-tests"]
+
+[[test]]
+name = "hostile"
+required-features = ["image-tests"]
 
 [lints]
 workspace = true

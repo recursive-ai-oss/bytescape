@@ -57,6 +57,17 @@ pub use scanner::{
 };
 pub use volume::{FixedVolume, StatvfsVolume, VolumeInfo};
 
+/// The rules the Windows walker applies to a directory entry (what a reparse
+/// point or cloud placeholder is, which attributes mean sparse or compressed,
+/// how names and times are converted), for other producers of the same
+/// entries.
+pub mod winrules {
+    pub use crate::wininfo::{
+        Classified, EntryClass, attr, classify, entry_flags, filetime_to_unix, is_plain_component,
+        wtf8_from_utf16,
+    };
+}
+
 #[cfg(target_os = "linux")]
 pub use linux::Walker;
 

@@ -9,7 +9,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 /// `FILE_ATTRIBUTE_*` values the walker looks at.
-pub(crate) mod attr {
+pub mod attr {
     pub const DIRECTORY: u32 = 0x10;
     pub const SPARSE_FILE: u32 = 0x200;
     pub const REPARSE_POINT: u32 = 0x400;
@@ -27,7 +27,7 @@ const TAG_CLOUD_MASK: u32 = 0xFFFF_0FFF;
 
 /// What a directory record is, for the walker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EntryClass {
+pub enum EntryClass {
     /// An ordinary file.
     File,
     /// An ordinary directory the walker may open and list.
@@ -40,7 +40,7 @@ pub(crate) enum EntryClass {
 
 /// What the walker does with a record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Classified {
+pub struct Classified {
     pub class: EntryClass,
     /// The entry is a cloud placeholder: sizes come from the listing only and
     /// the entry is never opened.
@@ -53,12 +53,12 @@ pub(crate) struct Classified {
     pub not_followed: bool,
 }
 
-pub(crate) fn is_cloud_tag(tag: u32) -> bool {
+pub fn is_cloud_tag(tag: u32) -> bool {
     tag & TAG_CLOUD_MASK == TAG_CLOUD
 }
 
 /// Decides what to do with a record from its attributes and reparse tag.
-pub(crate) fn classify(attributes: u32, reparse_tag: u32) -> Classified {
+pub fn classify(attributes: u32, reparse_tag: u32) -> Classified {
     let is_dir = attributes & attr::DIRECTORY != 0;
     let reparse = attributes & attr::REPARSE_POINT != 0;
     let placeholder =
@@ -84,7 +84,7 @@ pub(crate) fn classify(attributes: u32, reparse_tag: u32) -> Classified {
 /// came from a listing that gave no allocation size, so its allocated size
 /// was rounded up from the logical size: the tree then marks the entry and
 /// every directory above it, and no total built on the guess looks measured.
-pub(crate) fn entry_flags(class: &Classified, estimated: bool) -> bs_tree::NodeFlags {
+pub fn entry_flags(class: &Classified, estimated: bool) -> bs_tree::NodeFlags {
     use bs_tree::NodeFlags;
     let mut flags = NodeFlags::EMPTY;
     if class.placeholder {
@@ -203,7 +203,7 @@ fn i64_at(buf: &[u8], at: usize) -> Result<i64, ListError> {
 const EPOCH_GAP_SECS: i64 = 11_644_473_600;
 
 /// A Windows `FILETIME` (100 ns ticks since 1601) as Unix seconds.
-pub(crate) fn filetime_to_unix(ticks: i64) -> i64 {
+pub fn filetime_to_unix(ticks: i64) -> i64 {
     ticks.div_euclid(10_000_000).saturating_sub(EPOCH_GAP_SECS)
 }
 
@@ -304,7 +304,7 @@ pub(crate) fn name_units(buf: &[u8], rec: &DirRecord) -> impl Iterator<Item = u1
 /// the walker opens children by name relative to their parent, and a name
 /// with a separator in it would reach somewhere else; so a name that fails
 /// this is recorded as damaged and never opened.
-pub(crate) fn is_plain_component(units: &[u16]) -> bool {
+pub fn is_plain_component(units: &[u16]) -> bool {
     const BACKSLASH: u16 = b'\\' as u16;
     const SLASH: u16 = b'/' as u16;
     !units.is_empty()
@@ -331,7 +331,7 @@ pub(crate) fn join_path(dir: &[u16], name: &[u16]) -> Vec<u16> {
 /// Appends UTF-16 text to `out` as WTF-8: UTF-8, except that an unpaired
 /// surrogate (which Windows file names may contain) is written as the three
 /// bytes its code point would take, so no name is changed or lost.
-pub(crate) fn wtf8_from_utf16(units: impl IntoIterator<Item = u16>, out: &mut Vec<u8>) {
+pub fn wtf8_from_utf16(units: impl IntoIterator<Item = u16>, out: &mut Vec<u8>) {
     let mut units = units.into_iter().peekable();
     while let Some(u) = units.next() {
         let code = if (0xD800..0xDC00).contains(&u) {

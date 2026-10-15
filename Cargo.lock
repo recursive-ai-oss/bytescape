@@ -244,6 +244,12 @@ dependencies = [
 [[package]]
 name = "bs-scan-ntfs"
 version = "0.1.0"
+dependencies = [
+ "bs-scan",
+ "bs-tree",
+ "libc",
+ "proptest",
+]
 
 [[package]]
 name = "bs-scan-xfs"
