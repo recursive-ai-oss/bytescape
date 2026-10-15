@@ -195,7 +195,10 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
 
 fn main() -> ExitCode {
     let t0 = Instant::now();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Measurement-only: run without the screen-reader adapter.
+    let no_access = args.iter().any(|a| a == "--bench-no-access");
+    args.retain(|a| a != "--bench-no-access");
     let mode = match parse_args(&args) {
         Ok(m) => m,
         Err(e) => {
@@ -203,6 +206,14 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Still the only thread: the screen-reader setup changes the environment.
+    access::prepare(
+        no_access
+            || !matches!(
+                mode,
+                Mode::Interactive { .. } | Mode::FirstFrame { .. } | Mode::Live { .. }
+            ),
+    );
     match window::run(mode, t0) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

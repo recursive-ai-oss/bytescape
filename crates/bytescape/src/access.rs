@@ -1,8 +1,10 @@
 //! The bridge to the platform's screen-reader interface: UI Automation on
-//! Windows. Linux builds have no adapter yet (AT-SPI would bring a D-Bus
-//! client and an async runtime into the program), so there nothing attaches
-//! and no adapter is made.
+//! Windows and AT-SPI on Linux. On Linux the adapter is made only after both
+//! of the buses it talks to were checked to be local sockets (see
+//! `bs_platform::a11y_bus`); when that check refuses, the program runs
+//! without it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bs_ui::access::{AccessTree, ActionRequest};
@@ -24,8 +26,31 @@ impl From<accesskit_winit::Event> for UserEvent {
     }
 }
 
-/// Whether this build has a screen-reader interface to offer.
-pub const AVAILABLE: bool = cfg!(windows);
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a screen-reader adapter should be made for this run.
+pub fn available() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+/// Decides whether an adapter is made. On Linux this first checks the buses
+/// it would use and pins the accessibility bus address, which is why it must
+/// run at the start of `main`, before any thread exists. When a bus is
+/// refused, one line says so and the run goes on without the adapter. With
+/// `skip` set (measurements that compare against no adapter) nothing is
+/// checked and no adapter is made.
+pub fn prepare(skip: bool) {
+    if skip {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    match bs_platform::a11y_bus::pin_for_adapter() {
+        Ok(()) => ENABLED.store(true, Ordering::Relaxed),
+        Err(refusal) => eprintln!("bytescape: screen-reader support is off: {refusal}"),
+    }
+    #[cfg(windows)]
+    ENABLED.store(true, Ordering::Relaxed);
+}
 
 /// The adapter and what has been told to it.
 pub struct Access {

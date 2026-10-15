@@ -3,6 +3,8 @@
 //! launching the elevated helper, the light and dark, accent and
 //! reduced-motion settings, and local crash reports.
 
+#[cfg(target_os = "linux")]
+pub mod a11y_bus;
 pub mod appearance;
 pub mod bins;
 pub mod clipboard;

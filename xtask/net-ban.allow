@@ -6,8 +6,25 @@
 # interface only, and every entry names the windowing crate or crates that
 # pull the item in. An entry holds only while EVERY path to the item in the
 # dependency graph goes through one of those crates. It never applies to
-# anything in the dependency closure of `bytescape-helper`, and the async I/O
-# crate `async-io` can never be allowed.
+# anything in the dependency closure of `bytescape-helper`.
+#
+# The second kind is the Linux screen-reader adapter. `accesskit_unix` talks
+# AT-SPI over local D-Bus connections through `zbus` and `async-io`. These are
+# admitted only while every path to them goes through `accesskit_unix`, only
+# for Linux builds of the interface, and never in the helper. The condition is
+# that EVERY address the adapter connects to uses exactly the `unix` transport
+# (each `;`-separated entry; `unixexec`, `tcp`, `nonce-tcp`, `autolaunch` and
+# `launchd` are refused): the session bus (`DBUS_SESSION_BUS_ADDRESS`, or unset
+# with `$XDG_RUNTIME_DIR/bus`), `AT_SPI_BUS_ADDRESS`, and the reply of
+# `org.a11y.Bus.GetAddress`. The interface checks the AT-SPI address before it
+# creates the adapter and pins the checked address for the process, or runs
+# without the adapter. The library itself would also accept `tcp:` and
+# `unixexec:` addresses, so this check in the interface is what keeps the
+# adapter local.
+#
+# Every other socket, HTTP, TLS and DNS crate on the ban list can never be
+# allowed here, whatever `via` an entry names (see `never_allowed` in
+# xtask/src/net_ban.rs).
 #
 # Entry formats, one per line, with the reason after `#`:
 #
@@ -24,4 +41,6 @@
 #
 # Every added line also needs a maintainer's explicit approval.
 
-feature rustix/net via winit,softbuffer  # display server socket
+feature rustix/net via winit,softbuffer,accesskit_unix  # display server socket; session bus socket for screen readers
+crate zbus via accesskit_unix  # D-Bus client for the local session bus (screen readers)
+crate async-io via accesskit_unix  # event loop under zbus; local sockets only

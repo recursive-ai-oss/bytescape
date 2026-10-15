@@ -379,19 +379,84 @@ fn windowing_graph(extra_edge: &[Edge<'_>]) -> Value {
 }
 
 #[test]
-fn allow_entries_need_a_via_and_reject_the_never_allowed() {
+fn allow_entries_need_a_via() {
     let allow = net_ban::Allow::parse(
         "feature rustix/net\n\
-         crate async-io via winit\n\
          feature rustix via winit\n\
          crate x11rb via\n\
          source some/file.rs\n\
          feature rustix/net via winit,softbuffer  # ok\n",
     );
-    assert_eq!(allow.errors.len(), 4, "{:?}", allow.errors);
+    assert_eq!(allow.errors.len(), 3, "{:?}", allow.errors);
     assert_eq!(allow.entries.len(), 1);
     assert_eq!(allow.entries[0].via, vec!["winit", "softbuffer"]);
     assert!(allow.sources.contains("some/file.rs"));
+}
+
+#[test]
+fn no_allowlist_entry_can_admit_a_network_stack() {
+    // Every banned crate except the two the screen-reader adapter admits.
+    let mut names: Vec<String> = net_ban::BANNED_CRATES
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    names.extend([
+        "hickory-newthing".to_string(),
+        "trust-dns-newthing".to_string(),
+    ]);
+    let mut refused = 0;
+    for name in &names {
+        let allow = net_ban::Allow::parse(&format!("crate {name} via accesskit_unix\n"));
+        if net_ban::MAY_BE_ALLOWED.contains(&name.as_str()) {
+            assert!(allow.errors.is_empty(), "{name}: {:?}", allow.errors);
+            assert_eq!(allow.entries.len(), 1, "{name}");
+        } else {
+            refused += 1;
+            assert_eq!(allow.errors.len(), 1, "{name} must be refused");
+            assert!(allow.entries.is_empty(), "{name}");
+        }
+    }
+    for must in [
+        "reqwest",
+        "hyper",
+        "ureq",
+        "curl",
+        "rustls",
+        "native-tls",
+        "openssl",
+        "socket2",
+    ] {
+        assert!(net_ban::never_allowed(must), "{must}");
+    }
+    assert!(!net_ban::never_allowed("zbus") && !net_ban::never_allowed("async-io"));
+    assert!(refused >= 30, "{refused}");
+}
+
+#[test]
+fn an_entry_for_a_network_stack_is_refused_even_when_it_reaches_the_checker() {
+    // The checker repeats the rule, in case an entry is built another way.
+    let mut allow = net_ban::Allow::default();
+    allow.entries.push(net_ban::Entry {
+        kind: net_ban::Kind::Crate,
+        key: "reqwest".to_string(),
+        via: vec!["accesskit_unix".to_string()],
+        line: 1,
+    });
+    let doc = metadata_with_members(
+        &[
+            ("bytescape", &[], &[("accesskit_unix", None)]),
+            ("accesskit_unix", &[], &[("reqwest", None)]),
+            ("reqwest", &[], &[]),
+        ],
+        &["bytescape"],
+    );
+    let findings = net_ban::check_metadata(&doc, "t", &allow);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(
+        findings[0].message.contains("cannot be allowed"),
+        "{}",
+        findings[0]
+    );
 }
 
 #[test]
@@ -448,15 +513,137 @@ fn an_entry_never_applies_inside_the_helper_closure() {
     );
 }
 
+// ---- net-ban: the Linux screen-reader adapter ----
+
+const ADAPTER_ALLOW: &str = "crate zbus via accesskit_unix\n\
+                             crate async-io via accesskit_unix\n\
+                             feature rustix/net via winit,softbuffer,accesskit_unix\n";
+
+/// The interface reaches the bus crates only through `accesskit_unix`;
+/// `extra` adds edges so a test can add another path.
+fn adapter_graph(extra_ui: &[Edge<'_>], extra_helper: &[Edge<'_>]) -> Value {
+    let mut ui: Vec<Edge<'_>> = vec![("accesskit_unix", None)];
+    ui.extend_from_slice(extra_ui);
+    let mut helper: Vec<Edge<'_>> = vec![];
+    helper.extend_from_slice(extra_helper);
+    metadata_with_members(
+        &[
+            ("bytescape", &[], &ui),
+            ("bytescape-helper", &[], &helper),
+            ("accesskit_unix", &[], &[("zbus", None), ("async-io", None)]),
+            ("zbus", &[], &[("async-io", None), ("rustix", None)]),
+            ("async-io", &[], &[("rustix", None)]),
+            ("rustix", &["net"], &[]),
+        ],
+        &["bytescape", "bytescape-helper"],
+    )
+}
+
+#[test]
+fn the_adapter_entries_admit_the_bus_crates_only_through_accesskit_unix() {
+    let allow = net_ban::Allow::parse(ADAPTER_ALLOW);
+    assert!(allow.errors.is_empty(), "{:?}", allow.errors);
+    let doc = adapter_graph(&[], &[]);
+    assert_eq!(flagged(&doc), 3, "banned without the entries");
+    assert!(net_ban::check_metadata(&doc, "t", &allow).is_empty());
+}
+
+#[test]
+fn zbus_reached_by_another_path_is_still_flagged() {
+    let allow = net_ban::Allow::parse(ADAPTER_ALLOW);
+    // A second direct route from the interface to the bus crate.
+    let doc = adapter_graph(&[("zbus", None)], &[]);
+    let findings = net_ban::check_metadata(&doc, "t", &allow);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.subject == "zbus" && f.message.contains("another way")),
+        "{findings:?}"
+    );
+    // So is a crate that is not accesskit_unix pulling in async-io.
+    let doc = adapter_graph(&[("async-io", None)], &[]);
+    let findings = net_ban::check_metadata(&doc, "t", &allow);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.subject == "async-io" && f.message.contains("another way")),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn the_bus_crates_are_flagged_inside_the_helper_closure() {
+    let allow = net_ban::Allow::parse(ADAPTER_ALLOW);
+    for crate_name in ["zbus", "async-io", "accesskit_unix"] {
+        let doc = adapter_graph(&[], &[(crate_name, None)]);
+        let findings = net_ban::check_metadata(&doc, "t", &allow);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("bytescape-helper")),
+            "{crate_name}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn the_adapter_entries_do_not_admit_other_banned_crates() {
+    let allow = net_ban::Allow::parse(ADAPTER_ALLOW);
+    for banned in ["reqwest", "socket2", "dbus", "smol"] {
+        let doc = metadata_with_members(
+            &[
+                ("bytescape", &[], &[("accesskit_unix", None)]),
+                ("accesskit_unix", &[], &[(banned, None)]),
+                (banned, &[], &[]),
+            ],
+            &["bytescape"],
+        );
+        assert_eq!(
+            net_ban::check_metadata(&doc, "t", &allow).len(),
+            1,
+            "{banned} must stay banned"
+        );
+    }
+}
+
+#[test]
+fn the_shipped_allow_file_holds_exactly_the_reviewed_entries() {
+    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/net-ban.allow"))
+        .expect("net-ban.allow");
+    let allow = net_ban::Allow::parse(&text);
+    assert!(allow.errors.is_empty(), "{:?}", allow.errors);
+    let mut shipped: Vec<(String, Vec<String>)> = allow
+        .entries
+        .iter()
+        .map(|e| (e.key.clone(), e.via.clone()))
+        .collect();
+    shipped.sort();
+    let want = |key: &str, via: &[&str]| {
+        (
+            key.to_string(),
+            via.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        shipped,
+        vec![
+            want("async-io", &["accesskit-unix"]),
+            want("rustix/net", &["winit", "softbuffer", "accesskit-unix"]),
+            want("zbus", &["accesskit-unix"]),
+        ]
+    );
+    assert!(allow.sources.is_empty());
+}
+
 #[test]
 fn a_via_that_scopes_nothing_does_not_admit_the_item() {
     // `via` naming the item's own crate, or a workspace crate that holds the
     // dependency, removes every path to the item; that must not admit it.
     let direct = metadata_with_members(
         &[
-            ("bs-ui", &[], &[("rustix", None), ("socket2", None)]),
+            ("bs-ui", &[], &[("rustix", None), ("zbus", None)]),
             ("rustix", &["net"], &[]),
-            ("socket2", &[], &[]),
+            ("zbus", &[], &[]),
         ],
         &["bs-ui"],
     );
@@ -464,8 +651,8 @@ fn a_via_that_scopes_nothing_does_not_admit_the_item() {
         "feature rustix/net via rustix",
         "feature rustix/net via bs-ui",
         "feature rustix/net via winit,bs-ui",
-        "crate socket2 via socket2",
-        "crate socket2 via bs-ui",
+        "crate zbus via zbus",
+        "crate zbus via bs-ui",
     ] {
         let allow = net_ban::Allow::parse(&format!("{line}\n"));
         let findings = net_ban::check_metadata(&direct, "t", &allow);

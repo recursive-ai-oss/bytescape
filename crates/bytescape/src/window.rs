@@ -1297,7 +1297,7 @@ impl WinApp {
         self.timeline.push(("event_loop_running", at));
         // A screen-reader adapter has to be made before the window is first
         // shown, so the window starts hidden where one is used.
-        let with_access = access::AVAILABLE && !matches!(self.mode, Mode::Zoom(_));
+        let with_access = access::available() && !matches!(self.mode, Mode::Zoom(_));
         let mut attrs = Window::default_attributes()
             .with_title("Bytescape")
             .with_visible(!with_access);

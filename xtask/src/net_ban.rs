@@ -76,8 +76,21 @@ pub const BANNED_CRATES: [&str; 40] = [
 /// names). `deny.toml` lists the known members one by one.
 pub const BANNED_CRATE_PREFIXES: [&str; 2] = ["hickory-", "trust-dns-"];
 
-/// Crates that no allowlist entry can admit.
-pub const NEVER_ALLOWED: [&str; 1] = ["async-io"];
+/// The only banned crates an allowlist entry may admit, and only through a
+/// reviewed `via`: the Linux accessibility adapter (`accesskit_unix`) needs
+/// `zbus` and `async-io` to speak to the local session bus.
+pub const MAY_BE_ALLOWED: [&str; 2] = ["zbus", "async-io"];
+
+/// Is this a banned crate that no allowlist entry can admit? That is every
+/// banned crate except [`MAY_BE_ALLOWED`]: the HTTP, TLS, socket and DNS
+/// stacks, whatever `via` an entry gives. Nothing justifies them.
+pub fn never_allowed(name: &str) -> bool {
+    let banned = BANNED_CRATES.contains(&name)
+        || BANNED_CRATE_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+    banned && !MAY_BE_ALLOWED.contains(&name)
+}
 
 /// Crate features that open sockets: `(crate, feature)`.
 pub const BANNED_FEATURES: [(&str, &str); 13] = [
@@ -177,7 +190,7 @@ impl Allow {
                         allow
                             .errors
                             .push((line, String::from("`via` needs at least one crate")));
-                    } else if NEVER_ALLOWED.contains(&name.as_str()) {
+                    } else if never_allowed(&name) {
                         allow.errors.push((
                             line,
                             format!("`{name}` is banned for the application and cannot be allowed"),
@@ -562,7 +575,7 @@ pub fn check_metadata(metadata: &Value, target: &str, allow: &Allow) -> Vec<Find
             };
             let problem = match entry {
                 None => Some(format!("{what} ({target})")),
-                Some(_) if NEVER_ALLOWED.contains(&name.as_str()) => Some(format!(
+                Some(_) if never_allowed(&name) => Some(format!(
                     "banned for the application and cannot be allowed ({target})"
                 )),
                 Some(_) if helper_closure.contains(id) => Some(format!(
