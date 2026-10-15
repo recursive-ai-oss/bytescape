@@ -19,7 +19,7 @@ use crate::drives::{Drive, DriveKind};
 pub(crate) use bs_fsops::win::identity_of;
 use bs_fsops::win::{final_path, identity_of_handle, info_by_handle, open_nofollow, wide};
 use std::cell::{Cell, RefCell};
-use std::ffi::{OsStr, OsString, c_void};
+use std::ffi::{OsString, c_void};
 use std::io;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
@@ -619,8 +619,8 @@ fn move_out_of_bin(recycled: &Path, to: &Path) -> io::Result<()> {
     if unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), 0) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    if let Some(info) = winpure::info_for(&recycled.to_string_lossy()) {
-        let info = wide(OsStr::new(&info));
+    if let Some(info) = winpure::info_for(&units_of(recycled)) {
+        let info = wide(&OsString::from_wide(&info));
         // SAFETY: `info` is NUL-terminated and outlives the call.
         unsafe { DeleteFileW(info.as_ptr()) };
     }
@@ -689,11 +689,15 @@ impl Disposal {
         // The shell refuses the verbatim form (`\\?\C:\...`) that long paths and
         // canonical paths come in, so it is given the ordinary form. A path that
         // has no ordinary form is not handed over.
-        let Some(shell_path) = winpure::shell_path(&item.path.to_string_lossy()) else {
+        // It is built from the path's own 16-bit units: as text, a name with a
+        // lone surrogate would turn into a look-alike name, and the shell
+        // would recycle the look-alike.
+        let Some(shell_units) = winpure::shell_path(&units_of(&item.path)) else {
             return Outcome::Refused {
                 reason: RefuseReason::CannotResolve,
             };
         };
+        let shell_path = OsString::from_wide(&shell_units);
         let report = match recycle_through_shell(Path::new(&shell_path)) {
             Ok(report) => report,
             Err(error) => return Outcome::Failed { error },
@@ -814,9 +818,11 @@ impl Disposal {
         if !text.to_lowercase().contains(&marker) {
             return not_in_bin();
         }
-        let Some(info_path) = winpure::info_for(&text) else {
+        // The record is looked up under the item's own name, unit for unit.
+        let Some(info_units) = winpure::info_for(&units_of(&recycled.recycled)) else {
             return not_in_bin();
         };
+        let info_path = OsString::from_wide(&info_units);
         let record = read_small(Path::new(&info_path))
             .ok()
             .and_then(|bytes| winpure::parse_record(&bytes));

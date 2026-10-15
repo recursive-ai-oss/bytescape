@@ -199,21 +199,31 @@ pub(crate) fn fallback_for(error: &ScanError) -> Fallback {
 // ------------------------------------------------------------------ Linux
 
 /// Decides which reader runs for `requested` on `root`, given the mount table.
-/// `device_ok` says whether a device named by the table may be read raw.
-/// `requested_mounts` are the mount IDs the request names as further mounts of
-/// the drive; only those that are mounts of the same filesystem as `root`'s
-/// are kept.
+/// `device_ok` says whether a device named by the table, which the table gives
+/// the device number of, may be read raw. `requested_mounts` are the mount IDs
+/// the request names as further mounts of the drive; only those that are mounts
+/// of the same filesystem as `root`'s are kept.
+///
+/// `root_mount_id` is the mount ID that `statx` reports for `root` itself. The
+/// mount table is searched by path, and a path can be hidden: a mount placed
+/// over a shorter path covers the mounts below it, but the table still lists
+/// them. The table's mount is used only when it is the one `statx` says `root`
+/// is on; otherwise (or when the kernel gives no mount ID) the table does not
+/// describe what is there, so the walker reads it and no other mount is
+/// entered.
 #[cfg(target_os = "linux")]
 pub(crate) fn choose(
     requested: Backend,
     root: &Path,
     mounts: &[crate::mounts::Mount],
-    device_ok: &dyn Fn(&Path) -> bool,
+    device_ok: &dyn Fn(&Path, (u32, u32)) -> bool,
     requested_mounts: &[u64],
+    root_mount_id: Option<u64>,
 ) -> Plan {
     use crate::mounts::{already_shown_ids, at_exactly, containing, same_filesystem};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     let path = root.as_os_str().as_bytes();
+    let in_view = |m: &&crate::mounts::Mount| root_mount_id == Some(m.id);
     // Only mounts of the filesystem the scan is on may be entered, whatever
     // the request says: crossing into another filesystem is never allowed.
     // Nor is a mount that would show files the scan counts anyway: one that
@@ -222,6 +232,7 @@ pub(crate) fn choose(
     // judged from where this scan starts. The list comes from the interface,
     // which is not trusted to have got either right.
     let mount_ids: Vec<u64> = containing(mounts, path)
+        .filter(in_view)
         .map(|home| {
             let dropped: std::collections::HashSet<u64> =
                 already_shown_ids(mounts, home, path, requested_mounts)
@@ -260,7 +271,7 @@ pub(crate) fn choose(
         _ => return walker(Fallback::Unavailable),
     };
     // Each raw reader reads from where a filesystem is mounted.
-    let Some(mount) = at_exactly(mounts, path) else {
+    let Some(mount) = at_exactly(mounts, path).filter(in_view) else {
         return walker(unsuitable);
     };
     let Some(kind) = Kind::of(&mount.fs_type) else {
@@ -272,7 +283,7 @@ pub(crate) fn choose(
     let reader = match kind {
         Kind::Ext4 => {
             let device = PathBuf::from(std::ffi::OsString::from_vec(mount.source.clone()));
-            if !device_ok(&device) {
+            if !device_ok(&device, mount.device) {
                 return walker(unsuitable);
             }
             let others = mounts
@@ -337,16 +348,42 @@ impl Kind {
 }
 
 /// The device is read as the superuser, so it must be a block device under
-/// `/dev` that the mount table names.
+/// `/dev` that the mount table names, and its device number must be the one
+/// the table shows for the mount. A name in the table that leads to another
+/// device than the mounted one (a replaced node, a link) is not read.
 #[cfg(target_os = "linux")]
-pub(crate) fn is_block_device_under_dev(device: &Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
+pub(crate) fn is_block_device_under_dev(device: &Path, expected: (u32, u32)) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     device.starts_with("/dev")
         && std::fs::canonicalize(device)
             .ok()
             .filter(|real| real.starts_with("/dev"))
             .and_then(|real| std::fs::metadata(real).ok())
-            .is_some_and(|meta| meta.file_type().is_block_device())
+            .is_some_and(|meta| {
+                meta.file_type().is_block_device() && is_device_number(meta.rdev(), expected)
+            })
+}
+
+/// Whether the device number `rdev` is `major:minor`.
+#[cfg(target_os = "linux")]
+fn is_device_number(rdev: u64, expected: (u32, u32)) -> bool {
+    (libc::major(rdev), libc::minor(rdev)) == expected
+}
+
+/// The mount ID that `statx` reports for the folder `root`, if the kernel
+/// reports one (Linux 5.8 and later).
+#[cfg(target_os = "linux")]
+fn mount_id_of(root: &Path) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    // The folder is held open while it is asked about, and is not followed if
+    // it has become a link since it was resolved.
+    let folder = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)
+        .ok()?;
+    bs_fsops::remove::fstat(folder.as_raw_fd()).ok()?.mnt
 }
 
 /// The plan for a scan on this computer.
@@ -366,6 +403,7 @@ pub(crate) fn plan_for(
         &mounts,
         &is_block_device_under_dev,
         requested_mounts,
+        mount_id_of(root),
     )
 }
 
@@ -865,6 +903,20 @@ mod tests {
         use crate::mounts::{self, Mount};
         use crate::testutil::Fixture;
 
+        /// [`choose`] for a root that the kernel reports on the mount the
+        /// table says holds it (nothing hidden): the ordinary case.
+        fn choose_in_view(
+            requested: Backend,
+            root: &Path,
+            mounts: &[Mount],
+            device_ok: &dyn Fn(&Path, (u32, u32)) -> bool,
+            requested_mounts: &[u64],
+        ) -> Plan {
+            use std::os::unix::ffi::OsStrExt;
+            let view = mounts::containing(mounts, root.as_os_str().as_bytes()).map(|m| m.id);
+            choose(requested, root, mounts, device_ok, requested_mounts, view)
+        }
+
         const TABLE: &str = "\
 22 1 8:2 / / rw - ext4 /dev/sda2 rw
 23 22 8:3 / /data rw - ext4 /dev/sda3 rw
@@ -884,12 +936,12 @@ mod tests {
             mounts::parse(TABLE.as_bytes())
         }
 
-        fn anything_under_dev(device: &Path) -> bool {
+        fn anything_under_dev(device: &Path, _: (u32, u32)) -> bool {
             device.starts_with("/dev")
         }
 
         fn choose_for(requested: Backend, root: &str) -> Plan {
-            choose(
+            choose_in_view(
                 requested,
                 Path::new(root),
                 &table(),
@@ -998,18 +1050,146 @@ mod tests {
 
         #[test]
         fn a_device_the_check_refuses_is_not_read() {
-            let plan = choose(Backend::Auto, Path::new("/data"), &table(), &|_| false, &[]);
+            let plan = choose_in_view(
+                Backend::Auto,
+                Path::new("/data"),
+                &table(),
+                &|_, _| false,
+                &[],
+            );
             assert_eq!(plan.backend, Backend::Walker);
             assert!(matches!(plan.reader, Reader::Walker));
             // The check is for raw block devices; the ioctl readers have none.
-            let plan = choose(Backend::Auto, Path::new("/btr"), &table(), &|_| false, &[]);
+            let plan = choose_in_view(
+                Backend::Auto,
+                Path::new("/btr"),
+                &table(),
+                &|_, _| false,
+                &[],
+            );
             assert_eq!(plan.backend, Backend::Btrfs);
+        }
+
+        #[test]
+        fn a_mount_the_scan_root_is_not_on_is_not_the_one_chosen() {
+            // The table lists a mount at /data, but `statx` says the folder is
+            // on another mount (something was mounted over a shorter path and
+            // hides it, or the table is not this namespace's). The table does
+            // not describe what is there: no raw reader, no further mounts.
+            let table = table();
+            let data = mounts::at_exactly(&table, b"/data").unwrap().id;
+            let btr = mounts::at_exactly(&table, b"/btr").unwrap().id;
+            let hidden_under = 999;
+            let by = |root: &str, requested: Backend, extra: &[u64], view: Option<u64>| {
+                choose(
+                    requested,
+                    Path::new(root),
+                    &table,
+                    &anything_under_dev,
+                    extra,
+                    view,
+                )
+            };
+            // On the mount the table names: the reader is chosen.
+            let plan = by("/data", Backend::Auto, &[], Some(data));
+            assert_eq!(plan.backend, Backend::Ext4);
+            let plan = by("/btr", Backend::Auto, &[28], Some(btr));
+            assert_eq!((plan.backend, plan.mount_ids), (Backend::Btrfs, vec![28]));
+            // On another mount, or on one the kernel does not name.
+            for view in [Some(hidden_under), Some(btr), Some(0), None] {
+                for requested in [Backend::Auto, Backend::Ext4] {
+                    let plan = by("/data", requested, &[], view);
+                    assert_eq!(plan.backend, Backend::Walker, "{view:?} {requested:?}");
+                    assert!(matches!(plan.reader, Reader::Walker));
+                }
+            }
+            // An explicit request says it was not used; the automatic choice
+            // has nothing to explain.
+            assert_eq!(
+                by("/data", Backend::Ext4, &[], Some(hidden_under)).fallback,
+                Fallback::NotSupported
+            );
+            assert_eq!(
+                by("/data", Backend::Auto, &[], Some(hidden_under)).fallback,
+                Fallback::None
+            );
+            // The mounts of the same filesystem are not entered either: they
+            // were found under a mount that is not in view.
+            for requested in [Backend::Auto, Backend::Walker, Backend::Btrfs] {
+                let plan = by("/btr", requested, &[28, 29], Some(hidden_under));
+                assert!(plan.mount_ids.is_empty(), "{requested:?}");
+                assert_eq!(plan.backend, Backend::Walker);
+                let plan = by("/btr", requested, &[28, 29], None);
+                assert!(plan.mount_ids.is_empty(), "{requested:?} on an old kernel");
+            }
+            // A folder inside a mount is judged by the mount that holds it.
+            let plan = by("/btr/folder", Backend::Walker, &[28], Some(btr));
+            assert_eq!(plan.mount_ids, vec![28]);
+            let plan = by("/btr/folder", Backend::Walker, &[28], Some(hidden_under));
+            assert!(plan.mount_ids.is_empty());
+        }
+
+        #[test]
+        fn a_device_is_read_raw_only_when_it_is_the_one_the_table_shows_for_the_mount() {
+            // The table shows 8:3 for /data and 8:2 for /; the check is given
+            // the number of the mount that holds the root.
+            let asked = std::cell::RefCell::new(Vec::new());
+            let record = |device: &Path, number: (u32, u32)| {
+                asked.borrow_mut().push((device.to_path_buf(), number));
+                true
+            };
+            let plan = choose_in_view(Backend::Auto, Path::new("/data"), &table(), &record, &[]);
+            assert_eq!(plan.backend, Backend::Ext4);
+            assert_eq!(*asked.borrow(), vec![(PathBuf::from("/dev/sda3"), (8, 3))]);
+            // A check that finds another number refuses the device.
+            let wrong = |_: &Path, number: (u32, u32)| number != (8, 3);
+            let plan = choose_in_view(Backend::Auto, Path::new("/data"), &table(), &wrong, &[]);
+            assert_eq!(plan.backend, Backend::Walker);
+            assert!(matches!(plan.reader, Reader::Walker));
+        }
+
+        #[test]
+        fn device_numbers_are_compared_as_major_and_minor() {
+            for (major, minor) in [(8u32, 3u32), (259, 1), (253, 0), (0, 0), (4095, 1_048_575)] {
+                let rdev = libc::makedev(major, minor);
+                assert!(is_device_number(rdev, (major, minor)));
+                assert!(!is_device_number(rdev, (major, minor ^ 1)));
+                assert!(!is_device_number(rdev, (major ^ 1, minor)));
+                assert!(!is_device_number(rdev, (minor, major)) || major == minor);
+            }
+        }
+
+        #[test]
+        fn a_real_block_device_passes_only_with_its_own_number() {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            let Some(device) = std::fs::read_dir("/dev")
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| {
+                    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_block_device())
+                })
+            else {
+                return println!("NOT RUN: there is no block device node in /dev here");
+            };
+            let rdev = std::fs::metadata(&device).unwrap().rdev();
+            let number = (libc::major(rdev), libc::minor(rdev));
+            assert!(is_block_device_under_dev(&device, number), "{device:?}");
+            assert!(!is_block_device_under_dev(
+                &device,
+                (number.0, number.1 ^ 1)
+            ));
+            assert!(!is_block_device_under_dev(
+                &device,
+                (number.0 ^ 1, number.1)
+            ));
         }
 
         #[test]
         fn only_mounts_of_the_scan_roots_own_filesystem_may_be_entered() {
             let ids = |requested: &[u64], root: &str, backend| {
-                choose(
+                choose_in_view(
                     backend,
                     Path::new(root),
                     &table(),
@@ -1038,7 +1218,7 @@ mod tests {
             // Nothing requested, nothing entered.
             assert!(ids(&[], "/btr", Backend::Auto).is_empty());
             // A root the table does not know cannot vouch for any mount.
-            let nowhere = choose(
+            let nowhere = choose_in_view(
                 Backend::Walker,
                 Path::new("relative"),
                 &table(),
@@ -1046,7 +1226,7 @@ mod tests {
                 &[28],
             );
             assert!(nowhere.mount_ids.is_empty());
-            let unreadable = choose(
+            let unreadable = choose_in_view(
                 Backend::Walker,
                 Path::new("/btr"),
                 &[],
@@ -1079,7 +1259,7 @@ mod tests {
 ";
             let table = mounts::parse(text.as_bytes());
             let ids = |root: &str, requested: &[u64]| {
-                choose(
+                choose_in_view(
                     Backend::Walker,
                     Path::new(root),
                     &table,
@@ -1116,7 +1296,7 @@ mod tests {
 3 1 0:27 / /mnt/top rw - btrfs /dev/sda3 rw
 ";
             let ids = |text: &str, requested: &[u64]| {
-                choose(
+                choose_in_view(
                     Backend::Walker,
                     Path::new("/"),
                     &mounts::parse(text.as_bytes()),
@@ -1139,11 +1319,17 @@ mod tests {
         fn only_block_devices_under_dev_pass_the_real_check() {
             let fx = Fixture::new("device-check");
             fx.write("not-a-device", "x");
-            assert!(!is_block_device_under_dev(&fx.p("not-a-device")));
-            assert!(!is_block_device_under_dev(Path::new("/etc/passwd")));
-            assert!(!is_block_device_under_dev(Path::new("/dev/null")));
-            assert!(!is_block_device_under_dev(Path::new("/dev/does-not-exist")));
-            assert!(!is_block_device_under_dev(Path::new("/dev/../etc/passwd")));
+            assert!(!is_block_device_under_dev(&fx.p("not-a-device"), (0, 0)));
+            assert!(!is_block_device_under_dev(Path::new("/etc/passwd"), (0, 0)));
+            assert!(!is_block_device_under_dev(Path::new("/dev/null"), (0, 0)));
+            assert!(!is_block_device_under_dev(
+                Path::new("/dev/does-not-exist"),
+                (0, 0)
+            ));
+            assert!(!is_block_device_under_dev(
+                Path::new("/dev/../etc/passwd"),
+                (0, 0)
+            ));
         }
 
         #[test]

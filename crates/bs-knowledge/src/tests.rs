@@ -426,7 +426,7 @@ fn protected_entries_have_notes_and_blocked_ones_may_not_need_them() {
 
 // ------------------------------------------------------- the blocked list
 
-const BLOCKED_WINDOWS: [&str; 11] = [
+const BLOCKED_WINDOWS: [&str; 21] = [
     r"C:\Windows",
     r"C:\Windows\System32\config\SAM",
     r"C:\Program Files",
@@ -434,17 +434,34 @@ const BLOCKED_WINDOWS: [&str; 11] = [
     r"C:\Program Files (Arm)",
     r"C:\System Volume Information",
     r"D:\System Volume Information\x",
+    // The boot loader and recovery, wherever they sit on a drive.
+    r"C:\Boot",
+    r"C:\Boot\BCD",
+    r"c:\BOOT\en-US\bootmgr.exe.mui",
+    r"C:\EFI",
+    r"D:\EFI\Microsoft\Boot\bootmgfw.efi",
+    r"C:\Recovery",
+    r"C:\Recovery\WindowsRE\Winre.wim",
+    r"E:\Recovery",
+    r"C:\bootmgr",
+    r"d:\BootMgr",
     r"C:\",
     r"d:\",
     "C:",
     "E:/",
 ];
 
-const BLOCKED_LINUX: [&str; 17] = [
+const BLOCKED_LINUX: [&str; 22] = [
     "/",
     "/usr",
     "/usr/share/x",
     "/boot",
+    // The boot loader partition, wherever the system mounts it.
+    "/efi",
+    "/efi/EFI",
+    "/efi/EFI/systemd",
+    "/efi/loader/entries",
+    "/boot/efi/EFI",
     "/etc/passwd",
     "/bin",
     "/bin/sh",
@@ -475,6 +492,29 @@ fn every_listed_os_root_is_blocked_with_and_without_an_environment() {
 }
 
 #[test]
+fn names_that_only_look_like_the_boot_places_are_not_blocked() {
+    for k in [full(), bare()] {
+        for path in [
+            r"C:\Boot2",
+            r"C:\Boots\x",
+            r"C:\EFIs",
+            r"C:\Recovery.txt",
+            r"C:\bootmgr.bak",
+            r"C:\bootmgr\x",
+            r"C:\data\Boot",
+            r"C:\data\Recovery\x",
+        ] {
+            assert!(level(k, path) < Level::Blocked, "{path}");
+        }
+    }
+    for k in [linux_full(), linux_bare()] {
+        for path in ["/efi-backup", "/efis/x", "/home/a/efi", "/srv/efi/EFI"] {
+            assert!(level(k, path) < Level::Blocked, "{path}");
+        }
+    }
+}
+
+#[test]
 fn the_blocked_roots_are_in_the_table() {
     let blocked: HashSet<&str> = protected_entries()
         .iter()
@@ -490,10 +530,15 @@ fn the_blocked_roots_are_in_the_table() {
         "%ProgramFiles(Arm)%",
         "?:/System Volume Information",
         "?:",
+        "?:/Boot",
+        "?:/EFI",
+        "?:/Recovery",
+        "?:/bootmgr",
         // Linux
         "/",
         "/usr",
         "/boot",
+        "/efi",
         "/etc",
         "/bin",
         "/sbin",
@@ -521,7 +566,20 @@ fn the_roots_themselves_are_exact_and_the_system_folders_are_subtrees() {
     };
     assert!(entry("/").exact && entry("?:").exact);
     assert!(entry("C:/Program Files").exact);
-    for pattern in ["/usr", "/etc", "/boot", "/proc", "C:/Windows"] {
+    // The boot manager is one file; the other boot and recovery places are
+    // folders and blocked with everything in them.
+    assert!(entry("?:/bootmgr").exact);
+    for pattern in [
+        "/usr",
+        "/etc",
+        "/boot",
+        "/efi",
+        "/proc",
+        "C:/Windows",
+        "?:/Boot",
+        "?:/EFI",
+        "?:/Recovery",
+    ] {
         assert!(!entry(pattern).exact, "{pattern}");
     }
 }
@@ -1883,7 +1941,20 @@ proptest! {
 
     #[test]
     fn nothing_under_a_blocked_folder_escapes_its_level(name in "[a-z0-9 _.-]{0,40}") {
-        for root in ["/usr", "/etc", "/boot", "/proc", "/sys", "/dev", "/bin", r"C:\Windows"] {
+        for root in [
+            "/usr",
+            "/etc",
+            "/boot",
+            "/efi",
+            "/proc",
+            "/sys",
+            "/dev",
+            "/bin",
+            r"C:\Windows",
+            r"C:\Boot",
+            r"C:\EFI",
+            r"C:\Recovery",
+        ] {
             let sep = if root.starts_with('/') { "/" } else { "\\" };
             let path = format!("{root}{sep}{name}");
             prop_assert_eq!(level(full(), &path), Level::Blocked, "{}", path);

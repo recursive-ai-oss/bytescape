@@ -190,3 +190,57 @@ fn a_mounted_tmpfs_is_found_in_the_mount_table() {
     let here = bytescape_helper::mounts::at_exactly(&mounts, fx.p("mnt").as_os_str().as_bytes());
     assert_eq!(here.map(|m| m.fs_type.as_str()), Some("tmpfs"));
 }
+
+#[test]
+fn a_mount_hidden_by_a_mount_over_a_shorter_path_is_not_the_one_the_scan_uses() {
+    // A is mounted at a/b, a subfolder of A is mounted on its own folder (a
+    // mount the scan has to enter), and then B is mounted over `a`, hiding all
+    // of it. The table still lists A where it was; the folder a/b is now B's.
+    use bytescape_helper::mounts::{at_exactly, containing, parse};
+    use bytescape_helper::scan::{Host, plan_summary};
+    let fx = Fixture::new("overmount");
+    fx.mkdir("ovm/a/b");
+    let base = fs::canonicalize(fx.p("ovm")).unwrap();
+    let (a, b) = (base.join("a"), base.join("a/b"));
+    let Some(_inner) = mount_tmpfs(&b) else {
+        return not_run("cannot mount a tmpfs here");
+    };
+    fs::create_dir(b.join("sub")).unwrap();
+    fs::write(b.join("mark"), "A").unwrap();
+    let Some(_sub) = bind_mount(&b.join("sub"), &b.join("sub")) else {
+        return not_run("cannot make a bind mount here");
+    };
+    let id_at = |path: &Path| {
+        let table = parse(&fs::read("/proc/self/mountinfo").unwrap());
+        at_exactly(&table, path.as_os_str().as_bytes()).map(|m| m.id)
+    };
+    let sub_id = id_at(&b.join("sub")).unwrap();
+    let hidden_id = id_at(&b).unwrap();
+    let host = Host::system();
+    // Nothing hidden yet: the mount of the subfolder is entered.
+    let (_, _, ids) = plan_summary(bs_ipc::Backend::Walker, &b, &host, &[sub_id]);
+    assert_eq!(ids, vec![sub_id]);
+    let Some(_over) = mount_tmpfs(&a) else {
+        return not_run("cannot mount over a folder here");
+    };
+    fs::create_dir(b.clone()).unwrap();
+    fs::write(b.join("mark"), "B").unwrap();
+    // The folder shows B, but the table's longest mount point for it is A's.
+    assert_eq!(fs::read_to_string(b.join("mark")).unwrap(), "B");
+    let table = parse(&fs::read("/proc/self/mountinfo").unwrap());
+    let by_table = containing(&table, b.join("mark").as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        by_table.id, hidden_id,
+        "the table alone points at the hidden mount"
+    );
+    assert_eq!(
+        at_exactly(&table, b.as_os_str().as_bytes()).unwrap().id,
+        hidden_id
+    );
+    // The hidden mount is no longer chosen: nothing is entered because of it.
+    for backend in [bs_ipc::Backend::Walker, bs_ipc::Backend::Auto] {
+        let (ran, _, ids) = plan_summary(backend, &b, &host, &[sub_id]);
+        assert!(ids.is_empty(), "{backend:?}: {ids:?}");
+        assert_eq!(ran, bs_ipc::Backend::Walker);
+    }
+}

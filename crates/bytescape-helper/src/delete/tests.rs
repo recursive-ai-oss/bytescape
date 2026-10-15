@@ -355,6 +355,28 @@ fn blocked_places_are_blocked_in_every_spelling() {
 }
 
 #[test]
+fn the_boot_loader_is_refused_wherever_the_system_mounts_it() {
+    // A permanent delete of the boot loader partition's contents needs no
+    // hold-to-confirm to reach the helper: the helper itself refuses it.
+    let lab = Lab::new("boot-loader");
+    let judge = lab.judge();
+    for path in [
+        "/efi",
+        "/efi/EFI",
+        "/efi/EFI/systemd",
+        "/efi/loader/entries",
+        "/boot/efi/EFI",
+    ] {
+        let mut asked = item(Path::new(path));
+        // Not even a confirmed protected path is enough for a blocked one.
+        asked.confirmed_protected = true;
+        let outcomes = run(&judge, &request(vec![asked]));
+        assert_eq!(refusal(&outcomes[0]), Refusal::Blocked, "{path}");
+        assert_eq!(judge.level_of(Path::new(path)), Level::Blocked, "{path}");
+    }
+}
+
+#[test]
 fn the_real_place_is_judged_as_well_as_the_text() {
     let lab = Lab::new("real-place");
     lab.mkdir("holder/inner-root/x");

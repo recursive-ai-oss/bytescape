@@ -8,7 +8,9 @@ use std::path::Path;
 
 #[cfg(test)]
 pub(crate) use bs_fsops::winpath::same_path;
-pub(crate) use bs_fsops::winpath::{fold, strip_extended_prefix};
+#[cfg(test)]
+pub(crate) use bs_fsops::winpath::strip_extended_prefix;
+use bs_fsops::winpath::{fold_units, is_inside_units, strip_extended_prefix_units};
 
 /// Why the Recycle Bin would not take an item, if it would not.
 ///
@@ -56,18 +58,29 @@ pub(crate) fn same_place(original: &str, path: &[u16]) -> bool {
     bs_fsops::winpath::same_path_units(&original, path)
 }
 
+/// The 16-bit units of a path. Paths are compared and handed to the shell as
+/// units, never as text: a name can hold a lone surrogate that text would turn
+/// into U+FFFD, which is the name of a different file.
+#[cfg(windows)]
+pub(crate) fn units_of_path(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().collect()
+}
+
+/// The units of a path on a system whose paths are not 16-bit; only the tests
+/// of the pure rules run there.
+#[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn units_of_path(path: &Path) -> Vec<u16> {
+    path.to_string_lossy().encode_utf16().collect()
+}
+
 /// Whether `path` is `root` or lies below it, comparing as Windows does:
-/// without regard to case, to `/` against `\`, or to the `\\?\` prefix.
+/// without regard to case, to `/` against `\`, or to the `\\?\` prefix, and
+/// by exact 16-bit units.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn is_inside(root: &str, path: &str) -> bool {
-    let norm = |text: &str| fold(&strip_extended_prefix(text)).replace('/', "\\");
-    let root = norm(root);
-    let root = root.trim_end_matches('\\');
-    let path = norm(path);
-    path == root
-        || path
-            .strip_prefix(root)
-            .is_some_and(|rest| rest.starts_with('\\'))
+pub(crate) fn is_inside(root: &[u16], path: &[u16]) -> bool {
+    is_inside_units(root, path)
 }
 
 /// The form of a path the shell's item parser accepts. It refuses the verbatim
@@ -75,28 +88,48 @@ pub(crate) fn is_inside(root: &str, path: &str) -> bool {
 /// UNC path becomes `\\host\share\...`. Forward slashes become backslashes. A
 /// path that still has a verbatim or device prefix (`\\?\Volume{...}`,
 /// `\\.\`) cannot be turned into an ordinary one, and gives `None`.
-pub(crate) fn shell_path(path: &str) -> Option<String> {
-    let plain = strip_extended_prefix(path).replace('/', "\\");
+///
+/// Every unit is kept as it is, so the shell is asked for the item that was
+/// chosen and not for a look-alike.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn shell_path(path: &[u16]) -> Option<Vec<u16>> {
+    const BACKSLASH: u16 = b'\\' as u16;
+    const SLASH: u16 = b'/' as u16;
+    const QUESTION: u16 = b'?' as u16;
+    const DOT: u16 = b'.' as u16;
+    let plain: Vec<u16> = strip_extended_prefix_units(path)
+        .into_iter()
+        .map(|unit| if unit == SLASH { BACKSLASH } else { unit })
+        .collect();
     let ordinary = !plain.is_empty()
-        && !plain.starts_with(r"\\?\")
-        && !plain.starts_with(r"\\.\")
-        && !plain.contains('\0');
+        && !matches!(
+            plain.as_slice(),
+            [BACKSLASH, BACKSLASH, QUESTION | DOT, BACKSLASH, ..]
+        )
+        && !plain.contains(&0);
     ordinary.then_some(plain)
 }
 
 /// The drive that holds a path: the one whose root is the longest match.
 pub(crate) fn drive_for<'a>(drives: &'a [Drive], path: &Path) -> Option<&'a Drive> {
-    let path = fold(&strip_extended_prefix(&path.to_string_lossy())).replace('/', "\\");
+    drive_for_units(drives, &units_of_path(path))
+}
+
+/// [`drive_for`] for a path held as 16-bit units.
+pub(crate) fn drive_for_units<'a>(drives: &'a [Drive], path: &[u16]) -> Option<&'a Drive> {
     drives
         .iter()
         .filter_map(|drive| {
-            let root = fold(&drive.mount_point.to_string_lossy()).replace('/', "\\");
-            let root = root.trim_end_matches('\\');
-            let inside = path == root
-                || path
-                    .strip_prefix(root)
-                    .is_some_and(|rest| rest.starts_with('\\'));
-            inside.then_some((root.len(), drive))
+            let root = units_of_path(&drive.mount_point);
+            if !is_inside_units(&root, path) {
+                return None;
+            }
+            // Longer roots are the more specific ones.
+            let length = fold_units(&strip_extended_prefix_units(&root))
+                .iter()
+                .rposition(|unit| *unit != u16::from(b'\\') && *unit != u16::from(b'/'))
+                .map_or(0, |last| last + 1);
+            Some((length, drive))
         })
         .max_by_key(|(length, _)| *length)
         .map(|(_, drive)| drive)
@@ -162,12 +195,23 @@ pub(crate) fn parse_record(bytes: &[u8]) -> Option<RecycleRecord> {
 }
 
 /// The `$I` file that goes with a recycled `$R` file: same name with the
-/// letter after the dollar sign changed. `None` for any other name.
-pub(crate) fn info_for(recycled: &str) -> Option<String> {
-    let split = recycled.rfind(['\\', '/'])?;
+/// letter after the dollar sign changed. `None` for any other name. The name
+/// is kept unit for unit, since the bin names its files after the original's
+/// extension.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn info_for(recycled: &[u16]) -> Option<Vec<u16>> {
+    let split = recycled
+        .iter()
+        .rposition(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))?;
     let (folder, name) = recycled.split_at(split + 1);
-    let rest = name.strip_prefix("$R")?;
-    (!rest.is_empty()).then(|| format!("{folder}$I{rest}"))
+    let rest = name.strip_prefix(&[u16::from(b'$'), u16::from(b'R')])?;
+    if rest.is_empty() {
+        return None;
+    }
+    let mut out = folder.to_vec();
+    out.extend([u16::from(b'$'), u16::from(b'I')]);
+    out.extend_from_slice(rest);
+    Some(out)
 }
 
 #[cfg(test)]
@@ -287,36 +331,110 @@ mod tests {
         drive_for(drives, Path::new(path)).map(|d| d.mount_point.to_str().unwrap())
     }
 
+    fn u(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    fn text(units: Option<Vec<u16>>) -> Option<String> {
+        units.map(|u| String::from_utf16(&u).unwrap())
+    }
+
     #[test]
     fn the_shell_gets_an_ordinary_path() {
+        let shell = |path: &str| text(shell_path(&u(path)));
         assert_eq!(
-            shell_path(r"\\?\C:\Users\a\f.txt").as_deref(),
+            shell(r"\\?\C:\Users\a\f.txt").as_deref(),
             Some(r"C:\Users\a\f.txt")
         );
         assert_eq!(
-            shell_path(r"\\?\UNC\host\share\f.txt").as_deref(),
+            shell(r"\\?\UNC\host\share\f.txt").as_deref(),
             Some(r"\\host\share\f.txt")
         );
-        assert_eq!(shell_path(r"C:\x\y").as_deref(), Some(r"C:\x\y"));
-        assert_eq!(shell_path("C:/x/y").as_deref(), Some(r"C:\x\y"));
+        assert_eq!(shell(r"C:\x\y").as_deref(), Some(r"C:\x\y"));
+        assert_eq!(shell("C:/x/y").as_deref(), Some(r"C:\x\y"));
         // Nothing ordinary can name these.
         for path in [
             r"\\?\Volume{1234}\x",
             r"\\.\C:\x",
             r"\\?\GLOBALROOT\Device\x",
             "",
+            "C:\\a\0b",
         ] {
-            assert_eq!(shell_path(path), None, "{path}");
+            assert_eq!(shell(path), None, "{path}");
         }
     }
 
     #[test]
+    fn the_shell_is_asked_for_the_item_that_was_chosen_and_not_for_a_look_alike() {
+        // `a<lone surrogate>` and `a<U+FFFD>` are two different files that can
+        // sit side by side. As text the first becomes the second; as units it
+        // stays itself.
+        let lone = [0xD800u16];
+        let mut chosen = u(r"\\?\C:\Users\me\a");
+        chosen.extend(lone);
+        let given = shell_path(&chosen).unwrap();
+        let mut want = u(r"C:\Users\me\a");
+        want.extend(lone);
+        assert_eq!(given, want);
+        let mut look_alike = u(r"C:\Users\me\a");
+        look_alike.extend(u("\u{fffd}"));
+        assert_ne!(given, look_alike);
+        // A lone surrogate in the middle, or the low half alone, is kept too.
+        for unit in [0xD800u16, 0xDBFF, 0xDC00, 0xDFFF] {
+            let mut path = u(r"C:\x\");
+            path.push(unit);
+            path.extend(u(".txt"));
+            assert_eq!(shell_path(&path).unwrap(), path, "{unit:#x}");
+        }
+        // A path is not "ordinary" because of a NUL or a prefix hidden behind
+        // a surrogate; those are judged on the units too.
+        let mut with_nul = u(r"C:\x");
+        with_nul.extend([0xD800, 0]);
+        assert_eq!(shell_path(&with_nul), None);
+    }
+
+    #[test]
     fn inside_means_the_root_or_below_it() {
-        assert!(is_inside(r"\\?\C:\Temp\fx", r"C:\temp\FX\a\b"));
-        assert!(is_inside(r"C:\Temp\fx\", r"c:/temp/fx"));
-        assert!(!is_inside(r"C:\Temp\fx", r"C:\Temp\fx2"));
-        assert!(!is_inside(r"C:\Temp\fx", r"C:\Temp"));
-        assert!(!is_inside(r"C:\Temp\fx", r"D:\Temp\fx\a"));
+        let inside = |root: &str, path: &str| is_inside(&u(root), &u(path));
+        assert!(inside(r"\\?\C:\Temp\fx", r"C:\temp\FX\a\b"));
+        assert!(inside(r"C:\Temp\fx\", r"c:/temp/fx"));
+        assert!(!inside(r"C:\Temp\fx", r"C:\Temp\fx2"));
+        assert!(!inside(r"C:\Temp\fx", r"C:\Temp"));
+        assert!(!inside(r"C:\Temp\fx", r"D:\Temp\fx\a"));
+    }
+
+    #[test]
+    fn inside_and_the_drive_are_judged_by_exact_units() {
+        // A lone surrogate is not the replacement character, whether it is in
+        // the root or below it.
+        let with = |prefix: &str, unit: u16, suffix: &str| {
+            let mut out = u(prefix);
+            out.push(unit);
+            out.extend(u(suffix));
+            out
+        };
+        let root_lone = with(r"C:\Temp\fx", 0xD800, "");
+        let root_fffd = u("C:\\Temp\\fx\u{fffd}");
+        assert!(is_inside(&root_lone, &with(r"C:\Temp\fx", 0xD800, r"\a")));
+        assert!(is_inside(&root_lone, &root_lone));
+        assert!(!is_inside(&root_lone, &root_fffd));
+        assert!(!is_inside(&root_fffd, &root_lone));
+        assert!(!is_inside(&root_lone, &with(r"C:\Temp\fx", 0xD801, r"\a")));
+        // The same for the root of a drive: a folder whose name ends in a lone
+        // surrogate is not inside the drive mounted on the same name ending in
+        // U+FFFD, so it is on the drive that really holds it.
+        let mut lookalike = drive(DriveKind::Removable, r"C:\mnt\x");
+        lookalike.mount_point = PathBuf::from("C:\\mnt\\x\u{fffd}\\");
+        let drives = [drive(DriveKind::Fixed, r"C:\"), lookalike];
+        let under_lone = with(r"C:\mnt\x", 0xD800, r"\file");
+        let found = drive_for_units(&drives, &under_lone).unwrap();
+        assert_eq!(found.kind, DriveKind::Fixed);
+        let under_fffd = u("C:\\mnt\\x\u{fffd}\\file");
+        assert_eq!(
+            drive_for_units(&drives, &under_fffd).unwrap().kind,
+            DriveKind::Removable
+        );
+        assert!(drive_for_units(&drives, &[]).is_none());
     }
 
     #[test]
@@ -429,12 +547,28 @@ mod tests {
 
     #[test]
     fn the_info_file_of_a_recycled_item_is_found_by_name() {
+        let u = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
         assert_eq!(
-            info_for(r"C:\$Recycle.Bin\S-1-5-21\$R1A2B3C.txt").as_deref(),
-            Some(r"C:\$Recycle.Bin\S-1-5-21\$I1A2B3C.txt")
+            info_for(&u(r"C:\$Recycle.Bin\S-1-5-21\$R1A2B3C.txt")),
+            Some(u(r"C:\$Recycle.Bin\S-1-5-21\$I1A2B3C.txt"))
         );
         for bad in [r"C:\x\$I1A2B3C.txt", r"C:\x\file", r"C:\x\$R", r"C:\x\R12"] {
-            assert_eq!(info_for(bad), None, "{bad}");
+            assert_eq!(info_for(&u(bad)), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn the_info_file_keeps_an_extension_that_is_not_text() {
+        // The bin names the item after the original's extension, which can
+        // end in a lone surrogate; the record is looked up under that name.
+        let mut recycled: Vec<u16> = r"C:\$Recycle.Bin\S-1-5-21\$R1A2B3C.t"
+            .encode_utf16()
+            .collect();
+        recycled.push(0xD800);
+        let mut want: Vec<u16> = r"C:\$Recycle.Bin\S-1-5-21\$I1A2B3C.t"
+            .encode_utf16()
+            .collect();
+        want.push(0xD800);
+        assert_eq!(info_for(&recycled), Some(want));
     }
 }

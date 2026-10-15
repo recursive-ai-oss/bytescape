@@ -18,6 +18,10 @@
 
   A copy of the helper that is not at the path below (a portable or AppImage
   build) matches neither action, and pkexec shows its generic prompt.
+
+  The helper draws nothing, so the actions do not ask pkexec to keep the
+  display variables for it (the allow_gui annotation): it runs with the
+  minimal environment pkexec gives it.
 -->
 <policyconfig>
   <vendor>Recursive AI, LLC</vendor>
@@ -33,7 +37,6 @@
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/bytescape/bytescape-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.argv1">scan</annotate>
-    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 
   <action id="org.recursiveai.bytescape.helper.delete">
@@ -46,6 +49,5 @@
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/bytescape/bytescape-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.argv1">delete</annotate>
-    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

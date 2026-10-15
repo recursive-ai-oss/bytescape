@@ -31,9 +31,16 @@ const FORBIDDEN: &[&str] = &[
     "CommandExt",
     "CreateProcessA",
     "CreateProcessW",
+    "CreateProcessAsUserA",
     "CreateProcessAsUserW",
+    "CreateProcessInternalA",
+    "CreateProcessInternalW",
     "CreateProcessWithLogonW",
     "CreateProcessWithTokenW",
+    "NtCreateProcess",
+    "NtCreateProcessEx",
+    "NtCreateUserProcess",
+    "RtlCreateUserProcess",
     "ShellExecuteA",
     "ShellExecuteW",
     "ShellExecuteExA",
@@ -59,11 +66,23 @@ const FORBIDDEN: &[&str] = &[
 
 /// Names that are ordinary words in Rust code, and count only when they are
 /// reached through the C library (`libc::name`, or inside `use libc::{..}`).
-const FORBIDDEN_IN_LIBC: &[&str] = &["system", "popen", "fork", "vfork", "clone", "clone3"];
+const FORBIDDEN_IN_LIBC: &[&str] = &[
+    "system", "_wsystem", "popen", "_popen", "_wpopen", "fork", "vfork", "clone", "clone3",
+];
 
 /// Name beginnings that count in the same two places: the whole `exec*` and
 /// `posix_spawn*` families, whatever their exact name.
-const FORBIDDEN_LIBC_PREFIXES: &[&str] = &["exec", "posix_spawn"];
+///
+/// The Windows C runtime has its own: `_exec*` and `_spawn*`, and the wide
+/// character forms `_wexec*` and `_wspawn*`.
+const FORBIDDEN_LIBC_PREFIXES: &[&str] = &[
+    "exec",
+    "posix_spawn",
+    "_exec",
+    "_wexec",
+    "_spawn",
+    "_wspawn",
+];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -840,6 +859,75 @@ fn the_check_sees_what_it_is_looking_for() {
         "let forked = 1; fn systematic() {} fn system() {} let fork = 2; let c = x.clone(); fn execute() {}\nlet n = libc::getpid(); let v = libc::CLONE_NEWNS; fn fork_join() {}\n",
     );
     assert!(hits(&code).is_empty(), "{:?}", hits(&code));
+}
+
+#[test]
+fn the_windows_ways_of_starting_a_program_are_all_seen() {
+    // The plain Win32 names, whatever path they are reached by.
+    for name in [
+        "CreateProcessA",
+        "CreateProcessW",
+        "CreateProcessAsUserA",
+        "CreateProcessAsUserW",
+        "CreateProcessWithLogonW",
+        "CreateProcessWithTokenW",
+        "CreateProcessInternalA",
+        "CreateProcessInternalW",
+        "NtCreateUserProcess",
+        "NtCreateProcess",
+        "NtCreateProcessEx",
+        "RtlCreateUserProcess",
+        "ShellExecuteExW",
+        "WinExec",
+    ] {
+        let text = format!(
+            "pub fn planted() {{ let _ = windows_sys::Win32::System::Threading::{name}; }}\n"
+        );
+        assert_eq!(hits(&code_of(&text)), vec![name.to_owned()], "{name}");
+        let text = format!("use windows_sys::Win32::System::Threading::{{{name}, Other}};\n");
+        assert_eq!(
+            hits(&code_of(&text)),
+            vec![name.to_owned()],
+            "{name} in a use"
+        );
+    }
+    // The C runtime's families, reached through the libc crate or declared by
+    // hand.
+    for name in [
+        "_spawnv",
+        "_spawnlp",
+        "_wspawnve",
+        "_execv",
+        "_execlpe",
+        "_wexecv",
+        "_wexeclp",
+        "_wsystem",
+        "_popen",
+        "_wpopen",
+        "system",
+    ] {
+        let through = format!("pub fn planted() {{ unsafe {{ libc::{name}(); }} }}\n");
+        assert_eq!(hits(&code_of(&through)), vec![name.to_owned()], "{name}");
+        let grouped = format!("use libc::{{getpid, {name}}};\n");
+        assert_eq!(
+            hits(&code_of(&grouped)),
+            vec![name.to_owned()],
+            "{name} grouped"
+        );
+        let declared = format!("extern \"C\" {{ fn {name}(); }}\n");
+        assert_eq!(
+            hits(&code_of(&declared)),
+            vec![name.to_owned()],
+            "{name} declared"
+        );
+    }
+    // Names that only start alike are not them.
+    assert!(
+        hits(&code_of(
+            "fn _spawner() {} fn _executor() {} let _wexecutive = 1; let spawn = 2; fn _system_name() {}\n"
+        ))
+        .is_empty()
+    );
 }
 
 #[test]

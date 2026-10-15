@@ -93,11 +93,13 @@ fn both_actions_name_the_installed_helper_and_their_first_argument() {
             Some(mode),
             "{id}"
         );
+        // The helper draws nothing, so it gets no display variables.
         assert_eq!(
             annotation(&body, "org.freedesktop.policykit.exec.allow_gui"),
-            Some("true"),
+            None,
             "{id}"
         );
+        assert!(!body.contains("allow_gui"), "{id}");
     }
 }
 

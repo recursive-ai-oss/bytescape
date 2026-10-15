@@ -43,6 +43,20 @@ impl Host {
     }
 }
 
+/// What a scan of `root` on this computer would use, for the tests that need
+/// a real mount table: the reader, why it is not the one asked for, and the
+/// mounts that would be entered.
+#[doc(hidden)]
+pub fn plan_summary(
+    requested: bs_ipc::Backend,
+    root: &std::path::Path,
+    host: &Host,
+    requested_mounts: &[u64],
+) -> (bs_ipc::Backend, bs_ipc::Fallback, Vec<u64>) {
+    let plan = plan_for(requested, root, host, requested_mounts);
+    (plan.backend, plan.fallback, plan.mount_ids)
+}
+
 /// A batch that could not be cut into frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SplitError;

@@ -240,9 +240,27 @@ note = "Swap file that Windows uses for Microsoft Store apps."
 [[entry]]
 pattern = "?:/bootmgr"
 os = "windows"
-level = "protected"
+level = "blocked"
 scope = "exact"
 note = "Windows Boot Manager, managed by Windows."
+
+[[entry]]
+pattern = "?:/Boot"
+os = "windows"
+level = "blocked"
+note = "Boot configuration data and boot files of Windows, managed by Windows."
+
+[[entry]]
+pattern = "?:/EFI"
+os = "windows"
+level = "blocked"
+note = "Boot loader files on the EFI system partition, managed by Windows and the boot loaders installed beside it."
+
+[[entry]]
+pattern = "?:/Recovery"
+os = "windows"
+level = "blocked"
+note = "Windows Recovery Environment files, managed by Windows."
 
 # ------------------------------------------------------------------ Linux
 
@@ -264,6 +282,12 @@ pattern = "/boot"
 os = "linux"
 level = "blocked"
 note = "Boot loader files and kernel images, managed by the distribution's packages."
+
+[[entry]]
+pattern = "/efi"
+os = "linux"
+level = "blocked"
+note = "Mount point of the EFI system partition on systems that mount it here, holding boot loader files managed by the distribution's boot loader tools."
 
 [[entry]]
 pattern = "/etc"

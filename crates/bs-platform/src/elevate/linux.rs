@@ -105,15 +105,28 @@ fn snap_is_classic(snap: &Path) -> bool {
 /// to start: it has no links in it, so nothing on the way to it can be
 /// changed by anyone but the owner, and what runs is what was checked.
 pub(super) fn check_trusted(helper: &Path, trust: &Trust) -> Result<PathBuf, ElevateError> {
+    check_program(helper, trust, false)
+}
+
+/// [`check_trusted`] for any program, and with `set_user_id` also requires the
+/// set-user-id bit on the program itself (as `pkexec` has).
+fn check_program(
+    program: &Path,
+    trust: &Trust,
+    set_user_id: bool,
+) -> Result<PathBuf, ElevateError> {
     let missing = || ElevateError::Unavailable(Unavailable::HelperNotInstalled);
     let untrusted = || ElevateError::Unavailable(Unavailable::HelperNotTrusted);
-    if !helper.is_absolute() {
+    if !program.is_absolute() {
         return Err(missing());
     }
-    let real = std::fs::canonicalize(helper).map_err(|_| missing())?;
+    let real = std::fs::canonicalize(program).map_err(|_| missing())?;
     let file = std::fs::metadata(&real).map_err(|_| missing())?;
     if !file.is_file() || file.permissions().mode() & 0o111 == 0 {
         return Err(missing());
+    }
+    if set_user_id && file.permissions().mode() & 0o4000 == 0 {
+        return Err(untrusted());
     }
     if !real.starts_with(&trust.top) {
         return Err(untrusted());
@@ -132,6 +145,46 @@ pub(super) fn check_trusted(helper: &Path, trust: &Trust) -> Result<PathBuf, Ele
             None => return Ok(real),
         }
     }
+}
+
+/// Where the system's `pkexec` is. Never searched for on the user's `PATH`: a
+/// program of that name in a folder the user can write to would be handed the
+/// administrator's password.
+const PKEXEC_PLACES: [&str; 2] = ["/usr/bin/pkexec", "/bin/pkexec"];
+
+/// The `pkexec` to start: the first of `places` that exists, and only if it is
+/// the administrator's set-user-id program in the administrator's folders.
+fn find_pkexec(places: &[&Path], trust: &Trust) -> Result<PathBuf, ElevateError> {
+    for place in places {
+        match check_program(place, trust, true) {
+            Ok(real) => return Ok(real),
+            Err(ElevateError::Unavailable(Unavailable::HelperNotInstalled)) => {}
+            // Found, but not what it has to be. Look no further: the next
+            // place is usually the same file.
+            Err(_) => {
+                return Err(ElevateError::Unavailable(Unavailable::Other(
+                    "The system's pkexec is not the administrator's set-user-id program, so it is not used to ask for administrator rights.",
+                )));
+            }
+        }
+    }
+    Err(ElevateError::Unavailable(Unavailable::NoElevationService))
+}
+
+/// The `pkexec` that [`launch`] starts for `elevation`.
+fn pkexec_for(elevation: &Elevation) -> Result<PathBuf, ElevateError> {
+    if let Some(given) = &elevation.pkexec {
+        // Only tests give one: they start a stand-in that asks for nothing.
+        return Ok(given.clone());
+    }
+    let places: Vec<&Path> = PKEXEC_PLACES.iter().map(Path::new).collect();
+    find_pkexec(
+        &places,
+        &Trust {
+            owner: 0,
+            top: PathBuf::from("/"),
+        },
+    )
 }
 
 /// `pkexec` exits with 126 when the user dismissed the prompt or is not
@@ -185,19 +238,6 @@ impl Drop for Guard {
     }
 }
 
-/// A program found on the user's `PATH`: only absolute entries count, and the
-/// result must be an executable regular file.
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(name))
-        .find(|candidate| {
-            std::fs::metadata(candidate)
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
-}
-
 /// Whether this process has the superuser's rights.
 fn is_superuser() -> bool {
     std::fs::metadata("/proc/self")
@@ -213,11 +253,7 @@ pub(super) fn launch(
     if is_superuser() {
         return Err(ElevateError::Unavailable(Unavailable::AlreadyElevated));
     }
-    let pkexec = elevation
-        .pkexec
-        .clone()
-        .or_else(|| find_on_path("pkexec"))
-        .ok_or(ElevateError::Unavailable(Unavailable::NoElevationService))?;
+    let pkexec = pkexec_for(elevation)?;
     let helper = match &elevation.trusted {
         // The helper the system provides is checked again now, just before
         // it is started, and the path that was checked is the path that is
@@ -422,6 +458,161 @@ mod tests {
         let elsewhere = outside.program("helper");
         symlink(&elsewhere, tree.path("escape")).unwrap();
         untrusted(&tree, &tree.path("escape"));
+    }
+
+    // ------------------------------------------------------------ pkexec
+
+    /// A program with the set-user-id bit, as `pkexec` has.
+    fn set_user_id_program(tree: &Tree, relative: &str) -> PathBuf {
+        let path = tree.program(relative);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_systems_pkexec_is_the_set_user_id_program_in_the_administrators_folders() {
+        let tree = Tree::new("pkexec-ok");
+        let pkexec = set_user_id_program(&tree, "usr/bin/pkexec");
+        assert_eq!(find_pkexec(&[&pkexec], &tree.trust()).unwrap(), pkexec);
+        // The first place that exists is used; one that is absent is skipped.
+        let absent = tree.path("bin/pkexec");
+        assert_eq!(
+            find_pkexec(&[&absent, &pkexec], &tree.trust()).unwrap(),
+            pkexec
+        );
+        // A link is judged by where it leads, and that file is what is started.
+        std::fs::create_dir_all(tree.path("bin")).unwrap();
+        std::fs::set_permissions(tree.path("bin"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&pkexec, &absent).unwrap();
+        assert_eq!(find_pkexec(&[&absent], &tree.trust()).unwrap(), pkexec);
+    }
+
+    #[test]
+    fn a_pkexec_that_is_not_the_administrators_is_not_used() {
+        let refused = |result: Result<PathBuf, ElevateError>| {
+            assert!(
+                matches!(
+                    result,
+                    Err(ElevateError::Unavailable(Unavailable::Other(text)))
+                        if text.contains("pkexec")
+                ),
+                "{result:?}"
+            );
+        };
+        let tree = Tree::new("pkexec-bad");
+        let pkexec = set_user_id_program(&tree, "usr/bin/pkexec");
+        // Without the set-user-id bit it cannot ask for anything.
+        let plain = tree.program("plain/pkexec");
+        refused(find_pkexec(&[&plain], &tree.trust()));
+        // Writable by the group or by anyone, or in a folder that is.
+        for mode in [0o4775, 0o4757, 0o4777] {
+            std::fs::set_permissions(&pkexec, std::fs::Permissions::from_mode(mode)).unwrap();
+            refused(find_pkexec(&[&pkexec], &tree.trust()));
+        }
+        std::fs::set_permissions(&pkexec, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        for folder in ["usr/bin", "usr"] {
+            let path = tree.path(folder);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+            refused(find_pkexec(&[&pkexec], &tree.trust()));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        find_pkexec(&[&pkexec], &tree.trust()).unwrap();
+        // Owned by someone other than the administrator.
+        let other = Trust {
+            owner: tree.trust().owner.wrapping_add(1),
+            top: tree.root.clone(),
+        };
+        refused(find_pkexec(&[&pkexec], &other));
+        // A link out of the trusted folders.
+        let outside = Tree::new("pkexec-outside");
+        let elsewhere = set_user_id_program(&outside, "pkexec");
+        symlink(&elsewhere, tree.path("escape")).unwrap();
+        refused(find_pkexec(&[&tree.path("escape")], &tree.trust()));
+        // One that is found but refused ends the search: a later place does
+        // not get a say.
+        refused(find_pkexec(&[&plain, &pkexec], &tree.trust()));
+    }
+
+    #[test]
+    fn no_pkexec_means_no_elevation_service() {
+        let tree = Tree::new("pkexec-none");
+        let absent = tree.path("usr/bin/pkexec");
+        assert!(matches!(
+            find_pkexec(&[&absent], &tree.trust()),
+            Err(ElevateError::Unavailable(Unavailable::NoElevationService))
+        ));
+        assert!(matches!(
+            find_pkexec(&[], &tree.trust()),
+            Err(ElevateError::Unavailable(Unavailable::NoElevationService))
+        ));
+        // A folder, or a file that cannot be started, is no pkexec.
+        let folder = tree.path("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        assert!(matches!(
+            find_pkexec(&[&folder], &tree.trust()),
+            Err(ElevateError::Unavailable(Unavailable::NoElevationService))
+        ));
+    }
+
+    #[test]
+    fn the_places_pkexec_is_looked_for_are_fixed() {
+        assert_eq!(PKEXEC_PLACES, ["/usr/bin/pkexec", "/bin/pkexec"]);
+    }
+
+    /// Run by [`a_pkexec_on_the_path_is_never_used`] in a child process, where
+    /// the search path holds a fake `pkexec`. It only asks which program would
+    /// be started; nothing is started.
+    #[test]
+    fn pkexec_probe_child() {
+        if std::env::var_os("BS_PKEXEC_PROBE").is_none() {
+            return;
+        }
+        let elevation = Elevation::with_helper("/nonexistent/helper");
+        match pkexec_for(&elevation) {
+            Ok(path) => println!("RESOLVED: {}", path.display()),
+            Err(error) => println!("RESOLVED: none ({error})"),
+        }
+    }
+
+    #[test]
+    fn a_pkexec_on_the_path_is_never_used() {
+        // A fake `pkexec` with the set-user-id bit, owned by the user running
+        // the tests, first on the search path of a child process. What the
+        // child finds must be the same as with a search path that holds no
+        // `pkexec` at all.
+        let tree = Tree::new("pkexec-path");
+        let fake = set_user_id_program(&tree, "bin/pkexec");
+        let exe = std::env::current_exe().unwrap();
+        let ask = |path: &Path| {
+            let output = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "elevate::linux::tests::pkexec_probe_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("BS_PKEXEC_PROBE", "1")
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.lines()
+                .find_map(|line| line.split_once("RESOLVED: ").map(|(_, answer)| answer))
+                .unwrap_or_else(|| panic!("the child did not answer: {text}"))
+                .to_owned()
+        };
+        let with_the_fake = ask(&tree.path("bin"));
+        let without = ask(&tree.path("nothing-here"));
+        assert_eq!(with_the_fake, without, "the search path changed the answer");
+        assert!(!with_the_fake.contains(&fake.display().to_string()));
+        // What it found is the system's, in a fixed place, or nothing.
+        assert!(
+            with_the_fake.starts_with("none (")
+                || with_the_fake == "/usr/bin/pkexec"
+                || Path::new(&with_the_fake).is_absolute()
+                    && !Path::new(&with_the_fake).starts_with(&tree.root),
+            "{with_the_fake}"
+        );
     }
 
     #[test]

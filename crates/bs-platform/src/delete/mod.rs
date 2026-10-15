@@ -516,7 +516,7 @@ impl Disposal {
         };
         #[cfg(windows)]
         {
-            winpure::is_inside(&root.to_string_lossy(), &path.to_string_lossy())
+            winpure::is_inside(&winpure::units_of_path(root), &winpure::units_of_path(path))
         }
         #[cfg(not(windows))]
         {
