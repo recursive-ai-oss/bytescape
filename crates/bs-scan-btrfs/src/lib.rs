@@ -36,6 +36,12 @@
 //! same file system, and a scan of a drive crosses into them. Nothing here can
 //! cross into another file system, which has no trees in this one.
 //!
+//! A subvolume is nested where the root tree says so, not wherever a directory
+//! entry names it. A snapshot keeps the entries of the subvolumes that were
+//! nested in its origin, but not the nesting: the kernel shows an empty
+//! directory there, and so does the reader ([`BtrfsReport::stand_in_dirs`]).
+//! Each subvolume is therefore read, and counted, once, where it is nested.
+//!
 //! # Mounts
 //!
 //! A mount hides the folder it covers, and a walk sees the mount's files
@@ -83,6 +89,13 @@
 //! * **An extent only partly used.** After an overwrite in the middle of an
 //!   extent the whole extent stays on disk. The reader counts it whole; the
 //!   kernel counts the bytes the file refers to.
+//! * **Compressed data.** The kernel counts a file's extents at their length
+//!   in the file, compressed or not, so a compressed file shows its
+//!   uncompressed size. The reader counts what the extents take on disk.
+//!
+//! And on one time: the empty folder shown where a snapshot holds the entry
+//! of a subvolume that is not nested in it has no time on disk (the kernel
+//! stamps it with the moment it is looked up), so the reader reports none.
 //!
 //! # What it does not do
 //!
@@ -127,7 +140,7 @@ pub use search::{Flow, Item, Key, TreeSource};
 /// Item types and ids a [`TreeSource`] implementation needs to know.
 pub mod consts {
     pub use crate::items::{
-        DIR_INDEX, EXTENT_DATA, FIRST_FREE, FS_TREE_ID, INODE_ITEM, LAST_FREE, ROOT_ITEM,
+        DIR_INDEX, EXTENT_DATA, FIRST_FREE, FS_TREE_ID, INODE_ITEM, LAST_FREE, ROOT_ITEM, ROOT_REF,
         ROOT_TREE_ID,
     };
 }
@@ -273,6 +286,10 @@ pub struct BtrfsReport {
     pub unreadable_entries: u64,
     /// Entries that named an inode that was not there.
     pub vanished_entries: u64,
+    /// Empty directories shown where a snapshot holds the entry of a
+    /// subvolume that is not nested in it (the kernel shows an empty folder
+    /// there too).
+    pub stand_in_dirs: u64,
     /// Every inconsistency met.
     pub diagnostics: Diagnostics,
     /// The read stopped early because it was cancelled.
@@ -350,6 +367,7 @@ pub fn read_filesystem(
     report.memory_used_bytes = model.bytes();
     report.unreadable_entries = emitter.unreadable_entries;
     report.vanished_entries = emitter.vanished_entries;
+    report.stand_in_dirs = emitter.stand_ins;
     report.cancelled = emitter.cancelled;
     diag.absorb(&emitter.diag);
     report.diagnostics = diag;

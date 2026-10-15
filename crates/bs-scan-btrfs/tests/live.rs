@@ -24,11 +24,16 @@
 
 #[path = "common/diff.rs"]
 mod diff;
+#[path = "common/exceptions.rs"]
+mod exceptions;
 
 use bs_scan::{ScanOptions, ScanResult, Walker, start};
-use bs_scan_btrfs::{BtrfsOptions, BtrfsScanner};
+use bs_scan_btrfs::consts::{FS_TREE_ID, INODE_ITEM};
+use bs_scan_btrfs::{BtrfsOptions, BtrfsScanner, Flow, IoctlSource, Key, TreeSource};
 use bs_tree::NodeFlags;
-use diff::{Exception, Field, Node, compare, tree_of};
+use diff::{compare, tree_of};
+use exceptions::{STAND_INS, class_table};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -147,38 +152,27 @@ fn read(mnt: &Path) -> (ScanResult, bs_scan_btrfs::BtrfsReport) {
     (result, report)
 }
 
-fn exceptions() -> Vec<Exception> {
-    vec![
-        Exception {
-            name: "inline data",
-            reason: "A file whose data is kept inside the tree's own blocks is reported by \
-                     the kernel (st_blocks) as one whole sector; the reader counts the bytes \
-                     stored. The walker's figure is the reader's rounded up to a sector.",
-            field: Field::Allocated,
-            applies: Box::new(|_, _, r: &Node| {
-                matches!(r.kind, bs_tree::NodeKind::File | bs_tree::NodeKind::Symlink)
-            }),
-            relation: Box::new(|walker, reader| reader > 0 && reader < 4096 && walker == 4096),
-        },
-        Exception {
-            name: "shared extents",
-            reason: "An extent used by several files is counted once, at the file the reader \
-                     emits first; the walker counts it at every file (as `du` does). The \
-                     reader's figure is at most the walker's.",
-            field: Field::Allocated,
-            applies: Box::new(|_, _, r| r.flags.contains(NodeFlags::SHARED)),
-            relation: Box::new(|walker, reader| reader < walker),
-        },
-        Exception {
-            name: "partly used extent",
-            reason: "overwritten.bin has a 4 KiB hole punched into the middle of its extent by \
-                     an overwrite. The extent stays on disk whole; the reader counts it whole, \
-                     the kernel counts the bytes the file refers to.",
-            field: Field::Allocated,
-            applies: Box::new(|p, _, _| p == "overwritten.bin"),
-            relation: Box::new(|walker, reader| reader > walker),
-        },
-    ]
+/// The inode item's `nbytes` for `ino` of `tree`, read through the tree
+/// search: the number the kernel makes `st_blocks` from.
+fn inode_nbytes(mnt: &Path, tree: u64, ino: u64) -> u64 {
+    let (source, _) = IoctlSource::open(mnt).unwrap();
+    let key = Key {
+        objectid: ino,
+        ty: INODE_ITEM,
+        offset: 0,
+    };
+    let mut nbytes = None;
+    source
+        .search(tree, key, key, &mut |item| {
+            nbytes = item
+                .data
+                .get(24..32)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_le_bytes);
+            Flow::Stop
+        })
+        .unwrap();
+    nbytes.expect("the inode item")
 }
 
 #[test]
@@ -195,8 +189,19 @@ fn the_reader_matches_the_walker_on_a_btrfs_file_system() {
     assert!(reader.snapshot.scan_complete(), "{:?}", report.diagnostics);
     let w = tree_of(&walker.snapshot);
     let r = tree_of(&reader.snapshot);
-    let outcome = compare(&w, &r, &exceptions());
-    let text = outcome.render();
+    let outcome = compare(&w, &r, &exceptions::all());
+    let mut text = outcome.render();
+    text.push_str(&class_table(&w, &r, &outcome));
+    // The compressed file's two figures, and the number the kernel makes the
+    // walker's from: the claim behind the "compressed extents" entry.
+    let md = std::fs::metadata(fs.mnt.join("text.txt")).unwrap();
+    let nbytes = inode_nbytes(&fs.mnt, FS_TREE_ID, md.ino());
+    text.push_str(&format!(
+        "text.txt: length {}, inode nbytes {nbytes}, st_blocks*512 {} (the walker), on disk by the reader {}\n",
+        md.len(),
+        md.blocks() * 512,
+        r["text.txt"].allocated
+    ));
     println!("{text}");
     if let Ok(dir) = std::env::var("BENCH_RESULTS") {
         std::fs::create_dir_all(&dir).unwrap();
@@ -209,6 +214,28 @@ fn the_reader_matches_the_walker_on_a_btrfs_file_system() {
     }
     assert!(outcome.is_clean(), "{text}");
     assert_eq!(report.diagnostics.total(), 0, "{:?}", report.diagnostics);
+    // The claim behind the "compressed extents" entry, and that it covers the
+    // one compressible file of the fixture and nothing else.
+    assert_eq!(nbytes, md.len(), "the kernel counts the file at its length");
+    assert_eq!(nbytes, md.blocks() * 512);
+    assert!(r["text.txt"].allocated < nbytes, "it is smaller on disk");
+    let covered = |name: &str| -> Vec<&str> {
+        outcome
+            .explained
+            .iter()
+            .filter(|(_, n)| *n == name)
+            .map(|(f, _)| f.path.as_str())
+            .collect()
+    };
+    assert_eq!(covered("compressed extents"), vec!["text.txt"]);
+    // The folders the kernel makes up have no time on disk; they are the two
+    // snapshots' copies of the entry for `sub1/inner`, and the report counts
+    // them.
+    assert_eq!(covered("stand-in directory time"), STAND_INS);
+    assert_eq!(report.stand_in_dirs, 2);
+    for p in STAND_INS {
+        assert!(!r[*p].failed && !w[*p].failed, "{p}");
+    }
 
     // What the fixture is meant to show, so that a fixture that stopped
     // exercising something fails and does not just pass.
@@ -347,7 +374,7 @@ fn a_sibling_subvolume_mounted_below_the_root_is_read_where_the_walker_finds_it(
         "cd '{top}'; btrfs -q subvolume create rootsv; btrfs -q subvolume create homesv; \
          head -c 300000 /dev/urandom > rootsv/system.bin; mkdir rootsv/home; \
          mkdir homesv/alice; head -c 3000000 /dev/urandom > homesv/alice/photos.bin; \
-         head -c 2000 /dev/urandom > homesv/alice/note.txt"
+         head -c 100 /dev/urandom > homesv/alice/note.txt"
     ));
     fs.sync();
     let device = String::from_utf8(
@@ -379,15 +406,25 @@ fn a_sibling_subvolume_mounted_below_the_root_is_read_where_the_walker_finds_it(
     let report = scanner.last_report().expect("a report");
     let w = tree_of(&walker.snapshot);
     let r = tree_of(&reader.snapshot);
-    let outcome = compare(&w, &r, &[]);
+    // Only the 100-byte note differs: its data lives inside the tree.
+    let outcome = compare(&w, &r, &[exceptions::inline_data()]);
     println!("{}", outcome.render());
+    println!("{}", class_table(&w, &r, &outcome));
     assert!(r.contains_key("home/alice/photos.bin"), "{:?}", r.keys());
     assert!(!r["home"].flags.contains(NodeFlags::NOT_FOLLOWED));
     assert!(outcome.is_clean(), "{}", outcome.render());
     assert_eq!(report.mounts_entered, 1);
+    // The two totals differ by exactly what the explained differences add up
+    // to (the sector the kernel counts for the inline note, less its bytes).
+    let explained: u64 = outcome
+        .explained
+        .iter()
+        .map(|(f, _)| f.walker.parse::<u64>().unwrap() - f.reader.parse::<u64>().unwrap())
+        .sum();
+    assert!(explained > 0);
     assert_eq!(
         walker.snapshot.root().unwrap().allocated(),
-        reader.snapshot.root().unwrap().allocated()
+        reader.snapshot.root().unwrap().allocated() + explained
     );
     // Left to the default boundary neither tool enters the mount, and both
     // say so.

@@ -155,6 +155,11 @@ fn walk(model: &Model, grafts: &Grafts, start: u32, path: &[Vec<u8>]) -> Walk {
         else {
             return Walk::Missing;
         };
+        if entry.stub || (entry.subvolume && !entry.confirmed) {
+            // An empty stand-in folder, or an entry the root tree did not
+            // place: there is nothing below it to place a mount in.
+            return Walk::Missing;
+        }
         let next = if entry.subvolume {
             let Some(&t) = model.tree_index.get(&entry.target) else {
                 return Walk::Missing;

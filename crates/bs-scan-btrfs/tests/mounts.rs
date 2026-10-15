@@ -323,3 +323,58 @@ fn two_mounts_on_one_folder_are_refused_when_one_belongs_to_the_drive() {
     assert_eq!(run.report.mounts_entered, 0);
     assert_eq!(run.report.diagnostics.total(), 0);
 }
+
+/// The top level holds the entries `home_name` (a subvolume entry for tree
+/// 257) and a folder `folder_name` on which tree 257 is mounted, and the root
+/// tree cannot be searched, so the entry cannot be placed.
+fn unplaced_entry_of_a_mounted_subvolume(home_name: &str, folder_name: &str) -> Run {
+    let mut fs = MemFs::new();
+    fs.make_tree(257);
+    fs.subvolume(5, ROOT, home_name, 257);
+    fs.mkdir(5, ROOT, folder_name);
+    fs.plain(257, ROOT, "photos.bin", 64 << 20);
+    let mut src = fs.source();
+    src.fail_trees.insert(bs_scan_btrfs::consts::ROOT_TREE_ID);
+    src.mounts = vec![mount(&[folder_name], HOME_MOUNT, here(257))];
+    let start = Start {
+        tree: 5,
+        inode: ROOT,
+    };
+    try_read_within(
+        &src,
+        start,
+        &BtrfsOptions::default(),
+        Boundary::with_mount_ids([HOME_MOUNT]),
+    )
+    .unwrap()
+}
+
+#[test]
+fn an_unplaced_entry_is_not_entered_even_when_its_subvolume_was_loaded_by_a_mount() {
+    // Whichever the walk meets first, the subvolume is read where the mount
+    // puts it, and the entry that could not be placed is an unreadable folder:
+    // it is not entered, so the real place is never dropped as a second way
+    // in.
+    for (entry, folder) in [("a-entry", "z-mount"), ("z-entry", "a-mount")] {
+        let run = unplaced_entry_of_a_mounted_subvolume(entry, folder);
+        let m = run.flat();
+        assert_eq!(
+            m[&format!("{folder}/photos.bin")].allocated,
+            64 << 20,
+            "{entry}/{folder}"
+        );
+        assert!(m[entry].failed, "{entry}/{folder}");
+        assert!(
+            !m.contains_key(&format!("{entry}/photos.bin")),
+            "{entry}/{folder}"
+        );
+        assert_eq!(
+            run.report.diagnostics.count(ProblemKind::SubvolumeSkipped),
+            1,
+            "{entry}/{folder}: only the failed lookup is noted, not a second way in"
+        );
+        let root = run.snapshot.root().unwrap();
+        assert!(root.has_unreadable_below(), "{entry}/{folder}");
+        assert!(root.bytes_are_lower_bound(), "{entry}/{folder}");
+    }
+}

@@ -1,8 +1,9 @@
-//! The two ioctls the reader makes, as small functions over byte buffers.
+//! The ioctls the reader makes, as small functions over byte buffers.
 //!
 //! This is the only place in the crate with `unsafe`. The reader never writes
-//! to the file system: `TREE_SEARCH_V2` and `INO_LOOKUP` only read. Both need
-//! administrator rights, which is why the reader runs in the helper.
+//! to the file system: `TREE_SEARCH_V2`, `INO_LOOKUP` and `FS_INFO` only read.
+//! The first needs administrator rights, which is why the reader runs in the
+//! helper.
 #![allow(unsafe_code)]
 #![allow(
     clippy::cast_possible_truncation,
@@ -27,7 +28,16 @@ use std::path::{Path, PathBuf};
 
 /// `BTRFS_IOCTL_MAGIC`.
 const MAGIC: u8 = 0x94;
+const IOC_READ: libc::c_ulong = 2;
 const IOC_READ_WRITE: libc::c_ulong = 3;
+
+/// `_IOR(type, nr, size)`.
+const fn ior(ty: u8, nr: u8, size: usize) -> libc::c_ulong {
+    (IOC_READ << 30)
+        | ((size as libc::c_ulong) << 16)
+        | ((ty as libc::c_ulong) << 8)
+        | nr as libc::c_ulong
+}
 
 /// `_IOWR(type, nr, size)`.
 const fn iowr(ty: u8, nr: u8, size: usize) -> libc::c_ulong {
@@ -44,6 +54,12 @@ const IOC_TREE_SEARCH_V2: libc::c_ulong = iowr(MAGIC, 17, ARGS_HEADER);
 /// `struct btrfs_ioctl_ino_lookup_args`: two ids and 4080 bytes of path.
 const INO_LOOKUP_ARGS: usize = 4096;
 const IOC_INO_LOOKUP: libc::c_ulong = iowr(MAGIC, 18, INO_LOOKUP_ARGS);
+
+/// `struct btrfs_ioctl_fs_info_args`: ids and counts, the file system's UUID
+/// at byte 16, then 1 KiB in all.
+const FS_INFO_ARGS: usize = 1024;
+const IOC_FS_INFO: libc::c_ulong = ior(MAGIC, 31, FS_INFO_ARGS);
+const FS_INFO_UUID: usize = 16;
 
 // Offsets in the search key.
 const OFF_TREE_ID: usize = 0;
@@ -70,9 +86,11 @@ pub struct IoctlSource {
     fd: OwnedFd,
     /// The start directory's canonical path, to find the mounts below it.
     root: PathBuf,
-    /// The file system's identity, to tell its mounts from other file
-    /// systems' that are also btrfs.
-    fsid: [i32; 2],
+    /// The file system's UUID, to tell its mounts from other file systems'
+    /// that are also btrfs. (`statfs`'s `f_fsid` will not do: the kernel mixes
+    /// the subvolume's id into it, so two subvolumes of one file system have
+    /// different ones.)
+    uuid: [u8; 16],
 }
 
 fn put64(buf: &mut [u8], at: usize, value: u64) {
@@ -93,17 +111,17 @@ impl IoctlSource {
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(path)?;
         let fd: OwnedFd = file.into();
-        let (magic, fsid) = statfs_of(fd.as_raw_fd())?;
-        if magic != BTRFS_MAGIC {
+        if statfs_of(fd.as_raw_fd())? != BTRFS_MAGIC {
             return Err(BtrfsError::NotBtrfs);
         }
         let stat = fstat_of(fd.as_raw_fd())?;
         let tree = tree_of_fd(fd.as_raw_fd())?;
+        let uuid = uuid_of_fd(fd.as_raw_fd())?;
         let source = IoctlSource {
             fd,
             // The mount table names canonical paths.
             root: std::fs::canonicalize(path)?,
-            fsid,
+            uuid,
         };
         Ok((
             source,
@@ -137,10 +155,12 @@ impl IoctlSource {
         if !is_mount_root(fd.as_raw_fd()) {
             return Mounted::HereUnplaced;
         }
-        match statfs_of(fd.as_raw_fd()) {
-            Ok((BTRFS_MAGIC, fsid)) if fsid == self.fsid => {}
-            Ok(_) => return Mounted::Other,
-            Err(_) => return Mounted::HereUnplaced,
+        let magic = statfs_of(fd.as_raw_fd()).ok();
+        let uuid = uuid_of_fd(fd.as_raw_fd()).ok();
+        match relation(magic, uuid, &self.uuid) {
+            Relation::Same => {}
+            Relation::Other => return Mounted::Other,
+            Relation::Unknown => return Mounted::HereUnplaced,
         }
         let (Ok(stat), Ok(tree)) = (fstat_of(fd.as_raw_fd()), tree_of_fd(fd.as_raw_fd())) else {
             return Mounted::HereUnplaced;
@@ -149,6 +169,30 @@ impl IoctlSource {
             tree,
             inode: stat.st_ino,
         })
+    }
+}
+
+/// How the file system under a mount relates to the scan's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Relation {
+    /// A directory of the scan's file system.
+    Same,
+    /// Another file system, btrfs or not.
+    Other,
+    /// The descriptor could not be asked.
+    Unknown,
+}
+
+/// Decides from what `statfs` and `FS_INFO` said about a mounted directory.
+/// `None` for either means the question failed. Only the UUID can tell two
+/// btrfs file systems apart, and tells a file system's subvolumes together.
+fn relation(magic: Option<i64>, uuid: Option<[u8; 16]>, own: &[u8; 16]) -> Relation {
+    match (magic, uuid) {
+        (None, _) => Relation::Unknown,
+        (Some(m), _) if m != BTRFS_MAGIC => Relation::Other,
+        (Some(_), Some(u)) if u == *own => Relation::Same,
+        (Some(_), Some(_)) => Relation::Other,
+        (Some(_), None) => Relation::Unknown,
     }
 }
 
@@ -186,8 +230,8 @@ fn is_mount_root(fd: RawFd) -> bool {
     mount_root_from(raw.stx_attributes, raw.stx_attributes_mask)
 }
 
-/// `f_type` and `f_fsid` of the file system of a descriptor.
-fn statfs_of(fd: RawFd) -> Result<(i64, [i32; 2]), BtrfsError> {
+/// `f_type` of the file system of a descriptor.
+fn statfs_of(fd: RawFd) -> Result<i64, BtrfsError> {
     let mut st = MaybeUninit::<libc::statfs>::zeroed();
     // SAFETY: `fd` is an open descriptor and `st` is a writable buffer of the
     // size `fstatfs` fills; it was zeroed, so it is initialized whether or
@@ -201,12 +245,34 @@ fn statfs_of(fd: RawFd) -> Result<(i64, [i32; 2]), BtrfsError> {
     // The type of `f_type` differs between targets.
     #[allow(clippy::unnecessary_cast)]
     let magic = st.f_type as i64;
-    const _: () = assert!(std::mem::size_of::<libc::fsid_t>() == std::mem::size_of::<[i32; 2]>());
-    // SAFETY: `fsid_t` is two plain integers, the same size as the array
-    // (asserted above); reading the struct that was just filled as the array
-    // is reading initialized memory.
-    let raw: [i32; 2] = unsafe { std::mem::transmute_copy(&st.f_fsid) };
-    Ok((magic, raw))
+    Ok(magic)
+}
+
+/// The UUID of the file system the descriptor is on, the same for all of its
+/// subvolumes. Needs no privileges.
+fn uuid_of_fd(fd: RawFd) -> Result<[u8; 16], BtrfsError> {
+    let mut args = vec![0u8; FS_INFO_ARGS];
+    loop {
+        // SAFETY: `args` is a writable buffer of exactly the size the ioctl
+        // number encodes, and it stays alive for the call.
+        let rc = unsafe {
+            libc::ioctl(
+                fd,
+                IOC_FS_INFO as _,
+                args.as_mut_ptr().cast::<libc::c_void>(),
+            )
+        };
+        if rc == 0 {
+            break;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e.into());
+        }
+    }
+    args.get(FS_INFO_UUID..FS_INFO_UUID + 16)
+        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        .ok_or(BtrfsError::Hostile("file system id"))
 }
 
 fn fstat_of(fd: RawFd) -> Result<libc::stat, BtrfsError> {
@@ -373,6 +439,58 @@ mod tests {
             !STATX_ATTR_MOUNT_ROOT,
             !STATX_ATTR_MOUNT_ROOT
         ));
+    }
+
+    /// What `btrfs_statfs` puts in `f_fsid`: the file system's UUID folded to
+    /// 64 bits, with the subvolume's id mixed in "to disambiguate subvols".
+    fn kernel_f_fsid(uuid: [u8; 16], subvolume: u64) -> [u32; 2] {
+        let word = |i: usize| u32::from_be_bytes([uuid[i], uuid[i + 1], uuid[i + 2], uuid[i + 3]]);
+        [
+            (word(0) ^ word(8)) ^ (subvolume >> 32) as u32,
+            (word(4) ^ word(12)) ^ subvolume as u32,
+        ]
+    }
+
+    #[test]
+    fn the_subvolumes_of_one_file_system_are_told_together_by_uuid_not_by_f_fsid() {
+        let uuid = [0x11; 16];
+        let other = [0x22; 16];
+        // The root subvolume mounted at `/` and `@home` mounted at `/home`:
+        // the same file system, with different `f_fsid`.
+        let (root, home) = (kernel_f_fsid(uuid, 256), kernel_f_fsid(uuid, 257));
+        assert_ne!(root, home, "the premise: f_fsid differs between subvolumes");
+        assert_eq!(
+            relation(Some(BTRFS_MAGIC), Some(uuid), &uuid),
+            Relation::Same
+        );
+        // Another btrfs file system is another file system.
+        assert_eq!(
+            relation(Some(BTRFS_MAGIC), Some(other), &uuid),
+            Relation::Other
+        );
+        // Anything that is not btrfs is another file system, whatever it says
+        // about a UUID.
+        assert_eq!(relation(Some(0xEF53), Some(uuid), &uuid), Relation::Other);
+        assert_eq!(relation(Some(0xEF53), None, &uuid), Relation::Other);
+        // A question that failed is not an answer.
+        assert_eq!(relation(None, Some(uuid), &uuid), Relation::Unknown);
+        assert_eq!(relation(Some(BTRFS_MAGIC), None, &uuid), Relation::Unknown);
+    }
+
+    #[test]
+    fn the_kernels_fsid_for_a_subvolume_is_its_own() {
+        // Documents the arithmetic above on a value computed by hand.
+        let uuid = [0u8; 16];
+        assert_eq!(kernel_f_fsid(uuid, 0x0000_0001_0000_0002), [1, 2]);
+    }
+
+    #[test]
+    fn the_ioctl_numbers_are_the_kernels() {
+        // `BTRFS_IOC_TREE_SEARCH_V2`, `BTRFS_IOC_INO_LOOKUP` and
+        // `BTRFS_IOC_FS_INFO` as `linux/btrfs.h` defines them.
+        assert_eq!(IOC_TREE_SEARCH_V2, 0xC070_9411);
+        assert_eq!(IOC_INO_LOOKUP, 0xD000_9412);
+        assert_eq!(IOC_FS_INFO, 0x8400_941F);
     }
 
     fn open_dir(path: &str) -> OwnedFd {

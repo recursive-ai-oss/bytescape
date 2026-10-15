@@ -12,7 +12,7 @@ use crate::BtrfsError;
 use crate::error::{Diagnostics, ProblemKind};
 use crate::items::{
     self, DIR_INDEX, EXTENT_DATA, Extent, FIRST_FREE, FS_TREE_ID, INODE_ITEM, LAST_FREE, ROOT_ITEM,
-    ROOT_TREE_ID, Target,
+    ROOT_REF, ROOT_TREE_ID, Target,
 };
 use crate::search::{Flow, Item, Key, TreeSource};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -26,6 +26,9 @@ pub(crate) const MAX_CENSUS_TREES: usize = 1 << 20;
 /// Disk addresses named by damaged extent items that are remembered one by
 /// one; past this, damage makes everything shared.
 pub(crate) const MAX_DAMAGED_REFS: usize = 4096;
+/// Root references looked up to place nested subvolumes, over a whole read.
+/// Past this, entries are left unplaced and shown as unreadable.
+pub(crate) const MAX_REF_LOOKUPS: u64 = MAX_TREES as u64;
 
 pub(crate) const F_DAMAGED: u8 = 1;
 pub(crate) const F_COMPRESSED: u8 = 2;
@@ -85,6 +88,16 @@ pub(crate) struct EntryRec {
     pub name_len: u16,
     pub ty: u8,
     pub subvolume: bool,
+    /// A subvolume entry that the kernel shows as an empty directory, because
+    /// the root tree does not nest that subvolume here. A snapshot keeps the
+    /// entries of the subvolume it was taken from, including those of
+    /// subvolumes nested in it, but not the nesting itself.
+    pub stub: bool,
+    /// A subvolume entry that the root tree confirms: a well-formed root
+    /// reference names this directory and this name. Only a confirmed entry
+    /// is entered; one that is neither confirmed nor a stand-in could not be
+    /// placed, and it is shown unreadable.
+    pub confirmed: bool,
     pub target: u64,
 }
 
@@ -145,6 +158,11 @@ pub(crate) struct Model {
     /// known and every extent is taken as shared.
     pub sharing_unknown: bool,
     pub dropped_trees: u64,
+    /// Searches made of the root tree to place nested subvolumes.
+    ref_lookups: u64,
+    /// A root tree search failed: no more are made, and the entries not yet
+    /// placed stay unplaced.
+    refs_failed: bool,
 }
 
 impl Model {
@@ -163,6 +181,8 @@ impl Model {
             census_trees: 0,
             sharing_unknown: false,
             dropped_trees: 0,
+            ref_lookups: 0,
+            refs_failed: false,
         }
     }
 
@@ -213,7 +233,7 @@ impl Model {
 
 /// What loading one tree found, apart from the tables.
 struct TreeLoad {
-    /// Subvolumes named by directory entries, in order of appearance.
+    /// Subvolumes nested in this tree, in order of appearance.
     children: Vec<u64>,
     new_extents: Vec<u64>,
 }
@@ -394,13 +414,13 @@ fn load_tree(
     let mut stopped = false;
     // The inode the items being read belong to.
     let mut cur: Option<u32> = None;
-    let mut seen_children: HashSet<u64> = HashSet::new();
+    let first_inode = m.inodes.len();
     src.search(tree, from, to, &mut |item: Item<'_>| {
         if cancelled() {
             stopped = true;
             return Flow::Stop;
         }
-        match handle_item(m, tree, item, &mut cur, &mut out, &mut seen_children, diag) {
+        match handle_item(m, tree, item, &mut cur, &mut out, diag) {
             Ok(()) => Flow::Continue,
             Err(e) => {
                 failure = Some(e);
@@ -414,6 +434,7 @@ fn load_tree(
     if stopped {
         return Ok(None);
     }
+    place_subvolumes(src, tree, first_inode, m, &mut out.children, diag);
     Ok(Some(out))
 }
 
@@ -423,7 +444,6 @@ fn handle_item(
     item: Item<'_>,
     cur: &mut Option<u32>,
     out: &mut TreeLoad,
-    seen_children: &mut HashSet<u64>,
     diag: &mut Diagnostics,
 ) -> Result<(), BtrfsError> {
     let key = item.key;
@@ -476,7 +496,7 @@ fn handle_item(
                 return Ok(());
             }
             if key.ty == DIR_INDEX {
-                dir_index(m, tree, at, item.data, out, seen_children, diag)?;
+                dir_index(m, tree, at, item.data, diag)?;
             } else {
                 extent_data(m, tree, at, item.data, out, diag)?;
             }
@@ -484,6 +504,123 @@ fn handle_item(
         _ => {}
     }
     Ok(())
+}
+
+/// Settles, for every subvolume entry of the directories just read from
+/// `tree`, whether the subvolume is really nested there.
+///
+/// A directory entry that names a subvolume is not enough. A snapshot is a
+/// copy of a subvolume's tree, so it carries the entries of the subvolumes
+/// nested in the original; the kernel does not nest them in the snapshot, and
+/// shows an empty directory there (`fixup_tree_root_location` and
+/// `new_simple_dir` in `fs/btrfs/inode.c`). It decides by looking for a root
+/// reference in the tree of trees, keyed (this tree, `ROOT_REF`, the
+/// subvolume), that names this directory and this name. So does the reader:
+/// without that, the snapshot's entry would claim the original's nested
+/// subvolume a second time.
+///
+/// An entry that is neither confirmed nor refuted (the search failed, too
+/// many were made, or the reference item is damaged) is not entered, wherever
+/// its subvolume was loaded from: it is shown as an unreadable directory, and
+/// what is shared is no longer known. A reference that breaks the kernel's
+/// rules for one is damage, not a snapshot's copy, so it does not make a
+/// stand-in.
+fn place_subvolumes(
+    src: &dyn TreeSource,
+    tree: u64,
+    first_inode: usize,
+    m: &mut Model,
+    children: &mut Vec<u64>,
+    diag: &mut Diagnostics,
+) {
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut at = first_inode;
+    while let Some(rec) = m.inodes.get(at).copied() {
+        at = at.saturating_add(1);
+        let start = usize::try_from(rec.entries_start).unwrap_or(usize::MAX);
+        let end = start.saturating_add(usize::try_from(rec.entries_len).unwrap_or(usize::MAX));
+        for index in start..end.min(m.entries.len()) {
+            let Some(entry) = m.entries.get(index).copied() else {
+                break;
+            };
+            if !entry.subvolume {
+                continue;
+            }
+            if m.refs_failed || m.ref_lookups >= MAX_REF_LOOKUPS {
+                diag.note(ProblemKind::SubvolumeSkipped, entry.target, 0);
+                m.sharing_unknown = true;
+                continue;
+            }
+            m.ref_lookups = m.ref_lookups.saturating_add(1);
+            let nested = nested_here(src, tree, rec.ino, m.name_bytes(&entry), entry.target);
+            match nested {
+                Ok(Placement::Nested) => {
+                    if let Some(e) = m.entries.get_mut(index) {
+                        e.confirmed = true;
+                    }
+                    if items::is_subvolume_id(entry.target) && seen.insert(entry.target) {
+                        children.push(entry.target);
+                    }
+                }
+                Ok(Placement::StandIn) => {
+                    if let Some(e) = m.entries.get_mut(index) {
+                        e.stub = true;
+                    }
+                }
+                Ok(Placement::Malformed) => {
+                    // Damage is not a snapshot's copy: what the reference
+                    // should say is not known, so the entry is not placed and
+                    // the subvolume's bytes may be missing from the totals.
+                    diag.note(ProblemKind::ItemMalformed, tree, entry.target);
+                    m.sharing_unknown = true;
+                }
+                Err(_) => {
+                    m.refs_failed = true;
+                    diag.note(ProblemKind::SubvolumeSkipped, entry.target, 0);
+                    m.sharing_unknown = true;
+                }
+            }
+        }
+    }
+}
+
+/// What the root tree says about a subvolume entry.
+enum Placement {
+    /// A well-formed reference names this directory and this name.
+    Nested,
+    /// No reference, or a well-formed one that names another place: the
+    /// kernel's `-ENOENT`, an empty directory.
+    StandIn,
+    /// An item sits at the key but breaks the kernel's rules for one.
+    Malformed,
+}
+
+/// Whether the root tree nests subvolume `child` in directory `dir_ino` of
+/// `tree`, under `name`.
+fn nested_here(
+    src: &dyn TreeSource,
+    tree: u64,
+    dir_ino: u64,
+    name: &[u8],
+    child: u64,
+) -> Result<Placement, BtrfsError> {
+    let key = Key {
+        objectid: tree,
+        ty: ROOT_REF,
+        offset: child,
+    };
+    let mut found = Placement::StandIn;
+    src.search(ROOT_TREE_ID, key, key, &mut |item: Item<'_>| {
+        if item.key == key {
+            found = match items::parse_root_ref(item.data) {
+                Some(r) if r.dirid == dir_ino && r.name == name => Placement::Nested,
+                Some(_) => Placement::StandIn,
+                None => Placement::Malformed,
+            };
+        }
+        Flow::Stop
+    })?;
+    Ok(found)
 }
 
 fn damage(m: &mut Model, at: u32) {
@@ -497,8 +634,6 @@ fn dir_index(
     tree: u64,
     at: u32,
     data: &[u8],
-    out: &mut TreeLoad,
-    seen_children: &mut HashSet<u64>,
     diag: &mut Diagnostics,
 ) -> Result<(), BtrfsError> {
     for entry in items::dir_entries(data) {
@@ -515,9 +650,6 @@ fn dir_index(
             Target::Inode(i) => (false, i),
             Target::Subvolume(t) => (true, t),
         };
-        if subvolume && items::is_subvolume_id(target) && seen_children.insert(target) {
-            out.children.push(target);
-        }
         m.names
             .extend_from_slice(entry.name.get(..usize::from(name_len)).unwrap_or(&[]));
         m.entries.push(EntryRec {
@@ -525,6 +657,8 @@ fn dir_index(
             name_len,
             ty: entry.ty,
             subvolume,
+            stub: false,
+            confirmed: false,
             target,
         });
         if let Some(r) = m.inodes.get_mut(usize::try_from(at).unwrap_or(usize::MAX)) {

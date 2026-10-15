@@ -353,6 +353,9 @@ fn check(compress: Option<&str>, name: &str) {
     );
     if made.nested_subvol {
         assert_eq!(run.report.trees, 2, "the nested subvolume was entered");
+        // The root reference `mkfs` wrote for it names this directory and
+        // this name, so it is nested here and not a stand-in.
+        assert_eq!(run.report.stand_in_dirs, 0);
     } else {
         assert_eq!(
             run.report.trees, 1,

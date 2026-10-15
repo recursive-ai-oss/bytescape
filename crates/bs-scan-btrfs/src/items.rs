@@ -7,6 +7,8 @@ pub const INODE_ITEM: u8 = 1;
 pub const DIR_INDEX: u8 = 96;
 pub const EXTENT_DATA: u8 = 108;
 pub const ROOT_ITEM: u8 = 132;
+/// A subvolume's place in its parent: keyed (parent tree, this, child tree).
+pub const ROOT_REF: u8 = 156;
 
 pub const ROOT_TREE_ID: u64 = 1;
 pub const FS_TREE_ID: u64 = 5;
@@ -124,6 +126,30 @@ impl<'a> DirEntries<'a> {
         self.pos = self.pos.checked_add(total).ok_or(())?;
         Ok(DirEntry { target, ty, name })
     }
+}
+
+/// A root reference item: where the kernel says a subvolume is nested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootRef<'a> {
+    /// The directory of the parent subvolume that holds the entry.
+    pub dirid: u64,
+    /// The name of the entry in that directory.
+    pub name: &'a [u8],
+}
+
+/// Decodes a root reference item (`struct btrfs_root_ref`: directory id,
+/// sequence, name length, then the name).
+///
+/// The kernel's tree checker takes only an item that is exactly the header
+/// and a name of 1 to 255 bytes; anything else is damage, and so it is here.
+pub(crate) fn parse_root_ref(data: &[u8]) -> Option<RootRef<'_>> {
+    let dirid = u64_at(data, 0)?;
+    let name_len = usize::from(u16_at(data, 16)?);
+    if name_len == 0 || name_len > 255 || data.len() != 18usize.checked_add(name_len)? {
+        return None;
+    }
+    let name = bytes_at(data, 18, name_len)?;
+    Some(RootRef { dirid, name })
 }
 
 /// A file extent item, reduced to what the accounting needs.
@@ -395,6 +421,43 @@ mod tests {
         assert_eq!(damaged_extent_target(&item), None);
         item[20] = 9;
         assert_eq!(damaged_extent_target(&item), None);
+    }
+
+    fn root_ref_bytes(dirid: u64, name: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&dirid.to_le_bytes());
+        b.extend_from_slice(&7u64.to_le_bytes());
+        b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        b.extend_from_slice(name);
+        b
+    }
+
+    #[test]
+    fn a_root_reference_gives_its_directory_and_name() {
+        let item = root_ref_bytes(260, b"inner");
+        assert_eq!(
+            parse_root_ref(&item),
+            Some(RootRef {
+                dirid: 260,
+                name: b"inner"
+            })
+        );
+        // Anything cut short of its name, or of its header, is refused.
+        for cut in 0..item.len() {
+            assert_eq!(parse_root_ref(&item[..cut]), None, "{cut}");
+        }
+        // A name length that runs past the item.
+        let mut long = item.clone();
+        long[16..18].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(parse_root_ref(&long), None);
+        // Bytes after the name, an empty name and a name longer than a
+        // name can be are damage, as the kernel's tree checker has it.
+        let mut extra = item;
+        extra.extend_from_slice(b"junk");
+        assert_eq!(parse_root_ref(&extra), None);
+        assert_eq!(parse_root_ref(&root_ref_bytes(260, b"")), None);
+        assert!(parse_root_ref(&root_ref_bytes(260, &[b'a'; 255])).is_some());
+        assert_eq!(parse_root_ref(&root_ref_bytes(260, &[b'a'; 256])), None);
     }
 
     #[test]

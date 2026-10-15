@@ -264,10 +264,64 @@ impl MemFs {
         self.entry(tree, parent, name.as_bytes(), dir, INODE_ITEM, 2);
     }
 
-    /// A subvolume `child` nested at `parent/name` of `tree`.
+    /// A subvolume `child` nested at `parent/name` of `tree`: the directory
+    /// entry, and the root reference the kernel writes in the tree of trees.
     pub fn subvolume(&mut self, tree: u64, parent: u64, name: &str, child: u64) {
         self.make_tree(child);
         self.entry(tree, parent, name.as_bytes(), child, ROOT_ITEM, 2);
+        self.root_ref(tree, parent, name.as_bytes(), child);
+    }
+
+    /// The root reference item that says `child` is nested at `parent/name`
+    /// of `tree`.
+    pub fn root_ref(&mut self, tree: u64, parent: u64, name: &[u8], child: u64) {
+        let mut b = Vec::new();
+        b.extend_from_slice(&parent.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        b.extend_from_slice(name);
+        self.put(ROOT_TREE_ID, tree, ROOT_REF, child, b);
+    }
+
+    /// A directory entry of `tree` that names the subvolume `child` without
+    /// `child` being nested there: what a snapshot keeps of the subvolumes
+    /// that were nested in its origin.
+    pub fn entry_of_unnested_subvolume(&mut self, tree: u64, parent: u64, name: &str, child: u64) {
+        self.entry(tree, parent, name.as_bytes(), child, ROOT_ITEM, 2);
+    }
+
+    /// A snapshot of `origin` as the kernel makes one: a new tree `snapshot`
+    /// with a copy of every item of `origin`, so the same inodes, entries and
+    /// extents, and the same entries for the subvolumes nested in `origin`
+    /// (but no root reference for them). The snapshot is nested at
+    /// `parent/name` of `tree`.
+    pub fn snapshot(&mut self, origin: u64, tree: u64, parent: u64, name: &str, snapshot: u64) {
+        let copies: Vec<_> = self
+            .items
+            .range((origin, Key::MIN)..=(origin, Key::MAX))
+            .map(|((_, k), v)| (*k, v.clone()))
+            .collect();
+        for (k, v) in copies {
+            self.items.insert((snapshot, k), v);
+        }
+        let next = self
+            .next_ino
+            .get(&origin)
+            .copied()
+            .unwrap_or(FIRST_FREE + 1);
+        self.next_ino.insert(snapshot, next);
+        let indexes: Vec<_> = self
+            .next_index
+            .iter()
+            .filter(|((t, _), _)| *t == origin)
+            .map(|((_, d), i)| (*d, *i))
+            .collect();
+        for (d, i) in indexes {
+            self.next_index.insert((snapshot, d), i);
+        }
+        self.put(ROOT_TREE_ID, snapshot, ROOT_ITEM, 0, vec![0u8; 439]);
+        self.entry(tree, parent, name.as_bytes(), snapshot, ROOT_ITEM, 2);
+        self.root_ref(tree, parent, name.as_bytes(), snapshot);
     }
 
     pub fn source(self) -> MemSource {

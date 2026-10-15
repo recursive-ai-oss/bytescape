@@ -124,6 +124,9 @@ pub(crate) struct Emitter<'a> {
     pub unreadable_entries: u64,
     pub vanished_entries: u64,
     pub cancelled: bool,
+    /// Empty directories shown where a snapshot keeps the entry of a
+    /// subvolume that is not nested in it.
+    pub stand_ins: u64,
     pub sharing: Sharing,
     pub compression: Compression,
 }
@@ -199,6 +202,7 @@ impl<'a> Emitter<'a> {
             unreadable_entries: 0,
             vanished_entries: 0,
             cancelled: false,
+            stand_ins: 0,
             sharing: Sharing::default(),
             compression: Compression::default(),
         })
@@ -398,6 +402,10 @@ impl<'a> Emitter<'a> {
         children: &mut Vec<Frame>,
     ) -> bool {
         let model = self.model;
+        if entry.stub {
+            self.stand_in(frame, name);
+            return true;
+        }
         let unreadable = |this: &mut Self, f: ReadFailure| {
             let Some(key) = this.ctx.next_dir_key() else {
                 return;
@@ -412,6 +420,14 @@ impl<'a> Emitter<'a> {
             this.batch.dir(key, frame.key, name, &meta).ok();
             this.batch.unreadable(key, f);
         };
+        if !entry.confirmed {
+            // Not placed (the search failed, too many were made, or the
+            // reference is damaged). The subvolume may have been loaded
+            // another way, but this is not known to be where it is: showing
+            // it here could leave its real place out as a second way in.
+            unreadable(self, failure(ReadErrorKind::Other, 0));
+            return true;
+        }
         let Some(&tree) = model.tree_index.get(&entry.target) else {
             // Beyond the number of subvolumes followed.
             unreadable(self, failure(ReadErrorKind::Other, 0));
@@ -439,6 +455,21 @@ impl<'a> Emitter<'a> {
         }
         self.dir_entry(frame, tree, at, rec, name, children);
         true
+    }
+
+    /// The empty directory the kernel shows where a snapshot has the entry of
+    /// a subvolume that is not nested in it. It is a complete, empty folder.
+    /// The kernel makes it up when the name is looked up and stamps it with
+    /// that moment, so there is no time to report: the time is left at zero.
+    fn stand_in(&mut self, frame: &Frame, name: &[u8]) {
+        let Some(key) = self.ctx.next_dir_key() else {
+            self.out_of_keys(frame, name, 0);
+            return;
+        };
+        bump(&mut self.tally.dirs);
+        bump(&mut self.stand_ins);
+        self.batch.dir(key, frame.key, name, &Meta::default()).ok();
+        self.batch.listing_done(key);
     }
 
     /// A directory that cannot be given a key: it is shown as an unreadable

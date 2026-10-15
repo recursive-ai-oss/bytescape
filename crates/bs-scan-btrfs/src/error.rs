@@ -100,9 +100,10 @@ pub enum ProblemKind {
     /// A nested subvolume's tree could not be read. The subvolume appears as
     /// an unreadable directory.
     SubvolumeUnreadable,
-    /// A subvolume is reached by two entries, or there are more nested
-    /// subvolumes than the reader follows. The extra entry is shown as an
-    /// unreadable directory.
+    /// A subvolume is reached by two entries, there are more nested
+    /// subvolumes than the reader follows, or the root tree could not say
+    /// whether an entry's subvolume is nested where it is named. The extra or
+    /// unplaced entry is shown as an unreadable directory.
     SubvolumeSkipped,
     /// The tree is nested deeper than the reader follows.
     TooDeep,
