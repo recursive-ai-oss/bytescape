@@ -138,6 +138,9 @@ pub fn current() -> Appearance {
 
 #[cfg(target_os = "linux")]
 mod linux;
+// The session-bus rule is shared with the programs started for handoffs.
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{Bus, session_bus};
 #[cfg(any(windows, test))]
 mod windows;
 

@@ -1,6 +1,6 @@
 [package]
 name = "bs-platform"
-description = "Bytescape platform services: trash, reveal, drives, elevation launch."
+description = "Bytescape platform services: trash, reveal and other shell handoffs, installed-software lookup, clipboard, folder dialog, drives, elevation launch."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -29,16 +29,25 @@ windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_Storage_FileSystem",
     # COM, for the shell's file operation that moves items to the Recycle Bin.
     "Win32_System_Com",
+    # Clipboard text, the local time zone, and the system folder.
+    "Win32_System_DataExchange",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_IO",
+    "Win32_System_Kernel",
     "Win32_System_Ioctl",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    "Win32_System_Time",
     "Win32_System_WindowsProgramming",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
+    # The real Windows version, for the crash report.
+    "Wdk_System_SystemServices",
 ] }
 
 [dev-dependencies]

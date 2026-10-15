@@ -1357,6 +1357,21 @@ mod tests {
         yes
     }
 
+    /// The Recycle Bin and its stored settings (the limit and the delete-
+    /// without-the-bin flag in the volume's BitBucket key) belong to the whole
+    /// machine, and tests run side by side. A test that recycles anything, or
+    /// changes those settings, holds this for its whole length, so it never
+    /// sees another test's setting. Declare it before any settings guard, so
+    /// the settings are put back before the next test gets its turn.
+    static BIN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn bin_turn() -> std::sync::MutexGuard<'static, ()> {
+        // A test that failed while holding it has already put the settings
+        // back (its guard ran while unwinding), so the lock is still good.
+        BIN.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -1406,6 +1421,7 @@ mod tests {
         if !disposable_host() {
             return;
         }
+        let _bin = bin_turn();
         let scratch = Scratch::new("roundtrip");
         let file = scratch.0.join("recycle-me.txt");
         fs::write(&file, "contents").unwrap();
@@ -1490,6 +1506,7 @@ mod tests {
         if !disposable_host() {
             return;
         }
+        let _bin = bin_turn();
         // Lower the limit of the drive that holds the scratch folder for the
         // length of the test, and restore it afterwards.
         let scratch = Scratch::new("overflow");
@@ -1503,16 +1520,11 @@ mod tests {
             eprintln!("skipped: the drive has no volume GUID");
             return;
         };
-        let key = crate::bins::winpure::bit_bucket_key(guid);
-        let previous = crate::winreg::read_dword(&key, "MaxCapacity");
-        crate::winreg::write_dword(&key, "MaxCapacity", 1).expect("set a 1 MB limit");
+        // Also puts the settings back if the call below panics.
+        let settings = SettingsGuard::new(crate::bins::winpure::bit_bucket_key(guid));
+        settings.set("NukeOnDelete", 0);
+        settings.set("MaxCapacity", 1);
         let outcomes = d.trash(&[Item::new(&file)], None);
-        match previous {
-            Some(old) => {
-                crate::winreg::write_dword(&key, "MaxCapacity", old).expect("restore the limit");
-            }
-            None => crate::winreg::delete_value(&key, "MaxCapacity"),
-        }
         assert!(
             matches!(
                 outcomes[0],
@@ -1564,6 +1576,7 @@ mod tests {
         if !disposable_host() {
             return;
         }
+        let _bin = bin_turn();
         let scratch = Scratch::new("junction-recycle");
         let target = scratch.0.join("target");
         fs::create_dir_all(&target).unwrap();
@@ -1602,6 +1615,7 @@ mod tests {
         if !disposable_host() {
             return;
         }
+        let _bin = bin_turn();
         let scratch = Scratch::new("limit-edge");
         let probe = disposal(&scratch);
         let Some(drive) = winpure::drive_for(probe.drives(), &scratch.0) else {
@@ -1669,6 +1683,7 @@ mod tests {
         if !disposable_host() {
             return;
         }
+        let _bin = bin_turn();
         let scratch = Scratch::new("limits");
         let d = disposal(&scratch);
         let Some(drive) = winpure::drive_for(d.drives(), &scratch.0) else {
