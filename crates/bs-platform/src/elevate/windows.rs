@@ -333,8 +333,19 @@ pub(super) fn launch(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
-    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, GetKernelObjectSecurity};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSidToSidW,
+    };
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetKernelObjectSecurity,
+        GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorLength, SE_DACL_PROTECTED, WinBuiltinAdministratorsSid,
+        WinLocalSystemSid, WinWorldSid,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE,
+    };
 
     fn unique_name() -> String {
         let mut bytes = [0u8; 16];
@@ -342,70 +353,306 @@ mod tests {
         format!(r"\\.\pipe\bytescape-test-{}", hex(&bytes))
     }
 
-    /// The pipe's access rules as the system reports them, in text form.
-    fn dacl_of(pipe: &PipeEnd) -> String {
-        let mut needed = 0u32;
-        // SAFETY: a null buffer of length 0 asks only for the size needed.
-        unsafe {
-            GetKernelObjectSecurity(
-                pipe.as_raw(),
-                DACL_SECURITY_INFORMATION,
+    /// A security descriptor in its self-relative form, in storage aligned for
+    /// the structures inside it.
+    struct Descriptor(Vec<u64>);
+
+    impl Descriptor {
+        fn as_ptr(&self) -> *mut c_void {
+            self.0.as_ptr().cast_mut().cast()
+        }
+
+        /// The descriptor the system builds from rules written in text.
+        fn from_text(sddl: &str) -> Descriptor {
+            let wide_sddl = wide(sddl);
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            // SAFETY: `wide_sddl` is NUL-terminated and `raw` is writable; the
+            // result is copied out and released with `LocalFree` below.
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide_sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut raw,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(ok, 0, "{sddl}: {}", io::Error::last_os_error());
+            // SAFETY: the conversion produced a valid self-relative descriptor.
+            let length = unsafe { GetSecurityDescriptorLength(raw) } as usize;
+            let mut copy = vec![0u64; length.div_ceil(8)];
+            // SAFETY: `raw` holds `length` bytes and `copy` has room for them.
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.cast::<u8>(), copy.as_mut_ptr().cast(), length);
+                LocalFree(raw as HLOCAL);
+            }
+            Descriptor(copy)
+        }
+
+        /// The access rules of a pipe, as the system holds them.
+        fn of_pipe(pipe: &PipeEnd) -> Descriptor {
+            let mut needed = 0u32;
+            // SAFETY: a null buffer of length 0 asks only for the size needed.
+            unsafe {
+                GetKernelObjectSecurity(
+                    pipe.as_raw(),
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut needed,
+                )
+            };
+            assert!(needed > 0 && needed < 8192);
+            let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+            // SAFETY: `buffer` is writable for at least `needed` bytes.
+            let ok = unsafe {
+                GetKernelObjectSecurity(
+                    pipe.as_raw(),
+                    DACL_SECURITY_INFORMATION,
+                    buffer.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                )
+            };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            Descriptor(buffer)
+        }
+
+        /// The rules in text form, for failure messages only. The text
+        /// abbreviates well-known accounts (`LA` is the built-in
+        /// Administrator), so no check reads it.
+        fn text(&self) -> String {
+            let mut text: *mut u16 = std::ptr::null_mut();
+            let mut length = 0u32;
+            // SAFETY: the descriptor is valid; the text is released with
+            // `LocalFree` below.
+            let ok = unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    self.as_ptr(),
+                    SDDL_REVISION_1,
+                    DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    &mut length,
+                )
+            };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            // SAFETY: the call returned `length` units at `text`.
+            let units = unsafe { std::slice::from_raw_parts(text, length as usize) };
+            let out = String::from_utf16_lossy(units)
+                .trim_end_matches('\0')
+                .to_owned();
+            // SAFETY: allocated by the conversion call above.
+            unsafe { LocalFree(text.cast()) };
+            out
+        }
+
+        fn dacl_is_protected(&self) -> bool {
+            let mut control = 0u16;
+            let mut revision = 0u32;
+            // SAFETY: the descriptor is valid and both outputs are writable.
+            let ok =
+                unsafe { GetSecurityDescriptorControl(self.as_ptr(), &mut control, &mut revision) };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            control & SE_DACL_PROTECTED != 0
+        }
+
+        /// Every rule in the access list: its type, its rights and the bytes of
+        /// the SID it names. Only allow and deny rules have this layout; any
+        /// other kind is reported with an empty SID, which matches nobody.
+        fn rules(&self) -> Vec<Rule> {
+            let mut present = 0i32;
+            let mut defaulted = 0i32;
+            let mut acl: *mut ACL = std::ptr::null_mut();
+            // SAFETY: the descriptor is valid and every output is writable.
+            let ok = unsafe {
+                GetSecurityDescriptorDacl(self.as_ptr(), &mut present, &mut acl, &mut defaulted)
+            };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            // No list at all would admit everyone; report it as a rule.
+            if present == 0 || acl.is_null() {
+                return vec![Rule {
+                    kind: u32::MAX,
+                    mask: u32::MAX,
+                    sid: Vec::new(),
+                }];
+            }
+            let mut size = ACL_SIZE_INFORMATION {
+                AceCount: 0,
+                AclBytesInUse: 0,
+                AclBytesFree: 0,
+            };
+            // SAFETY: `acl` is the list inside the descriptor and `size` is a
+            // writable structure of the length passed.
+            let ok = unsafe {
+                GetAclInformation(
+                    acl,
+                    (&raw mut size).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            };
+            assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+            (0..size.AceCount)
+                .map(|index| {
+                    let mut ace: *mut c_void = std::ptr::null_mut();
+                    // SAFETY: `index` is below the count the list reported.
+                    let ok = unsafe { GetAce(acl, index, &mut ace) };
+                    assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+                    let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+                    // SAFETY: every rule starts with this header, and the reads
+                    // do not assume the alignment of the pointer.
+                    let (kind, mask) = unsafe {
+                        (
+                            u32::from(std::ptr::addr_of!((*ace).Header.AceType).read_unaligned()),
+                            std::ptr::addr_of!((*ace).Mask).read_unaligned(),
+                        )
+                    };
+                    let sid = if kind == ACCESS_ALLOWED_ACE_TYPE || kind == ACCESS_DENIED_ACE_TYPE {
+                        // SAFETY: an allow or deny rule holds a SID from
+                        // `SidStart` to the end of the rule; its length is
+                        // asked of the system and the bytes are copied.
+                        unsafe {
+                            let start = std::ptr::addr_of_mut!((*ace).SidStart).cast::<c_void>();
+                            let length = GetLengthSid(start) as usize;
+                            std::slice::from_raw_parts(start.cast::<u8>(), length).to_vec()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    Rule { kind, mask, sid }
+                })
+                .collect()
+        }
+    }
+
+    struct Rule {
+        kind: u32,
+        mask: u32,
+        sid: Vec<u8>,
+    }
+
+    /// The bytes of a SID written as `S-1-...`.
+    fn sid_from_text(text: &str) -> Vec<u8> {
+        let wide_text = wide(text);
+        let mut sid: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `wide_text` is NUL-terminated and `sid` is writable; the
+        // result is copied and released with `LocalFree`.
+        let ok = unsafe { ConvertStringSidToSidW(wide_text.as_ptr(), &mut sid) };
+        assert_ne!(ok, 0, "{text}: {}", io::Error::last_os_error());
+        // SAFETY: the conversion produced a valid SID.
+        let bytes = unsafe {
+            let length = GetLengthSid(sid) as usize;
+            std::slice::from_raw_parts(sid.cast::<u8>(), length).to_vec()
+        };
+        // SAFETY: allocated by the conversion call above.
+        unsafe { LocalFree(sid as HLOCAL) };
+        bytes
+    }
+
+    /// The bytes of a well-known account's SID (`kind` is a `WinXxxSid` value).
+    fn well_known_sid(kind: i32) -> Vec<u8> {
+        let mut buffer = [0u8; 68];
+        let mut length = buffer.len() as u32;
+        // SAFETY: `buffer` is writable for `length` bytes, the most a SID needs.
+        let ok = unsafe {
+            CreateWellKnownSid(
+                kind,
                 std::ptr::null_mut(),
-                0,
-                &mut needed,
-            )
-        };
-        assert!(needed > 0 && needed < 8192);
-        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
-        // SAFETY: `buffer` is writable for at least `needed` bytes.
-        let ok = unsafe {
-            GetKernelObjectSecurity(
-                pipe.as_raw(),
-                DACL_SECURITY_INFORMATION,
                 buffer.as_mut_ptr().cast(),
-                needed,
-                &mut needed,
-            )
-        };
-        assert_ne!(ok, 0, "{}", io::Error::last_os_error());
-        let mut text: *mut u16 = std::ptr::null_mut();
-        let mut length = 0u32;
-        // SAFETY: the descriptor was filled in above; the text is released with
-        // `LocalFree` below.
-        let ok = unsafe {
-            ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                buffer.as_ptr().cast_mut().cast(),
-                SDDL_REVISION_1,
-                DACL_SECURITY_INFORMATION,
-                &mut text,
                 &mut length,
             )
         };
         assert_ne!(ok, 0, "{}", io::Error::last_os_error());
-        // SAFETY: the call returned `length` units at `text`.
-        let units = unsafe { std::slice::from_raw_parts(text, length as usize) };
-        let out = String::from_utf16_lossy(units)
-            .trim_end_matches('\0')
-            .to_owned();
-        // SAFETY: allocated by the conversion call above.
-        unsafe { LocalFree(text.cast()) };
-        out
+        buffer[..length as usize].to_vec()
+    }
+
+    /// Whether two SIDs are the same account, as the system compares them.
+    fn same_sid(a: &[u8], b: &[u8]) -> bool {
+        if a.is_empty() || b.is_empty() {
+            return false;
+        }
+        // SAFETY: both are complete SIDs copied out by the helpers above.
+        unsafe { EqualSid(a.as_ptr().cast_mut().cast(), b.as_ptr().cast_mut().cast()) != 0 }
+    }
+
+    /// Whether the rules admit `user` and nobody else: protected, one rule,
+    /// which allows, with some rights, and names `user`.
+    fn admits_only(sd: &Descriptor, user: &[u8]) -> Result<(), String> {
+        if !sd.dacl_is_protected() {
+            return Err("the list is not protected, so it can inherit rules".into());
+        }
+        let rules = sd.rules();
+        let [rule] = rules.as_slice() else {
+            return Err(format!("{} rules, not one", rules.len()));
+        };
+        if rule.kind != ACCESS_ALLOWED_ACE_TYPE {
+            return Err("the one rule does not allow".into());
+        }
+        if rule.mask == 0 {
+            return Err("the one rule grants nothing".into());
+        }
+        if !same_sid(&rule.sid, user) {
+            return Err("the one rule names someone else".into());
+        }
+        Ok(())
     }
 
     #[test]
     fn the_pipe_admits_the_current_user_and_nobody_else() {
         let pipe = create_pipe(&unique_name()).unwrap();
-        let sid = crate::bins::windows::user_sid().unwrap();
-        let text = dacl_of(&pipe);
+        let user = sid_from_text(crate::bins::windows::user_sid().unwrap());
+        let sd = Descriptor::of_pipe(&pipe);
         // Protected (no inherited entries), one entry that allows, naming the
-        // user: no administrators group, no system account, no "everyone".
-        assert!(text.starts_with("D:P(A;;"), "{text}");
-        assert!(text.ends_with(&format!(";;;{sid})")), "{text}");
-        assert_eq!(text.matches('(').count(), 1, "{text}");
-        assert!(
-            !text.contains("WD") && !text.contains("BA") && !text.contains("SY"),
-            "{text}"
-        );
+        // user. Compared by SID value, not by the text, which writes some
+        // accounts as two letters (the built-in Administrator is `LA`).
+        admits_only(&sd, &user).unwrap_or_else(|why| panic!("{why}: {}", sd.text()));
+        // Nobody else: neither everyone, nor the administrators group, nor the
+        // system account is named by any rule, unless that is the user itself.
+        let rules = sd.rules();
+        for kind in [WinWorldSid, WinBuiltinAdministratorsSid, WinLocalSystemSid] {
+            let other = well_known_sid(kind);
+            if !same_sid(&user, &other) {
+                assert!(
+                    !rules.iter().any(|r| same_sid(&r.sid, &other)),
+                    "{}",
+                    sd.text()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_check_for_the_users_rule_refuses_every_wider_or_other_rule() {
+        let user_text = crate::bins::windows::user_sid().unwrap();
+        let user = sid_from_text(user_text);
+        let good = Descriptor::from_text(&format!("D:P(A;;GA;;;{user_text})"));
+        admits_only(&good, &user).unwrap();
+        let mut bad = vec![
+            // Not protected: inherited rules would come with it.
+            format!("D:(A;;GA;;;{user_text})"),
+            // An empty list, and a deny rule where an allow belongs.
+            "D:P".to_string(),
+            format!("D:P(D;;GA;;;{user_text})"),
+            // The user plus someone else.
+            format!("D:P(A;;GA;;;{user_text})(A;;GA;;;WD)"),
+            // Rules for everyone and for the administrators group.
+            "D:P(A;;GA;;;WD)".to_string(),
+            "D:P(A;;GA;;;BA)".to_string(),
+        ];
+        if !same_sid(&user, &well_known_sid(WinLocalSystemSid)) {
+            bad.push("D:P(A;;GA;;;SY)".to_string());
+        }
+        for sddl in bad {
+            let sd = Descriptor::from_text(&sddl);
+            assert!(admits_only(&sd, &user).is_err(), "{sddl}");
+        }
+        // The text form of a well-known account is two letters, and a SID that
+        // is not the user's is not matched by looking for those letters.
+        let administrators = Descriptor::from_text("D:P(A;;GA;;;BA)");
+        assert!(admits_only(&administrators, &sid_from_text(user_text)).is_err());
+        assert!(!same_sid(
+            &sid_from_text("S-1-5-32-544"),
+            &sid_from_text("S-1-5-32-545")
+        ));
     }
 
     #[test]
