@@ -135,6 +135,27 @@ fn read_stream<S: ByteSource + ?Sized>(
     Ok(())
 }
 
+/// How many bytes of a stored attribute list may be read: `size`, if the
+/// list's clusters hold that much and it is within `room` and
+/// [`MAX_LIST_BYTES`]. Nothing is allocated for bytes the clusters do not
+/// hold: the runs lie inside the volume, so this ties the allocation to the
+/// size of the device and not only to a field of the record.
+fn stored_len(runs: &[Run], cluster_bytes: u32, size: u64, room: u64) -> Result<usize, ()> {
+    if size > MAX_LIST_BYTES.min(room) {
+        return Err(());
+    }
+    let held = runs
+        .iter()
+        .filter(|r| r.lcn.is_some())
+        .try_fold(0u64, |sum, r| sum.checked_add(r.len))
+        .and_then(|clusters| clusters.checked_mul(u64::from(cluster_bytes)))
+        .ok_or(())?;
+    if size > held {
+        return Err(());
+    }
+    to_usize(size).ok_or(())
+}
+
 /// Reads an attribute stored in clusters (an attribute list), `size` bytes.
 /// `room` is the most memory the read may take beyond what the caller has
 /// charged; a list larger than it, or larger than [`MAX_LIST_BYTES`], is
@@ -146,24 +167,9 @@ fn read_stored<S: ByteSource + ?Sized>(
     size: u64,
     room: u64,
 ) -> Result<Vec<u8>, ()> {
-    if size > MAX_LIST_BYTES.min(room) {
-        return Err(());
-    }
     let mut runs = Vec::new();
     runlist::decode(runs_bytes, 0, geo.clusters, |r| runs.push(r)).map_err(|_| ())?;
-    // Nothing is allocated for bytes the list's clusters do not hold: the
-    // runs lie inside the volume, so this ties the allocation to the size of
-    // the device and not only to the field.
-    let held = runs
-        .iter()
-        .filter(|r| r.lcn.is_some())
-        .try_fold(0u64, |sum, r| sum.checked_add(r.len))
-        .and_then(|clusters| clusters.checked_mul(u64::from(geo.cluster_bytes)))
-        .ok_or(())?;
-    if size > held {
-        return Err(());
-    }
-    let n = to_usize(size).ok_or(())?;
+    let n = stored_len(&runs, geo.cluster_bytes, size, room)?;
     let mut data = vec![0u8; n];
     // A hole or a gap in the runs is as unreadable as a failed read; a list
     // that reads as zeros but is meant to say something is caught by the
@@ -243,6 +249,32 @@ fn runs_overlap(runs: &[Run]) -> bool {
     false
 }
 
+/// The extension records of the table's data that its attribute list names,
+/// as (lowest VCN, record) pairs in `wanted`. The set stops growing at
+/// [`MAX_MFT_EXTENSIONS`]: a list that names more is refused, and refused
+/// before the set could grow to the size of the list.
+fn wanted_extensions(list: &[u8], wanted: &mut BTreeSet<(u64, u64)>) -> Result<(), NtfsError> {
+    let mut too_many = false;
+    list_entries(list, |e| {
+        let (r, _) = split_ref(e.reference);
+        if e.ty == ty::DATA && !e.named && r != 0 && !too_many {
+            let key = (e.lowest_vcn, r);
+            if !wanted.contains(&key) {
+                if wanted.len() >= MAX_MFT_EXTENSIONS {
+                    too_many = true;
+                } else {
+                    wanted.insert(key);
+                }
+            }
+        }
+    })
+    .map_err(|()| NtfsError::BadMft("the table's attribute list is damaged"))?;
+    if too_many {
+        return Err(NtfsError::BadMft("too many extension records"));
+    }
+    Ok(())
+}
+
 fn locate_mft<S: ByteSource + ?Sized>(
     src: &S,
     geo: &Geometry,
@@ -307,18 +339,7 @@ fn locate_mft<S: ByteSource + ?Sized>(
     // of the records.
     if let Some(list) = list {
         let mut wanted: BTreeSet<(u64, u64)> = BTreeSet::new();
-        let mut too_many = false;
-        list_entries(&list, |e| {
-            let (r, _) = split_ref(e.reference);
-            if e.ty == ty::DATA && !e.named && r != 0 {
-                wanted.insert((e.lowest_vcn, r));
-                too_many |= wanted.len() > MAX_MFT_EXTENSIONS;
-            }
-        })
-        .map_err(|()| NtfsError::BadMft("the table's attribute list is damaged"))?;
-        if too_many {
-            return Err(NtfsError::BadMft("too many extension records"));
-        }
+        wanted_extensions(&list, &mut wanted)?;
         for (lowest, r) in wanted {
             let mut buf = read_record(src, geo, &runs, r)?;
             let h = fix_and_parse(&mut buf)
@@ -882,6 +903,143 @@ mod tests {
         for (i, rec) in recs.iter().enumerate() {
             assert_eq!(m.files[*rec as usize].c.logical, 10 + i as u64);
         }
+    }
+
+    fn run(lcn: Option<u64>, len: u64) -> Run {
+        Run { vcn: 0, lcn, len }
+    }
+
+    #[test]
+    fn a_stored_list_is_read_only_as_far_as_its_clusters_hold_it() {
+        let cluster = 4096u32;
+        // Two clusters back the list; a hole backs nothing.
+        let runs = [run(Some(10), 1), run(None, 50), run(Some(20), 1)];
+        assert_eq!(stored_len(&runs, cluster, 8192, 1 << 30), Ok(8192));
+        assert_eq!(stored_len(&runs, cluster, 1, 1 << 30), Ok(1));
+        assert_eq!(stored_len(&runs, cluster, 0, 1 << 30), Ok(0));
+        // One byte more than the clusters hold: nothing is allocated.
+        assert_eq!(stored_len(&runs, cluster, 8193, 1 << 30), Err(()));
+        // Holes do not count, however long.
+        assert_eq!(
+            stored_len(&[run(None, 1 << 40)], cluster, 1, 1 << 30),
+            Err(())
+        );
+        // A size the clusters would hold but the caller has no room for, and
+        // one beyond the fixed cap.
+        assert_eq!(stored_len(&runs, cluster, 8192, 8191), Err(()));
+        let many = [run(Some(1), 1 << 40)];
+        assert_eq!(
+            stored_len(&many, cluster, MAX_LIST_BYTES, u64::MAX),
+            Ok(MAX_LIST_BYTES as usize)
+        );
+        assert_eq!(
+            stored_len(&many, cluster, MAX_LIST_BYTES + 1, u64::MAX),
+            Err(())
+        );
+        // Counting the clusters cannot overflow.
+        let huge = [run(Some(1), u64::MAX), run(Some(2), u64::MAX)];
+        assert_eq!(stored_len(&huge, cluster, 1, u64::MAX), Err(()));
+        assert_eq!(
+            stored_len(&[run(Some(1), u64::MAX)], cluster, 1, u64::MAX),
+            Err(())
+        );
+    }
+
+    /// A list entry for the table's unnamed data in extension record `rec`.
+    fn list_entry(lowest_vcn: u64, rec: u64) -> Vec<u8> {
+        let mut e = vec![0u8; 32];
+        e[0..4].copy_from_slice(&0x80u32.to_le_bytes());
+        e[4..6].copy_from_slice(&32u16.to_le_bytes());
+        e[8..16].copy_from_slice(&lowest_vcn.to_le_bytes());
+        e[16..24].copy_from_slice(&rec.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn the_set_of_extension_records_stops_growing_at_its_limit() {
+        let mut at_limit = Vec::new();
+        for i in 0..MAX_MFT_EXTENSIONS as u64 {
+            at_limit.extend(list_entry(i, i + 1));
+        }
+        // Exactly the most: accepted. The same entries again change nothing.
+        let mut wanted = BTreeSet::new();
+        wanted_extensions(&at_limit, &mut wanted).unwrap();
+        assert_eq!(wanted.len(), MAX_MFT_EXTENSIONS);
+        let mut twice = at_limit.clone();
+        twice.extend(at_limit.clone());
+        let mut wanted = BTreeSet::new();
+        wanted_extensions(&twice, &mut wanted).unwrap();
+        assert_eq!(wanted.len(), MAX_MFT_EXTENSIONS);
+
+        // One more, and then a flood: refused, and the set never grew past
+        // the limit, whatever the size of the list.
+        let mut flood = at_limit;
+        for i in 0..50_000u64 {
+            flood.extend(list_entry(1_000_000 + i, 2_000_000 + i));
+        }
+        let mut wanted = BTreeSet::new();
+        let error = wanted_extensions(&flood, &mut wanted).unwrap_err();
+        assert!(matches!(
+            error,
+            NtfsError::BadMft("too many extension records")
+        ));
+        assert_eq!(wanted.len(), MAX_MFT_EXTENSIONS);
+
+        // Entries that are not the table's unnamed data are not counted.
+        let mut other = Vec::new();
+        for i in 0..(2 * MAX_MFT_EXTENSIONS) as u64 {
+            let mut e = list_entry(i, i + 1);
+            e[0..4].copy_from_slice(&0x30u32.to_le_bytes());
+            other.extend(e);
+        }
+        let mut wanted = BTreeSet::new();
+        wanted_extensions(&other, &mut wanted).unwrap();
+        assert!(wanted.is_empty());
+    }
+
+    #[test]
+    fn an_extension_record_of_the_table_must_be_numbered_for_its_slot() {
+        use crate::testkit::{stamp, unstamp};
+        let build = || {
+            let mut v = Volume::new(Spec {
+                mft_fragments: 6,
+                mft_runs_in_extension: true,
+                ..Spec::default()
+            });
+            for i in 0..120 {
+                v.file(&format!("g{i}"), 5, i);
+            }
+            v.finish()
+        };
+        let load_error = |img: &[u8]| {
+            let geo = crate::boot::parse(&img[..512], img.len() as u64).unwrap();
+            let limits = Limits {
+                max_memory_bytes: 1 << 30,
+                threads: 1,
+            };
+            load(img, geo, limits, &|| false, &mut Diagnostics::default()).err()
+        };
+        let img = build();
+        assert!(load_error(&img).is_none());
+
+        // The extension record sits in slot 15, in the table's first piece
+        // (which starts at cluster 4). Renumber it as slot 16.
+        let at = 4 * 4096 + 15 * 1024;
+        let mut broken = img;
+        let mut rec = broken[at..at + 1024].to_vec();
+        unstamp(&mut rec);
+        assert_eq!(u32::from_le_bytes(rec[0x2C..0x30].try_into().unwrap()), 15);
+        rec[0x2C..0x30].copy_from_slice(&16u32.to_le_bytes());
+        stamp(&mut rec);
+        broken[at..at + 1024].copy_from_slice(&rec);
+        let error = load_error(&broken).expect("a record numbered for another slot is refused");
+        assert!(
+            matches!(
+                error,
+                NtfsError::BadMft("an extension record is another record")
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]

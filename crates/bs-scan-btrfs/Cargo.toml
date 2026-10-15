@@ -9,5 +9,25 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[dependencies]
+bs-tree = { path = "../bs-tree" }
+bs-scan = { path = "../bs-scan" }
+
+# The tree-search and inode-lookup ioctls.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[features]
+# Tests that build btrfs images with `mkfs.btrfs --rootdir` and read them
+# without mounting. They need btrfs-progs and fail loudly without it.
+image-tests = []
+
+[[test]]
+name = "image"
+required-features = ["image-tests"]
+
 [lints]
 workspace = true

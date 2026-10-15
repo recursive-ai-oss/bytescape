@@ -25,7 +25,8 @@
 //! typed problems in the [`NtfsReport`].
 //!
 //! A file that no directory reaches is not left out: when it has a name or
-//! holds clusters it is placed in a folder of the root, which is marked
+//! holds clusters it is placed in a made-up folder of the root (flagged
+//! synthetic, so that nothing is ever done to it by path), which is marked
 //! unreadable so that every total above it reads as a lower bound. Only
 //! records with no name and no bytes (the reserved ones every volume has),
 //! and what lies below a link or mount point the walk did not enter, stay
@@ -231,7 +232,9 @@ pub struct NtfsReport {
     /// folder of the root named `<files outside any folder>` that is marked
     /// unreadable, so the totals above it read as a lower bound: where they
     /// belong is not known, and a directory of theirs may be among the
-    /// records the table lost.
+    /// records the table lost. The folder is made up, not a real path, and
+    /// is flagged [`bs_tree::NodeFlags::SYNTHETIC`]: its name can equal that
+    /// of a real directory, so only the flag identifies it.
     pub adopted: Unaccounted,
     /// Entries of directories that are links or mount points, which are not
     /// entered.

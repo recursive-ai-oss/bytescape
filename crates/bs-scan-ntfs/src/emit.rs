@@ -200,6 +200,47 @@ fn build_graph(model: &Model, diag: &mut Diagnostics) -> Result<Graph, NtfsError
     })
 }
 
+/// The attributes the classification looks at. The bit 0x40000 is "recall on
+/// open" to the system's interface, but on disk it also marks a file that has
+/// extended attributes, which the interface does not report as a recall.
+/// Without a recall reparse point, a file with extended attributes is just
+/// that.
+fn effective_attrs(f: &FileRec) -> u32 {
+    let mut attrs = f.attrs | if f.is_dir() { attr::DIRECTORY } else { 0 };
+    if f.c.flags & F_HAS_EA != 0 {
+        attrs &= !attr::RECALL_ON_OPEN;
+    }
+    attrs
+}
+
+/// What a file-like entry is and the flags it carries: a link or mount point
+/// that was not followed, a cloud placeholder whose size comes from its
+/// record alone, a stream that is sparse or compressed. One place for every
+/// way an entry reaches the tree, so a file placed outside any folder is
+/// described like any other.
+fn kind_and_flags(f: &FileRec, attrs: u32, class: &winrules::Classified) -> (NodeKind, NodeFlags) {
+    let kind = match class.class {
+        EntryClass::Symlink => NodeKind::Symlink,
+        EntryClass::Other => NodeKind::Other,
+        _ => NodeKind::File,
+    };
+    let mut flags = NodeFlags::EMPTY;
+    if class.placeholder {
+        flags |= NodeFlags::CLOUD_PLACEHOLDER;
+    }
+    if class.not_followed {
+        flags |= NodeFlags::NOT_FOLLOWED;
+    }
+    if kind == NodeKind::File
+        && !class.placeholder
+        && (attrs & (attr::SPARSE_FILE | attr::COMPRESSED) != 0
+            || f.c.alloc.saturating_add(SPARSE_MARGIN) <= f.c.logical)
+    {
+        flags |= NodeFlags::SPARSE_OR_COMPRESSED;
+    }
+    (kind, flags)
+}
+
 enum PathSpec {
     Full(Rc<[u8]>),
 }
@@ -213,7 +254,11 @@ struct Frame {
     own_path: u64,
 }
 
-/// The name of the folder that holds files no directory reaches.
+/// The name of the folder that holds files no directory reaches. The name
+/// tells a person what it is, nothing more: a real directory may carry the
+/// same name (POSIX names on NTFS may contain `<`), so nothing may identify
+/// the folder by it. The folder carries [`NodeFlags::SYNTHETIC`], which is
+/// what the interface and the delete flows test.
 pub(crate) const ORPHANS_NAME: &[u8] = b"<files outside any folder>";
 
 #[derive(Default)]
@@ -329,10 +374,7 @@ impl<'a> Emitter<'a> {
         };
         let reached = bitset()?;
         let shadowed = bitset()?;
-        let classifier = ctx
-            .options()
-            .categories
-            .then(Classifier::from_process_environment);
+        let classifier = ctx.classifier();
         Ok(Emitter {
             model,
             ctx,
@@ -612,14 +654,7 @@ impl<'a> Emitter<'a> {
             return;
         }
 
-        // The bit 0x40000 is "recall on open" to the system's interface, but
-        // on disk it also marks a file that has extended attributes, which
-        // the interface does not report as a recall. Without a recall
-        // reparse point, a file with extended attributes is just that.
-        let mut attrs = f.attrs | if f.is_dir() { attr::DIRECTORY } else { 0 };
-        if f.c.flags & F_HAS_EA != 0 {
-            attrs &= !attr::RECALL_ON_OPEN;
-        }
+        let attrs = effective_attrs(&f);
         let class = winrules::classify(attrs, f.reparse_tag);
         // A directory is entered unless it is a link or mount point. A cloud
         // placeholder folder is entered too: the walker must not list one,
@@ -645,26 +680,8 @@ impl<'a> Emitter<'a> {
         class: &winrules::Classified,
     ) {
         let first_sight = !self.test_and_set(edge.file);
-        let kind = match class.class {
-            EntryClass::Symlink => NodeKind::Symlink,
-            EntryClass::Other => NodeKind::Other,
-            _ => NodeKind::File,
-        };
         let (logical, allocated) = self.sizes(f, f.is_dir());
-        let mut flags = NodeFlags::EMPTY;
-        if class.placeholder {
-            flags |= NodeFlags::CLOUD_PLACEHOLDER;
-        }
-        if class.not_followed {
-            flags |= NodeFlags::NOT_FOLLOWED;
-        }
-        if kind == NodeKind::File
-            && !class.placeholder
-            && (attrs & (attr::SPARSE_FILE | attr::COMPRESSED) != 0
-                || f.c.alloc.saturating_add(SPARSE_MARGIN) <= f.c.logical)
-        {
-            flags |= NodeFlags::SPARSE_OR_COMPRESSED;
-        }
+        let (kind, mut flags) = kind_and_flags(f, attrs, class);
         let mut link = None;
         let names = self
             .graph
@@ -928,7 +945,11 @@ impl<'a> Emitter<'a> {
                     let Some(k) = self.ctx.next_dir_key() else {
                         return false;
                     };
-                    self.batch.dir(k, root, ORPHANS_NAME, &Meta::default()).ok();
+                    let meta = Meta {
+                        flags: NodeFlags::SYNTHETIC,
+                        ..Meta::default()
+                    };
+                    self.batch.dir(k, root, ORPHANS_NAME, &meta).ok();
                     bump(&mut self.tally.dirs);
                     folder = Some(k);
                     k
@@ -947,12 +968,29 @@ impl<'a> Emitter<'a> {
             };
             Self::set_bit(&mut self.reached, i);
             let (logical, allocated) = self.sizes(f, f.is_dir());
+            // Described like any other entry: a placeholder, a link that is
+            // not followed, a sparse stream, and the category by extension
+            // (the place is not known, so the place gives none). A directory
+            // is not entered: what lies in it is placed here as well, flat.
+            let attrs = effective_attrs(f);
+            let class = winrules::classify(attrs, f.reparse_tag);
+            let (mut kind, mut flags) = kind_and_flags(f, attrs, &class);
+            if f.is_dir() && class.class == EntryClass::Dir {
+                kind = NodeKind::Other;
+            }
+            if scratch.len() > 1 && !f.is_dir() {
+                flags |= NodeFlags::HARD_LINK;
+            }
             let mut meta = Meta {
                 logical,
                 allocated,
                 mtime: f.mtime,
+                flags,
                 ..Meta::default()
             };
+            if let Some(classifier) = &self.classifier {
+                meta.category = classifier.category(None, kind, name);
+            }
             if f.damaged() {
                 meta.failure = Some(failure(false));
                 bump(&mut self.tally.unreadable);
@@ -962,11 +1000,6 @@ impl<'a> Emitter<'a> {
             self.tally.allocated = self.tally.allocated.saturating_add(allocated);
             self.tally.logical = self.tally.logical.saturating_add(logical);
             self.note_extras(f);
-            let kind = if f.is_dir() {
-                NodeKind::Other
-            } else {
-                NodeKind::File
-            };
             self.batch.file(kind, key, name, &meta).ok();
             self.adopted.files = self.adopted.files.saturating_add(1);
             self.adopted.allocated = self.adopted.allocated.saturating_add(Self::clusters_of(f));

@@ -408,6 +408,148 @@ fn files_no_directory_reaches_do_not_leave_the_root_looking_exact() {
     assert_eq!(root.allocated(), mft + 6_004_736);
 }
 
+/// The root's children called `name`, as the tree has them (a name is not
+/// unique: a real directory may be called what the made-up folder is).
+fn root_children<'a>(result: &'a ScanResult, name: &str) -> Vec<bs_tree::NodeRef<'a>> {
+    result
+        .snapshot
+        .root()
+        .unwrap()
+        .children()
+        .filter(|c| c.name() == name.as_bytes())
+        .collect()
+}
+
+#[test]
+fn the_folder_of_strays_is_marked_made_up_and_nothing_in_it_is_a_real_path() {
+    let mut v = Volume::new(Spec::default());
+    v.file("fine", ROOT, 5_000);
+    let stale = v.file("stale", ROOT, 8_000);
+    v.ent_mut(stale).names[0].parent_seq = 77;
+    let (result, report, _) = full(v);
+    assert_eq!(report.adopted.files, 1);
+    let folder = String::from_utf8_lossy(crate::emit::ORPHANS_NAME).into_owned();
+    let made_up = root_children(&result, &folder);
+    assert_eq!(made_up.len(), 1);
+    assert!(made_up[0].is_synthetic());
+    let inside: Vec<_> = made_up[0].children().collect();
+    assert_eq!(inside.len(), 1);
+    assert!(!inside[0].is_synthetic());
+    assert!(inside[0].is_under_synthetic());
+    // The rest of the tree is real.
+    for c in result.snapshot.root().unwrap().children() {
+        if c.id() != made_up[0].id() {
+            assert!(
+                !c.is_under_synthetic(),
+                "{:?}",
+                String::from_utf8_lossy(c.name())
+            );
+        }
+    }
+    assert!(!result.snapshot.root().unwrap().is_under_synthetic());
+}
+
+/// POSIX names on NTFS may hold `<` and `>`, so a real directory can be called
+/// what the made-up folder is called. Only the mark tells them apart.
+#[test]
+fn a_real_directory_with_the_name_of_the_folder_of_strays_is_not_mistaken_for_it() {
+    let folder = String::from_utf8_lossy(crate::emit::ORPHANS_NAME).into_owned();
+    let mut v = Volume::new(Spec::default());
+    let real = v.dir(&folder, ROOT);
+    v.file("mine", real, 12_288);
+    let stale = v.file("stray", ROOT, 8_000);
+    v.ent_mut(stale).names[0].parent_seq = 77;
+    let (result, report, _) = full(v);
+    assert_eq!(report.adopted.files, 1);
+    let same_name = root_children(&result, &folder);
+    assert_eq!(
+        same_name.len(),
+        2,
+        "the real directory and the made-up folder"
+    );
+    let synthetic: Vec<_> = same_name.iter().filter(|n| n.is_synthetic()).collect();
+    let real_ones: Vec<_> = same_name.iter().filter(|n| !n.is_synthetic()).collect();
+    assert_eq!((synthetic.len(), real_ones.len()), (1, 1));
+    // The user's file is under the real one and may be acted on; the stray
+    // is under the made-up one and may not.
+    let mine = real_ones[0].children().next().expect("the real file");
+    assert_eq!(mine.name(), b"mine");
+    assert!(!mine.is_under_synthetic());
+    assert!(!real_ones[0].is_under_synthetic());
+    let stray = synthetic[0].children().next().expect("the stray");
+    assert_eq!(stray.name(), b"stray");
+    assert!(stray.is_under_synthetic());
+    // The made-up one is the one that reads as a lower bound.
+    assert!(synthetic[0].is_unreadable());
+    assert!(!real_ones[0].is_unreadable());
+    result.snapshot.verify().unwrap();
+}
+
+#[test]
+fn a_stray_is_described_like_any_other_entry() {
+    const RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
+    let mut v = Volume::new(Spec::default());
+    let strays = v.dir("strays", ROOT);
+    // Each of these lives in a directory that is gone (a stale name).
+    let placeholder = v.file("cloud.docx", strays, 70_000);
+    v.set_attrs(placeholder, 0x20 | RECALL_ON_DATA_ACCESS | 0x400);
+    let symlink = v.file("link", strays, 0);
+    v.reparse(symlink, 0xA000_000C);
+    let sparse = v.sparse_file("holes.bin", strays, 2, 100, 3);
+    let movie = v.file("movie.mkv", strays, 50_000);
+    let plain = v.file("notes.zzz", strays, 50_000);
+    let hardly = v.file("twice", strays, 20_000);
+    v.link(hardly, "twice-again", strays);
+    for rec in [placeholder, symlink, sparse, movie, plain, hardly] {
+        for n in &mut v.ent_mut(rec).names {
+            n.parent_seq = 77;
+        }
+    }
+    // The directory itself is gone as well: nothing reaches its children.
+    v.ent_mut(strays).names[0].parent_seq = 77;
+    let (result, report, _) = full(v);
+    assert_eq!(report.adopted.files, 7);
+    let folder = String::from_utf8_lossy(crate::emit::ORPHANS_NAME).into_owned();
+    let made_up = root_children(&result, &folder);
+    let at = |name: &str| {
+        made_up[0]
+            .children()
+            .find(|c| c.name() == name.as_bytes())
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    assert!(
+        at("cloud.docx")
+            .flags()
+            .contains(NodeFlags::CLOUD_PLACEHOLDER)
+    );
+    assert_eq!(at("link").kind(), NodeKind::Symlink);
+    assert!(at("link").flags().contains(NodeFlags::NOT_FOLLOWED));
+    assert!(
+        at("holes.bin")
+            .flags()
+            .contains(NodeFlags::SPARSE_OR_COMPRESSED)
+    );
+    assert!(
+        !at("notes.zzz")
+            .flags()
+            .contains(NodeFlags::SPARSE_OR_COMPRESSED)
+    );
+    assert_eq!(at("notes.zzz").category().0, 0);
+    let video = bs_scan::Classifier::with_environment(&bs_scan::Environment::new())
+        .category(None, NodeKind::File, b"movie.mkv")
+        .0;
+    assert_ne!(video, 0);
+    assert_eq!(at("movie.mkv").category().0, video);
+    assert_eq!(at("strays").kind(), NodeKind::Other);
+    // A file that has two names is flagged, though only one is placed.
+    let twice = made_up[0]
+        .children()
+        .find(|c| c.name() == b"twice" || c.name() == b"twice-again")
+        .expect("the file with two names");
+    assert!(twice.flags().contains(NodeFlags::HARD_LINK));
+    result.snapshot.verify().unwrap();
+}
+
 /// The reserved records every volume has (in use, no name, no bytes) are
 /// not files; they are the baseline, and they do not mark the root.
 #[test]

@@ -31,8 +31,10 @@
 use crate::error::{BatchFull, DecodeError};
 use crate::types::{Category, DirKey, FileKey, NodeFlags, NodeKind, ReadErrorKind, ReadFailure};
 
-/// The serialized format version written by [`Batch::encode`].
-pub const BATCH_FORMAT_VERSION: u16 = 1;
+/// The serialized format version written by [`Batch::encode`]. Version 2
+/// added the optional exclusive-bytes field of shared entries; a decoder of
+/// version 1 would refuse such an entry, so the number moved with it.
+pub const BATCH_FORMAT_VERSION: u16 = 2;
 
 const MAGIC: [u8; 4] = *b"BSTB";
 const HEADER_LEN: usize = 16;
@@ -50,6 +52,7 @@ const TAG_UNREADABLE: u8 = 3;
 
 const OPT_LINK: u8 = 1;
 const OPT_FAILURE: u8 = 2;
+const OPT_EXCLUSIVE: u8 = 4;
 
 /// Where an entry's name lies in the batch's name block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -87,6 +90,12 @@ pub struct Meta {
     /// Set when the entry itself could not be inspected. For a directory this
     /// means it could not be opened, and it counts as finished listing.
     pub failure: Option<ReadFailure>,
+    /// For an entry flagged [`NodeFlags::SHARED`]: how many of its
+    /// `allocated` bytes belong to this entry alone, so deleting it frees
+    /// them. The rest is also used by other files (reflinks, snapshots) or
+    /// counted at another name. Ignored, and read as zero, for an entry that
+    /// is not shared; kept at most `allocated`.
+    pub exclusive: u64,
 }
 
 /// A directory entry.
@@ -264,6 +273,9 @@ impl Batch {
                     if meta.failure.is_some() {
                         opt |= OPT_FAILURE;
                     }
+                    if meta.flags.contains(NodeFlags::SHARED) {
+                        opt |= OPT_EXCLUSIVE;
+                    }
                     out.push(TAG_ENTRY);
                     out.push(entry.kind as u8);
                     out.extend_from_slice(&meta.flags.bits().to_le_bytes());
@@ -283,6 +295,9 @@ impl Batch {
                     if let Some(failure) = meta.failure {
                         out.push(failure.kind as u8);
                         out.extend_from_slice(&failure.code.to_le_bytes());
+                    }
+                    if opt & OPT_EXCLUSIVE != 0 {
+                        out.extend_from_slice(&meta.exclusive.to_le_bytes());
                     }
                 }
                 Record::ListingDone { dir } => {
@@ -367,11 +382,12 @@ fn skip_record(cur: &mut Cursor<'_>) -> Result<(), DecodeError> {
             const FIXED: usize = 1 + 2 + 1 + 1 + 4 + 4 + 4 + 4 + 8 + 8 + 8;
             let head = cur.take(FIXED)?;
             let opt = head.get(4).copied().ok_or(DecodeError::Truncated)?;
-            if opt & !(OPT_LINK | OPT_FAILURE) != 0 {
+            if opt & !(OPT_LINK | OPT_FAILURE | OPT_EXCLUSIVE) != 0 {
                 return Err(DecodeError::BadValue);
             }
             (if opt & OPT_LINK != 0 { 8 + 16 } else { 0 })
                 + (if opt & OPT_FAILURE != 0 { 1 + 4 } else { 0 })
+                + (if opt & OPT_EXCLUSIVE != 0 { 8 } else { 0 })
         }
         TAG_LISTING_DONE => 4,
         TAG_UNREADABLE => 4 + 1 + 4,
@@ -398,7 +414,7 @@ fn decode_record(cur: &mut Cursor<'_>, names_len: usize) -> Result<Record, Decod
             let flags = NodeFlags::from_bits_truncate(cur.u16()?).and(NodeFlags::PRODUCER_MASK);
             let category = Category(cur.u8()?);
             let opt = cur.u8()?;
-            if opt & !(OPT_LINK | OPT_FAILURE) != 0 {
+            if opt & !(OPT_LINK | OPT_FAILURE | OPT_EXCLUSIVE) != 0 {
                 return Err(DecodeError::BadValue);
             }
             let key = DirKey(cur.u32()?);
@@ -429,6 +445,11 @@ fn decode_record(cur: &mut Cursor<'_>, names_len: usize) -> Result<Record, Decod
             } else {
                 None
             };
+            let exclusive = if opt & OPT_EXCLUSIVE != 0 {
+                cur.u64()?
+            } else {
+                0
+            };
             Ok(Record::Entry(Entry {
                 kind,
                 key,
@@ -442,6 +463,11 @@ fn decode_record(cur: &mut Cursor<'_>, names_len: usize) -> Result<Record, Decod
                     category,
                     link,
                     failure,
+                    exclusive: if flags.contains(NodeFlags::SHARED) {
+                        exclusive
+                    } else {
+                        0
+                    },
                 },
             }))
         }
@@ -531,6 +557,7 @@ mod tests {
                 kind: ReadErrorKind::Io,
                 code: -5,
             }),
+            exclusive: 1000,
         };
         b.dir(DirKey(0), DirKey::NONE, b"/root", &Meta::default())
             .unwrap();
@@ -558,6 +585,7 @@ mod tests {
             panic!("entry expected");
         };
         assert_eq!(e.meta.flags, NodeFlags::SHARED);
+        assert_eq!(e.meta.exclusive, 1000);
         assert_eq!(back.name(e.name), Some(&b"a\xff\n"[..]));
         assert_eq!(back.len(), batch.len());
         assert_eq!(back.records()[2], batch.records()[2]);
@@ -586,6 +614,16 @@ mod tests {
         let mut bad = bytes.clone();
         bad[0] = b'X';
         assert_eq!(Batch::decode(&bad), Err(DecodeError::BadMagic));
+        // The header carries the version the encoder wrote, so a stream from
+        // an older format is refused by number, not by luck.
+        assert_eq!(bytes[4..6], BATCH_FORMAT_VERSION.to_le_bytes());
+        assert_eq!(BATCH_FORMAT_VERSION, 2);
+        let mut older = bytes.clone();
+        older[4..6].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            Batch::decode(&older),
+            Err(DecodeError::UnsupportedVersion(1))
+        );
         let mut bad = bytes.clone();
         bad[4] = 99;
         assert_eq!(

@@ -26,7 +26,7 @@ const POOL_MASK: u32 = (1 << POOL_BITS) - 1;
 const POOL_MAX_CHUNKS: usize = 1 << (32 - POOL_BITS);
 
 // Layout of the per-node `bits` column.
-const FLAG_BITS: u16 = NodeFlags::ALL;
+const FLAG_BITS: u16 = NodeFlags::STORED;
 const DELETE_SHIFT: u16 = 12;
 const KIND_SHIFT: u16 = 14;
 
@@ -179,6 +179,13 @@ pub(crate) struct Store {
     pub(crate) delete_totals: Arc<FastMap<u32, DeleteTotals>>,
     pub(crate) failures: Arc<FastMap<u32, ReadFailure>>,
     pub(crate) link_origin: Arc<FastMap<u32, u32>>,
+    /// Nodes the producer made up (see [`NodeFlags::SYNTHETIC`]).
+    pub(crate) synthetic: Arc<FastMap<u32, ()>>,
+    /// Hard-linked files that carry their bytes (the first name seen), so the
+    /// free estimate can find them without looking at every node.
+    pub(crate) linked: Arc<FastMap<u32, ()>>,
+    /// For shared entries: the allocated bytes that are theirs alone.
+    pub(crate) exclusive: Arc<FastMap<u32, u64>>,
     pub(crate) meta: Meta,
 }
 
@@ -290,7 +297,7 @@ impl Store {
 
     pub(crate) fn set_flag(&mut self, id: u32, flag: NodeFlags) {
         if let Some((c, i)) = self.slot_mut(id) {
-            c.bits[i & CHUNK_MASK as usize] |= flag.bits();
+            c.bits[i & CHUNK_MASK as usize] |= flag.bits() & FLAG_BITS;
         }
     }
 

@@ -145,10 +145,7 @@ impl Scanner for Walker {
         });
 
         // Read once, here, before any worker exists.
-        let classifier = ctx
-            .options()
-            .categories
-            .then(Classifier::from_process_environment);
+        let classifier = ctx.classifier();
         let root_path: Box<[u8]> = if classifier.is_some() {
             canonical.as_os_str().as_bytes().into()
         } else {

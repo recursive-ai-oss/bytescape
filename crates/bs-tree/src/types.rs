@@ -126,6 +126,14 @@ impl NodeFlags {
     /// lower-bound flags it says the figure may be off in either direction,
     /// and an interface shows "≈" for it. Set by the scanner.
     pub const ESTIMATED_SIZE: NodeFlags = NodeFlags(1 << 11);
+    /// The entry is not a real file or folder: the reader made it up to hold
+    /// things it could not place (files that no folder reaches). Its name is
+    /// not a path component, so nothing may be done to it, or to anything
+    /// below it, by name. Set by the scanner. Unlike the other flags it is not
+    /// kept in the node's flag bits: ask [`crate::NodeRef::is_synthetic`] and
+    /// [`crate::NodeRef::is_under_synthetic`]; the flag is for the producer's
+    /// [`Meta`](crate::Meta) only.
+    pub const SYNTHETIC: NodeFlags = NodeFlags(1 << 12);
 
     /// The flags a scanner may set. The tree ignores any other bit in a
     /// record.
@@ -135,11 +143,17 @@ impl NodeFlags {
             | Self::CLOUD_PLACEHOLDER.0
             | Self::NOT_FOLLOWED.0
             | Self::SPARSE_OR_COMPRESSED.0
-            | Self::ESTIMATED_SIZE.0,
+            | Self::ESTIMATED_SIZE.0
+            | Self::SYNTHETIC.0,
     );
 
     /// Every defined bit.
-    pub(crate) const ALL: u16 = (1 << 12) - 1;
+    pub(crate) const ALL: u16 = (1 << 13) - 1;
+
+    /// The bits kept in a node's flag column. The column has twelve bits
+    /// (the rest of its 16 hold the delete state and the kind), so
+    /// [`NodeFlags::SYNTHETIC`] is kept in a side table instead.
+    pub(crate) const STORED: u16 = (1 << 12) - 1;
 
     /// The raw bits.
     pub const fn bits(self) -> u16 {
@@ -181,7 +195,7 @@ impl BitOrAssign for NodeFlags {
 
 impl fmt::Debug for NodeFlags {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const NAMES: [(NodeFlags, &str); 12] = [
+        const NAMES: [(NodeFlags, &str); 13] = [
             (NodeFlags::COMPLETE, "COMPLETE"),
             (NodeFlags::UNREADABLE, "UNREADABLE"),
             (NodeFlags::UNREADABLE_BELOW, "UNREADABLE_BELOW"),
@@ -194,6 +208,7 @@ impl fmt::Debug for NodeFlags {
             (NodeFlags::NAME_TRUNCATED, "NAME_TRUNCATED"),
             (NodeFlags::RECORDS_LOST_BELOW, "RECORDS_LOST_BELOW"),
             (NodeFlags::ESTIMATED_SIZE, "ESTIMATED_SIZE"),
+            (NodeFlags::SYNTHETIC, "SYNTHETIC"),
         ];
         let mut first = true;
         write!(f, "NodeFlags(")?;

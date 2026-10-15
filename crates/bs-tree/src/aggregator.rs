@@ -612,9 +612,22 @@ impl Aggregator {
         if let Some(key) = first_sighting {
             self.links.insert(key, id);
         }
+        if flags.contains(NodeFlags::SYNTHETIC) {
+            Arc::make_mut(&mut self.store.synthetic).insert(id, ());
+        }
+        if flags.contains(NodeFlags::SHARED) {
+            // A later name of a counted file adds nothing, and so frees
+            // nothing either.
+            Arc::make_mut(&mut self.store.exclusive).insert(id, e.meta.exclusive.min(allocated));
+        }
+        if flags.contains(NodeFlags::HARD_LINK) && duplicate_of.is_none() {
+            // A name that carries the bytes of a file with other names.
+            Arc::make_mut(&mut self.store.linked).insert(id, ());
+        }
         if let Some(origin) = duplicate_of {
             Arc::make_mut(&mut self.store.link_origin).insert(id, origin);
             self.store.set_flag(origin, NodeFlags::HARD_LINK);
+            Arc::make_mut(&mut self.store.linked).insert(origin, ());
         }
         if parent != NONE {
             pending.add(

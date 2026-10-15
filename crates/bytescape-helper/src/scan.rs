@@ -473,6 +473,7 @@ mod tests {
             category: Category::OTHER,
             link: None,
             failure: None,
+            exclusive: 0,
         };
         batch.dir(DirKey(0), DirKey::NONE, b"root", &meta).unwrap();
         for i in 0..entries {

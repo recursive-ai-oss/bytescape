@@ -460,6 +460,12 @@ dependencies = [
 [[package]]
 name = "bs-scan-btrfs"
 version = "0.1.0"
+dependencies = [
+ "bs-scan",
+ "bs-tree",
+ "libc",
+ "proptest",
+]
 
 [[package]]
 name = "bs-scan-ext4"
@@ -483,6 +489,12 @@ dependencies = [
 [[package]]
 name = "bs-scan-xfs"
 version = "0.1.0"
+dependencies = [
+ "bs-scan",
+ "bs-tree",
+ "libc",
+ "proptest",
+]
 
 [[package]]
 name = "bs-tree"

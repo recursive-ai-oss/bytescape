@@ -23,7 +23,7 @@ pub(crate) fn set_ignore_mount_ids(on: bool) {
 
 /// The fields of `statx` the walker uses.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Stat {
+pub struct Stat {
     pub mode: u32,
     pub nlink: u32,
     pub ino: u64,
@@ -92,12 +92,12 @@ fn statx_raw(
 
 /// `statx` of `name` inside the directory `dir`, without following a final
 /// symbolic link.
-pub(crate) fn stat_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<Stat> {
+pub fn stat_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<Stat> {
     statx_raw(dir.as_raw_fd(), name.as_ptr(), FLAGS)
 }
 
 /// `statx` of an open directory itself.
-pub(crate) fn stat_fd(fd: BorrowedFd<'_>) -> io::Result<Stat> {
+pub fn stat_fd(fd: BorrowedFd<'_>) -> io::Result<Stat> {
     statx_raw(fd.as_raw_fd(), c"".as_ptr(), FLAGS | libc::AT_EMPTY_PATH)
 }
 
@@ -106,7 +106,7 @@ const DIR_FLAGS: libc::c_int =
 
 /// Opens the scan root. The caller has resolved the path, so symbolic links in
 /// it are the user's choice; nothing below the root is followed.
-pub(crate) fn open_root(path: &Path) -> io::Result<OwnedFd> {
+pub fn open_root(path: &Path) -> io::Result<OwnedFd> {
     let c = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     open_raw(
@@ -118,7 +118,7 @@ pub(crate) fn open_root(path: &Path) -> io::Result<OwnedFd> {
 
 /// Opens the directory `name` inside `dir`. Fails with `ELOOP` or `ENOTDIR` if
 /// it has been replaced by a link or a file since it was listed.
-pub(crate) fn open_dir_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<OwnedFd> {
+pub fn open_dir_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<OwnedFd> {
     open_raw(dir.as_raw_fd(), name, DIR_FLAGS)
 }
 
@@ -140,7 +140,7 @@ fn open_raw(dirfd: libc::c_int, name: &CStr, flags: libc::c_int) -> io::Result<O
 
 /// Reads directory records into `buf`. Returns the number of bytes filled, 0 at
 /// the end of the directory.
-pub(crate) fn getdents(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
+pub fn getdents(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         // SAFETY: `buf` is a valid writable region of `buf.len()` bytes; the
         // kernel writes at most that many.
@@ -165,7 +165,7 @@ pub(crate) fn getdents(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> 
 
 /// Raises the soft limit on open files to the hard limit, once. A deep tree
 /// keeps one handle per level that still has unvisited subdirectories.
-pub(crate) fn raise_open_file_limit() -> Option<u64> {
+pub fn raise_open_file_limit() -> Option<u64> {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

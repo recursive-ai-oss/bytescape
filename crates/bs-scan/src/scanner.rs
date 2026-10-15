@@ -26,6 +26,8 @@
 //! and everything unfinished stays incomplete.
 
 use crate::boundary::Boundary;
+use crate::classify::Classifier;
+use bs_knowledge::Environment;
 use bs_tree::{Aggregator, Batch, DirKey, SnapshotReader};
 use std::fmt;
 use std::io;
@@ -95,6 +97,23 @@ pub struct ScanOptions {
     /// entry unclassified, which only helps to measure what classification
     /// costs.
     pub categories: bool,
+    /// The places the category lookups resolve against: the user's home
+    /// folder, the system folders, and so on. `None`, the default, reads the
+    /// process environment once when the scan starts. A caller whose own
+    /// environment is not the user's (the elevated helper runs as another
+    /// user) gives the user's here instead, so that no scan has to change
+    /// the process environment first.
+    pub environment: Option<Environment>,
+}
+
+impl ScanOptions {
+    /// These options with the category lookups resolved against `environment`
+    /// instead of the process environment.
+    #[must_use]
+    pub fn with_environment(mut self, environment: Environment) -> ScanOptions {
+        self.environment = Some(environment);
+        self
+    }
 }
 
 impl Default for ScanOptions {
@@ -105,6 +124,7 @@ impl Default for ScanOptions {
             os_used_bytes: None,
             publish_interval: Duration::from_millis(100),
             categories: true,
+            environment: None,
         }
     }
 }
@@ -233,6 +253,19 @@ impl ScanContext {
     /// The caller's options.
     pub fn options(&self) -> &ScanOptions {
         &self.options
+    }
+
+    /// The category lookup this scan uses, or `None` when the caller turned
+    /// categories off. It resolves against [`ScanOptions::environment`] when
+    /// that is set and against the process environment otherwise, so call it
+    /// once, on the thread that starts the scan, before any worker exists.
+    pub fn classifier(&self) -> Option<Classifier> {
+        self.options
+            .categories
+            .then(|| match &self.options.environment {
+                Some(environment) => Classifier::with_environment(environment),
+                None => Classifier::from_process_environment(),
+            })
     }
 
     /// The next directory key. Keys are unique within the scan: a counter
@@ -629,6 +662,33 @@ mod tests {
         });
         rx.recv_timeout(limit)
             .expect("the scan ended within the time limit")
+    }
+
+    #[test]
+    fn the_classifier_follows_the_options() {
+        // A place the tables know wherever the user's home folder is.
+        let place = b"/srv/elsewhere/.cache";
+        let env = || Environment::new().with("HOME", "/srv/elsewhere");
+
+        // Explicit environment: used, and the process environment is not
+        // consulted (no panic, no dependence on the test's own HOME).
+        let (ctx, _rx) = ScanContext::channel(ScanOptions::default().with_environment(env()), 1);
+        assert!(ctx.options().environment.is_some());
+        let classifier = ctx.classifier().expect("categories are on by default");
+        assert!(classifier.place(place).is_some());
+
+        // Switched off: no lookup at all, whatever the environment says.
+        let options = ScanOptions {
+            categories: false,
+            ..ScanOptions::default().with_environment(env())
+        };
+        let (ctx, _rx) = ScanContext::channel(options, 1);
+        assert!(ctx.classifier().is_none());
+
+        // The default reads the process environment.
+        assert!(ScanOptions::default().environment.is_none());
+        let (ctx, _rx) = ScanContext::channel(ScanOptions::default(), 1);
+        assert!(ctx.classifier().unwrap().place(place).is_some());
     }
 
     #[test]

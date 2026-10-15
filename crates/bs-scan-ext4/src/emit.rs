@@ -231,10 +231,7 @@ impl<'a> Emitter<'a> {
             .try_reserve_exact(words)
             .map_err(|_| Ext4Error::TooLarge("cannot allocate the visited set"))?;
         counted.resize(words, 0u64);
-        let classifier = ctx
-            .options()
-            .categories
-            .then(Classifier::from_process_environment);
+        let classifier = ctx.classifier();
         Ok(Emitter {
             model,
             ctx,

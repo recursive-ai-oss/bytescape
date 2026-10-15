@@ -19,6 +19,7 @@ fn batch() -> Batch {
         logical: 10,
         allocated: 4096,
         mtime: 5,
+        exclusive: 0,
         flags: NodeFlags::default(),
         category: Category::OTHER,
         link: None,

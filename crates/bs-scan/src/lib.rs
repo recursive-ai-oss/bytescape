@@ -48,6 +48,9 @@ mod linux;
 mod windows;
 
 pub use boundary::{Boundary, Placement};
+/// What the category lookups resolve the user's places against; see
+/// [`ScanOptions::environment`].
+pub use bs_knowledge::Environment;
 /// The category lookup the walker uses, and the path joining it expects, for
 /// other producers that must give the same entries the same categories.
 pub use classify::{Classifier, MAX_PATH_BYTES, join as join_path};
@@ -70,6 +73,19 @@ pub mod winrules {
 
 #[cfg(target_os = "linux")]
 pub use linux::Walker;
+
+/// The directory primitives the Linux walker is made of, for other producers
+/// that must list directories the same way: opening a directory without
+/// following links, reading its entries with `getdents64`, and asking for the
+/// few fields of a directory that the walker uses. They are what keeps a
+/// producer from following a link or crossing a mount by accident.
+#[cfg(target_os = "linux")]
+pub mod rawdir {
+    pub use crate::dirent::{Entries, ParseError, RawEntry, entries};
+    pub use crate::linux::sys::{
+        Stat, getdents, open_dir_at, open_root, raise_open_file_limit, stat_at, stat_fd,
+    };
+}
 
 /// The hook type for [`set_before_open_hook`].
 #[cfg(any(target_os = "linux", windows))]

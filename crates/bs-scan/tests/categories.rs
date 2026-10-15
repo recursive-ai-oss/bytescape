@@ -357,6 +357,34 @@ fn categories_can_be_switched_off() {
 }
 
 #[test]
+fn a_scan_with_an_explicit_environment_classifies_like_any_other() {
+    // The caller may name the user's places instead of leaving the walker to
+    // read the process environment (the elevated helper does). The options
+    // must reach the walker and leave the categories working.
+    let fx = Fixture::new("cat-env");
+    fx.file(".cache/b.mp3", 100);
+    fx.file("clip.mp4", 100);
+    fx.settle();
+    let home = std::fs::canonicalize(&fx.root).unwrap();
+    let env = Environment::new().with("HOME", home.as_os_str().as_bytes());
+    let explicit = scan_with(&fx.root, ScanOptions::default().with_environment(env));
+    assert_clean(&explicit);
+    let default = scan(&fx.root);
+    assert_clean(&default);
+    for rel in [".cache/b.mp3", "clip.mp4"] {
+        assert_eq!(
+            node_at(&explicit.snapshot, rel).category(),
+            node_at(&default.snapshot, rel).category(),
+            "{rel}"
+        );
+    }
+    assert_eq!(
+        node_at(&explicit.snapshot, ".cache/b.mp3").category(),
+        number(Known::CacheTemp)
+    );
+}
+
+#[test]
 fn the_tree_and_the_tables_agree_on_the_numbers() {
     // The walker writes `Category::number()` into the tree; a file of each
     // kind comes back with the number of its category.

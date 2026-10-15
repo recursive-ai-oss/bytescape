@@ -188,10 +188,7 @@ impl Scanner for Walker {
             threads::auto_threads(None, cores)
         });
         // Read once, here, before any worker exists.
-        let classifier = ctx
-            .options()
-            .categories
-            .then(Classifier::from_process_environment);
+        let classifier = ctx.classifier();
         let root_path: Box<[u8]> = if classifier.is_some() {
             name.as_slice().into()
         } else {

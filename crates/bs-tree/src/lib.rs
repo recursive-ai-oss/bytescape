@@ -55,7 +55,7 @@ mod types;
 pub use aggregator::{Aggregator, ApplierLimits, ApplyReport, FinishReport, SnapshotReader};
 pub use batch::{BATCH_FORMAT_VERSION, Batch, DECODE_MAX_EXPANSION, Entry, Meta, NameSpan, Record};
 pub use error::{ApplyError, BatchFull, DecodeError, DeleteError, Violation};
-pub use snapshot::{Children, NodeRef, Progress, Snapshot};
+pub use snapshot::{Children, FreeEstimate, NodeRef, Progress, Snapshot};
 pub use types::{
     ByteCount, Category, DeleteState, DeleteTotals, DirKey, FileKey, MAX_NAME_LEN, Moved,
     NodeFlags, NodeId, NodeKind, ReadErrorKind, ReadFailure,

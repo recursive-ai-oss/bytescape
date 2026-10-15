@@ -361,9 +361,13 @@ const INFO_DELETE_SHIFT: u16 = 13;
 
 // The packing above needs the tree's flags to stay below `INFO_DIR`, and its
 // delete states to be 0, 1 and 2 (two bits). If the tree grows another flag
-// or state, this stops compiling instead of corrupting group summaries.
+// or state, this stops compiling instead of corrupting group summaries. A
+// node never reports the synthetic flag among its flags (the tree keeps it
+// aside), so that one bit is not packed.
 const _: () = {
-    assert!(NodeFlags::from_bits_truncate(u16::MAX).bits() < INFO_DIR);
+    assert!(
+        NodeFlags::from_bits_truncate(u16::MAX).bits() & !NodeFlags::SYNTHETIC.bits() < INFO_DIR
+    );
     assert!(DeleteState::None as u16 == 0);
     assert!(DeleteState::InBin as u16 == 1);
     assert!(DeleteState::Deleted as u16 == 2);
@@ -371,7 +375,8 @@ const _: () = {
 
 impl Cand {
     fn flags(self) -> NodeFlags {
-        NodeFlags::from_bits_truncate(self.info)
+        // Only the low bits are flags; the folder bit sits just above.
+        NodeFlags::from_bits_truncate(self.info & (INFO_DIR - 1))
     }
 
     fn is_dir(self) -> bool {

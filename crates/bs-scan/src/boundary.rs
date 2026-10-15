@@ -66,7 +66,7 @@ impl Boundary {
     /// Adds the root's own placement: the mount holding the scan root is
     /// always inside.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn including(&self, root: Placement) -> Boundary {
+    pub fn including(&self, root: Placement) -> Boundary {
         let mut copy = self.clone();
         match root.mount_id {
             Some(id) => {

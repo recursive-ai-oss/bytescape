@@ -129,6 +129,7 @@ fn build(ops: &[Op], with_root: bool) -> Batch {
                         id: u128::from(i),
                     }),
                     failure: failure.map(failure_of),
+                    exclusive: *allocated / 2,
                 };
                 let name = vec![b'a' + (*k % 26); usize::from(*name_len)];
                 let kind = NodeKind::from_u8_for_test(*kind);

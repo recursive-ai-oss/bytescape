@@ -18,6 +18,29 @@ pub enum Progress {
     Files(u64),
 }
 
+/// What deleting a node would free, as far as the tree can tell.
+///
+/// The two figures bracket the truth. Allocated bytes that other files also
+/// use (reflinks, snapshots) stay on disk when only one of the files goes, so
+/// the answer lies between the bytes only this subtree uses and everything the
+/// subtree is counted as holding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FreeEstimate {
+    /// Bytes that are certainly freed: what is not shared with anything
+    /// outside the files deleted together.
+    pub at_least: u64,
+    /// The most that can be freed: the node's allocated bytes still on disk.
+    pub at_most: u64,
+}
+
+impl FreeEstimate {
+    /// Whether the two figures agree, so the answer is exact (as far as the
+    /// tree's sizes are).
+    pub fn is_exact(&self) -> bool {
+        self.at_least == self.at_most
+    }
+}
+
 /// A point-in-time copy of the whole tree. Never changes after it is
 /// published; share it freely between threads.
 ///
@@ -248,6 +271,14 @@ impl Snapshot {
                     ));
                 }
             }
+            if let Some(&exclusive) = s.exclusive.get(&id)
+                && (exclusive > total.allocated || !flags.contains(NodeFlags::SHARED))
+            {
+                return Err(bad(id, "exclusive bytes exceed the allocated bytes"));
+            }
+            if flags.contains(NodeFlags::SHARED) && !s.exclusive.contains_key(&id) {
+                return Err(bad(id, "shared entry has no exclusive figure"));
+            }
             let del = s.delete_totals_of(id);
             for part in [del.in_bin, del.deleted] {
                 if part.logical > total.logical
@@ -269,6 +300,80 @@ impl Snapshot {
     /// Bytes of name data stored (including each name's length prefix).
     pub fn name_bytes(&self) -> usize {
         self.store.pool_used_bytes()
+    }
+
+    /// What deleting `id` and everything below it would free, counting the
+    /// bytes still on disk. `None` for unknown ids.
+    ///
+    /// `at_most` is the node's allocated size less what is already in the bin
+    /// or deleted. `at_least` also leaves out:
+    ///
+    /// - for every shared file below (and the node itself), the part other
+    ///   files use as well, as the scanner recorded it. Files that share data
+    ///   with each other inside the deleted subtree are treated as sharing
+    ///   with outsiders, so `at_least` can be short;
+    /// - every hard-linked file below, whole. The tree does not know a file's
+    ///   link count, so it cannot tell that all its names lie inside the
+    ///   deleted subtree; another name keeps the data. Files whose names are
+    ///   all inside are therefore left out too, and `at_least` is short there.
+    ///
+    /// A file already in the bin or deleted is skipped by both rules, as its
+    /// bytes are not in `at_most` any more. `at_least` is never long. Without
+    /// any shared or hard-linked file the two figures are equal.
+    ///
+    /// The cost is one look at every shared or hard-linked file of the tree,
+    /// however small the node asked about, so ask when a figure is shown (a
+    /// hover card, a confirmation), not for every box of a layout.
+    pub fn delete_would_free(&self, id: NodeId) -> Option<FreeEstimate> {
+        let node = self.node(id)?;
+        let at_most = node.current_allocated();
+        let mut kept_away = 0u64;
+        for &sid in self.store.linked.keys() {
+            if !self.is_at_or_below(sid, id.0) {
+                continue;
+            }
+            let Some(s) = self.node(NodeId(sid)) else {
+                continue;
+            };
+            if s.effective_delete_state() != DeleteState::None {
+                continue;
+            }
+            kept_away = kept_away.saturating_add(self.store.allocated(sid));
+        }
+        for (&sid, &exclusive) in self.store.exclusive.iter() {
+            // A hard-linked file is already out whole.
+            if self.store.linked.contains_key(&sid) || !self.is_at_or_below(sid, id.0) {
+                continue;
+            }
+            let Some(s) = self.node(NodeId(sid)) else {
+                continue;
+            };
+            if s.effective_delete_state() != DeleteState::None {
+                continue;
+            }
+            kept_away =
+                kept_away.saturating_add(self.store.allocated(sid).saturating_sub(exclusive));
+        }
+        Some(FreeEstimate {
+            at_least: at_most.saturating_sub(kept_away),
+            at_most,
+        })
+    }
+
+    /// Whether `node` is `ancestor` or lies below it.
+    fn is_at_or_below(&self, node: u32, ancestor: u32) -> bool {
+        let mut at = node;
+        // Parents are created before their children, so ids only go down.
+        while at != NONE {
+            if at == ancestor {
+                return true;
+            }
+            if at < ancestor {
+                return false;
+            }
+            at = self.store.parent(at).unwrap_or(NONE);
+        }
+        false
     }
 }
 
@@ -396,6 +501,42 @@ impl<'a> NodeRef<'a> {
     /// Why the entry could not be read, if it could not.
     pub fn read_failure(&self) -> Option<ReadFailure> {
         self.store.failures.get(&self.id.0).copied()
+    }
+
+    /// The entry shares data with other files (reflinks, snapshots). Deleting
+    /// it frees only [`NodeRef::exclusive_allocated`] of its bytes.
+    pub fn is_shared(&self) -> bool {
+        self.flags().contains(NodeFlags::SHARED)
+    }
+
+    /// For a shared entry: the allocated bytes only it uses, which deleting
+    /// it frees. `None` for entries the scanner did not report as shared.
+    pub fn exclusive_allocated(&self) -> Option<u64> {
+        self.is_shared()
+            .then(|| self.store.exclusive.get(&self.id.0).copied().unwrap_or(0))
+    }
+
+    /// The reader made this entry up (see [`NodeFlags::SYNTHETIC`]): it is not
+    /// a real file or folder, and nothing may be done to it by name.
+    pub fn is_synthetic(&self) -> bool {
+        !self.store.synthetic.is_empty() && self.store.synthetic.contains_key(&self.id.0)
+    }
+
+    /// This entry, or a folder above it, was made up by the reader. Paths
+    /// through it are not real, so every action on it, delete included, must
+    /// be refused.
+    pub fn is_under_synthetic(&self) -> bool {
+        if self.store.synthetic.is_empty() {
+            return false;
+        }
+        let mut at = Some(*self);
+        while let Some(node) = at {
+            if node.is_synthetic() {
+                return true;
+            }
+            at = node.parent();
+        }
+        false
     }
 
     /// The file has more than one name.
