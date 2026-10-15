@@ -9,7 +9,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use bs_knowledge::{Environment, Knowledge, Level};
+use bs_knowledge::{Knowledge, Level};
 use bs_layout::{
     DrawItem, ItemKind as LayoutKind, ItemRef, Metrics, ViewId, ViewTable, ViewTarget,
 };
@@ -51,6 +51,11 @@ pub struct TreeSource {
     /// Which program or package owns a big folder, once the platform has
     /// worked it out.
     owners: Option<Arc<dyn Owners>>,
+    /// The folder being read again in place, if one is. It and everything in    /// it count as not yet counted until the rescan ends.
+    rescanning: Option<NodeId>,
+    /// Folders whose last rescan did not work, with what went wrong. Their
+    /// numbers are those of the earlier scan.
+    problems: Vec<(NodeId, String)>,
 }
 
 /// A layout made on a worker thread, waiting to be adopted.
@@ -76,6 +81,8 @@ impl TreeSource {
             knowledge: OnceLock::new(),
             blocks: None,
             owners: None,
+            rescanning: None,
+            problems: Vec::new(),
         })
     }
 
@@ -84,6 +91,42 @@ impl TreeSource {
     /// owners.
     pub fn set_owners(&mut self, owners: Option<Arc<dyn Owners>>) {
         self.owners = owners;
+    }
+
+    /// Says which folder is being read again in place (`None` when none is).
+    /// Actions on that folder and on what is inside it stay off while it runs.
+    pub fn set_rescanning(&mut self, folder: Option<NodeId>) {
+        self.rescanning = folder;
+        if let Some(f) = folder {
+            self.problems.retain(|(n, _)| *n != f);
+        }
+    }
+
+    /// Notes what went wrong when `folder` was read again, or clears the note.
+    /// The folder keeps the numbers of the earlier scan, and its card says so.
+    pub fn set_folder_problem(&mut self, folder: NodeId, problem: Option<String>) {
+        self.problems.retain(|(n, _)| *n != folder);
+        if let Some(text) = problem {
+            self.problems.push((folder, text));
+        }
+    }
+
+    /// Whether `node` is the folder being read again or lies inside it.
+    fn in_rescan(&self, node: &bs_tree::NodeRef<'_>) -> bool {
+        let Some(scope) = self.rescanning else {
+            return false;
+        };
+        if node.id() == scope {
+            return true;
+        }
+        let mut at = node.parent();
+        while let Some(parent) = at {
+            if parent.id() == scope {
+                return true;
+            }
+            at = parent.parent();
+        }
+        false
     }
 
     /// Replaces the data. Views keep their ids; call the app's
@@ -225,11 +268,10 @@ impl TreeSource {
     }
 
     fn knowledge(&self) -> &Knowledge {
-        self.knowledge.get_or_init(|| {
-            Box::new(Knowledge::new(&Environment::from_lookup(|n| {
-                std::env::var_os(n)
-            })))
-        })
+        // The platform's own answers (never a variable a user set on Windows),
+        // so this table and the helper's agree on what is the system's.
+        self.knowledge
+            .get_or_init(|| Box::new(Knowledge::new(&bs_platform::system_environment())))
     }
 
     fn node_path(&self, node: NodeId) -> Option<Vec<u8>> {
@@ -291,6 +333,20 @@ impl ViewSource for TreeSource {
 
     fn parent(&self, view: ViewId) -> Option<ViewId> {
         self.table.parent(view)
+    }
+
+    fn view_is_empty(&self, view: ViewId) -> bool {
+        let Some(ViewTarget::Folder(id)) = self.table.target(view) else {
+            return false;
+        };
+        self.snapshot.node(*id).is_some_and(|n| {
+            n.kind() == NodeKind::Dir && n.is_complete() && n.children().next().is_none()
+        })
+    }
+
+    fn view_is_gone(&self, view: ViewId) -> bool {
+        self.view_folder(view)
+            .is_some_and(|f| self.snapshot.node(f).is_none_or(|n| n.is_detached()))
     }
 
     fn enter(&mut self, view: ViewId) {
@@ -392,7 +448,8 @@ impl ViewSource for TreeSource {
                 handoff: None,
                 hard_link: false,
                 delete_state: DeleteMark::None,
-                complete: node.is_complete(),
+                complete: node.is_complete() && !self.in_rescan(&node),
+                problem: None,
                 blocked: false,
                 scan_holds: false,
                 unreal: node.is_under_synthetic(),
@@ -442,7 +499,12 @@ impl ViewSource for TreeSource {
                 DeleteState::InBin => DeleteMark::InBin,
                 DeleteState::Deleted => DeleteMark::Deleted,
             },
-            complete: node.is_complete(),
+            complete: node.is_complete() && !self.in_rescan(&node),
+            problem: self
+                .problems
+                .iter()
+                .find(|(n, _)| *n == node_id)
+                .map(|(_, text)| text.clone()),
             blocked: knowledge.protection_bytes(&raw).level == Level::Blocked,
             scan_holds: false,
             unreal: node.is_under_synthetic(),

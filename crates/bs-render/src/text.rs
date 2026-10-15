@@ -79,6 +79,8 @@ struct Shared {
     /// The locale and font database of the first font system.
     template: Mutex<Option<(String, Database)>>,
     ready: AtomicBool,
+    /// Font discovery finished and found no font at all.
+    no_fonts: AtomicBool,
     cache: RwLock<HashMap<Key, Option<Arc<Label>>>>,
     widths: RwLock<HashMap<WidthKey, f32>>,
     hits: AtomicU64,
@@ -111,6 +113,7 @@ impl TextEngine {
                     .collect(),
                 template: Mutex::new(None),
                 ready: AtomicBool::new(false),
+                no_fonts: AtomicBool::new(false),
                 cache: RwLock::new(HashMap::new()),
                 widths: RwLock::new(HashMap::new()),
                 hits: AtomicU64::new(0),
@@ -131,6 +134,17 @@ impl TextEngine {
         };
         #[cfg(not(windows))]
         let system = FontSystem::new();
+        self.install(system, started);
+    }
+
+    /// Takes a discovered font system into use. One without any font cannot
+    /// shape anything (the shaper has no default to fall back on), so it is
+    /// never used: the engine stays not ready and says so.
+    fn install(&self, system: FontSystem, started: std::time::Instant) {
+        if system.db().faces().next().is_none() {
+            self.shared.no_fonts.store(true, Ordering::Release);
+            return;
+        }
         let template = (system.locale().to_string(), system.db().clone());
         let fonts = Fonts {
             system,
@@ -160,6 +174,12 @@ impl TextEngine {
         // If the thread cannot start, text stays unavailable; the map still
         // draws without labels.
         drop(spawned);
+    }
+
+    /// Font discovery has finished and the computer has no font at all, so
+    /// text can never be drawn.
+    pub fn no_fonts_found(&self) -> bool {
+        self.shared.no_fonts.load(Ordering::Acquire)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -463,6 +483,18 @@ mod tests {
             scale: 1.0,
             color: Color::rgb(0, 0, 0),
         }
+    }
+
+    #[test]
+    fn a_computer_without_fonts_is_reported_and_never_shaped_on() {
+        let engine = TextEngine::new();
+        let empty = FontSystem::new_with_locale_and_db("en-US".into(), Database::new());
+        engine.install(empty, std::time::Instant::now());
+        assert!(engine.no_fonts_found());
+        assert!(!engine.is_ready());
+        // Asking for text must not reach the shaper, which would panic.
+        assert!(engine.label("hello", style(), 100.0).is_none());
+        assert!(engine.measure("hello", 13.0, 1.0).is_none());
     }
 
     #[test]

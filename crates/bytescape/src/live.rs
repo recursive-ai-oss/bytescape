@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use bs_scan::{ScanHandle, ScanOptions, ScanStats, Scanner, StatvfsVolume, VolumeInfo, Walker};
-use bs_tree::{Aggregator, DeleteState, Snapshot, SnapshotReader};
+use bs_tree::{Aggregator, DeleteState, NodeId, RescanReport, Snapshot, SnapshotReader};
 use bs_ui::shell::TreeChange;
 use bs_ui::tree::relayout_interval;
 
@@ -47,6 +47,19 @@ pub struct ScanDriver {
     /// Delete marks asked for while the scan still owned the tree. They are
     /// put on as soon as the scan ends.
     pending_marks: Vec<TreeChange>,
+    /// The folder being read again in place, while that runs.
+    rescanning: Option<NodeId>,
+    /// How the last rescan in place ended, until the window takes it.
+    rescan_outcome: Option<RescanOutcome>,
+}
+
+/// How reading one folder again ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RescanOutcome {
+    pub folder: NodeId,
+    /// What went wrong, in words; the folder then keeps the numbers of the
+    /// earlier scan (or, when it failed part way, is marked unreadable).
+    pub problem: Option<String>,
 }
 
 impl ScanDriver {
@@ -86,7 +99,57 @@ impl ScanDriver {
             outcome: None,
             replay: false,
             pending_marks: Vec::new(),
+            rescanning: None,
+            rescan_outcome: None,
         }
+    }
+
+    /// Reads folder `node` (at `path`) of the finished tree again, in place:
+    /// the folder keeps its place and the rest of the tree stays as it is.
+    /// Fails, with the reason in words, when the scan is still running or the
+    /// tree cannot take a rescan of that folder.
+    pub fn start_rescan(&mut self, node: NodeId, path: PathBuf) -> Result<(), String> {
+        if self.handle.is_some() {
+            return Err("Still scanning".into());
+        }
+        let Some((aggregator, stats)) = self.finished.take() else {
+            return Err("Still scanning".into());
+        };
+        let options = ScanOptions {
+            publish_interval: PUBLISH_INTERVAL,
+            ..ScanOptions::default()
+        };
+        match bs_scan::start_rescan(aggregator, node, Arc::new(Walker), path, options) {
+            Ok(handle) => {
+                // The handle publishes into the cell this driver reads.
+                self.reader = handle.reader();
+                self.handle = Some(handle);
+                self.outcome = None;
+                self.replay = false;
+                self.rescanning = Some(node);
+                self.rescan_outcome = None;
+                self.started = Instant::now();
+                self.last_epoch = self.reader.load().epoch();
+                self.last_laid_out = None;
+                Ok(())
+            }
+            Err(refused) => {
+                let bs_scan::RescanRefused { error, aggregator } = *refused;
+                self.finished = Some((aggregator, stats));
+                Err(refusal_words(error))
+            }
+        }
+    }
+
+    /// The folder being read again in place, while that runs.
+    #[cfg(test)]
+    pub fn rescanning(&self) -> Option<NodeId> {
+        self.rescanning
+    }
+
+    /// How the last rescan in place ended; given out once.
+    pub fn take_rescan_outcome(&mut self) -> Option<RescanOutcome> {
+        self.rescan_outcome.take()
     }
 
     /// The latest published snapshot, whatever the throttle says.
@@ -153,11 +216,20 @@ impl ScanDriver {
             && let Some(handle) = self.handle.take()
         {
             let result = handle.wait();
-            let problem = result
+            let mut problem = result
                 .stats
                 .error
                 .as_ref()
                 .map(|e| format!("Couldn't scan: {e}"));
+            if let Some(folder) = self.rescanning.take() {
+                // The map stays; what went wrong belongs to the folder.
+                let report: Option<RescanReport> = result.aggregator.rescan_report();
+                self.rescan_outcome = Some(RescanOutcome {
+                    folder,
+                    problem: rescan_problem(report, result.stats.error.as_ref()),
+                });
+                problem = None;
+            }
             let mut snapshot = result.snapshot;
             self.finished = Some((result.aggregator, result.stats));
             // What was deleted while the scan ran shows in the final picture.
@@ -246,6 +318,35 @@ impl ScanDriver {
             h.cancel();
         }
     }
+}
+
+/// Why the tree cannot take a rescan of a folder, in words for the person.
+fn refusal_words(error: bs_tree::RescanError) -> String {
+    use bs_tree::RescanError as E;
+    match error {
+        E::NotADirectory(_) => "Not a folder".into(),
+        E::Marked(_) => "It was already moved or deleted".into(),
+        E::Detached(_) | E::UnknownNode(_) => {
+            "This folder was replaced by a newer read; open it again from the map".into()
+        }
+        _ => "Still scanning".into(),
+    }
+}
+
+/// What to tell about a folder that was read again, when it did not work.
+fn rescan_problem(
+    report: Option<RescanReport>,
+    error: Option<&bs_scan::ScanError>,
+) -> Option<String> {
+    let refused = report.is_some_and(|r| r.refused);
+    if refused {
+        return Some("the path now leads somewhere else (a link), so nothing was read".to_string());
+    }
+    error.map(|e| match e {
+        bs_scan::ScanError::Root(io) => format!("it can't be opened ({io})"),
+        bs_scan::ScanError::NotADirectory(_) => "it is not a folder any more".to_string(),
+        other => other.to_string(),
+    })
 }
 
 /// Files per second over about the last second, so the readout follows the
@@ -456,6 +557,173 @@ mod tests {
             0,
             "a snapshot of the discarded scan is still held"
         );
+    }
+
+    /// Scans `dir` to the end and returns the driver, finished.
+    fn finished_driver(dir: &std::path::Path) -> (ScanDriver, Arc<Snapshot>) {
+        let mut driver = ScanDriver::start(dir.to_path_buf());
+        loop {
+            if let Tick::Finished(s, problem) = driver.tick(Instant::now()) {
+                assert!(problem.is_none());
+                return (driver, s);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn folder(snapshot: &Snapshot, name: &str) -> (NodeId, PathBuf) {
+        let id = snapshot
+            .root()
+            .expect("root")
+            .children()
+            .find(|c| c.name() == name.as_bytes())
+            .expect("folder")
+            .id();
+        (id, bs_scan::node_path(snapshot, id).expect("path"))
+    }
+
+    fn finish_rescan_of(driver: &mut ScanDriver) -> Arc<Snapshot> {
+        for _ in 0..5000 {
+            if let Tick::Finished(s, problem) = driver.tick(Instant::now()) {
+                assert!(
+                    problem.is_none(),
+                    "a rescan never turns into a scan problem"
+                );
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("the rescan did not end");
+    }
+
+    #[test]
+    fn a_folder_is_read_again_in_place_and_keeps_its_node() {
+        let dir = std::env::temp_dir().join(format!("bytescape-rescan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        tree(&dir);
+        let (mut driver, first) = finished_driver(&dir);
+        let (d1, path) = folder(&first, "d1");
+        let before = first.root().unwrap().file_count();
+        fs::write(path.join("added"), vec![0u8; 30_000]).expect("write");
+
+        driver.start_rescan(d1, path).expect("starts");
+        assert_eq!(driver.rescanning(), Some(d1));
+        assert!(driver.running());
+        let after = finish_rescan_of(&mut driver);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(driver.rescanning(), None);
+        let outcome = driver.take_rescan_outcome().expect("an outcome");
+        assert_eq!(outcome.folder, d1);
+        assert_eq!(outcome.problem, None);
+        assert!(driver.take_rescan_outcome().is_none(), "given out once");
+        assert_eq!(after.root().unwrap().file_count(), before + 1);
+        let node = after.node(d1).expect("the folder is still there");
+        assert!(!node.is_detached() && node.is_complete());
+        assert!(after.scan_complete());
+        // Delete marks work again on the finished tree.
+        assert!(driver.stats().is_some());
+    }
+
+    #[test]
+    fn a_rescan_cannot_start_while_a_scan_runs_or_on_a_folder_in_the_bin() {
+        let dir = std::env::temp_dir().join(format!("bytescape-rescan2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        tree(&dir);
+        // Still running: the scan owns the tree.
+        let mut running = ScanDriver::start_scanner(
+            Arc::new(Synthetic { dirs: 3, files: 3 }),
+            PathBuf::from("/synthetic"),
+            None,
+        );
+        let why = running
+            .start_rescan(NodeId::ROOT, PathBuf::from("/synthetic"))
+            .unwrap_err();
+        assert_eq!(why, "Still scanning");
+        drop(running.discard());
+
+        let (mut driver, first) = finished_driver(&dir);
+        let (d0, path) = folder(&first, "d0");
+        driver
+            .apply_marks(&[TreeChange {
+                node: d0,
+                to: DeleteState::InBin,
+            }])
+            .expect("marked");
+        let why = driver.start_rescan(d0, path.clone()).unwrap_err();
+        assert_eq!(why, "It was already moved or deleted");
+        // The refused attempt left the tree usable: another folder works.
+        let (d1, path1) = folder(&first, "d1");
+        driver.start_rescan(d1, path1).expect("starts");
+        let _ = finish_rescan_of(&mut driver);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_that_is_gone_keeps_its_numbers_and_says_why() {
+        let dir = std::env::temp_dir().join(format!("bytescape-rescan3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        tree(&dir);
+        let (mut driver, first) = finished_driver(&dir);
+        let (d2, path) = folder(&first, "d2");
+        let size = first.node(d2).unwrap().allocated();
+        let files = first.root().unwrap().file_count();
+        fs::remove_dir_all(&path).expect("remove");
+
+        driver.start_rescan(d2, path).expect("starts");
+        let after = finish_rescan_of(&mut driver);
+        let _ = fs::remove_dir_all(&dir);
+
+        let outcome = driver.take_rescan_outcome().expect("an outcome");
+        let problem = outcome.problem.expect("the folder says what went wrong");
+        assert!(problem.starts_with("it can't be opened"), "{problem}");
+        assert_eq!(after.node(d2).unwrap().allocated(), size);
+        assert_eq!(after.root().unwrap().file_count(), files);
+        assert!(after.scan_complete(), "the tree is as it was");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_swapped_for_a_link_is_refused_in_words() {
+        let dir = std::env::temp_dir().join(format!("bytescape-rescan4-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        tree(&dir);
+        let (mut driver, first) = finished_driver(&dir);
+        let (d0, path) = folder(&first, "d0");
+        let files = first.root().unwrap().file_count();
+        fs::remove_dir_all(&path).expect("remove");
+        std::os::unix::fs::symlink(dir.join("d1"), &path).expect("link");
+
+        driver.start_rescan(d0, path).expect("starts");
+        let after = finish_rescan_of(&mut driver);
+        let _ = fs::remove_dir_all(&dir);
+
+        let problem = driver
+            .take_rescan_outcome()
+            .and_then(|o| o.problem)
+            .expect("refused with a reason");
+        assert!(problem.contains("leads somewhere else"), "{problem}");
+        assert_eq!(
+            after.root().unwrap().file_count(),
+            files,
+            "nothing was read"
+        );
+        assert!(!after.node(d0).unwrap().is_detached());
+    }
+
+    #[test]
+    fn refusals_are_worded_for_a_person_not_for_the_tree() {
+        use bs_tree::RescanError as E;
+        let id = NodeId::ROOT;
+        for (error, words) in [
+            (E::NotADirectory(id), "Not a folder"),
+            (E::Marked(id), "It was already moved or deleted"),
+            (E::ScanRunning, "Still scanning"),
+            (E::Busy, "Still scanning"),
+        ] {
+            assert_eq!(refusal_words(error), words);
+        }
+        assert!(refusal_words(E::Detached(id)).contains("open it again"));
     }
 
     #[test]

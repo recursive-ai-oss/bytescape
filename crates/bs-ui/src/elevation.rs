@@ -416,6 +416,25 @@ pub enum ElevatedEnd {
     },
 }
 
+/// What to tell when the administrator helper refuses a volume: a network
+/// share or remote file system, or a volume it could not identify. Used for
+/// a refused scan and a refused delete alike.
+pub const REMOTE_VOLUME: &str = "This is a network volume, or one the administrator helper couldn't identify. Administrator scans and deletes work only on this computer's own disks.";
+
+/// The sentence for a helper error that has words of its own here, or `None`
+/// for any other. Ends with a full stop.
+pub fn elevate_error_words(error: &bs_platform::elevate::ElevateError) -> Option<String> {
+    use bs_platform::elevate::ElevateError;
+    match error {
+        ElevateError::Protocol(bs_ipc::ClientError::Helper(report))
+            if report.code == bs_ipc::ErrorCode::RemoteVolume =>
+        {
+            Some(REMOTE_VOLUME.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// What a refused item says.
 pub fn refusal_words(refusal: bs_platform::elevate::Refusal) -> &'static str {
     use bs_platform::elevate::Refusal;
@@ -431,6 +450,9 @@ pub fn refusal_words(refusal: bs_platform::elevate::Refusal) -> &'static str {
         Refusal::MountPoint => "it is the start of another drive",
         Refusal::Overlaps { .. } => "one selected item is inside another",
         Refusal::NotPermanent => "the request was not a permanent delete",
+        Refusal::RemoteVolume => {
+            "it is on a network volume, or one the administrator helper couldn't identify; administrator deletes work only on this computer's own disks"
+        }
         _ => "the helper would not touch it",
     }
 }
@@ -522,6 +544,14 @@ pub fn end_from_error(
             if report.code == bs_ipc::ErrorCode::NoAccount =>
         {
             ElevatedEnd::NoAccount
+        }
+        ElevateError::Protocol(bs_ipc::ClientError::Helper(report))
+            if report.code == bs_ipc::ErrorCode::RemoteVolume =>
+        {
+            ElevatedEnd::Failed {
+                message: REMOTE_VOLUME.to_string(),
+                completed: done,
+            }
         }
         ElevateError::Protocol(bs_ipc::ClientError::Helper(report)) => ElevatedEnd::Failed {
             message: report.message,
@@ -653,6 +683,8 @@ mod tests {
             NO_ACCOUNT_TEXT,
             DECLINED_TEXT,
             refusal_words(bs_platform::elevate::Refusal::Blocked),
+            refusal_words(bs_platform::elevate::Refusal::RemoteVolume),
+            REMOTE_VOLUME,
         ];
         for text in all {
             let lower = text.to_lowercase();
@@ -660,5 +692,52 @@ mod tests {
                 assert!(!lower.contains(banned), "{text}");
             }
         }
+    }
+
+    fn helper_error(code: bs_ipc::ErrorCode) -> bs_platform::elevate::ElevateError {
+        bs_platform::elevate::ElevateError::Protocol(bs_ipc::ClientError::Helper(
+            bs_ipc::ErrorReport {
+                code,
+                message: "technical text from the helper".into(),
+            },
+        ))
+    }
+
+    #[test]
+    fn a_remote_volume_is_explained_for_a_scan_and_for_a_delete() {
+        // The refused scan.
+        let scan = elevate_error_words(&helper_error(bs_ipc::ErrorCode::RemoteVolume))
+            .expect("words of its own");
+        assert_eq!(scan, REMOTE_VOLUME);
+        assert!(scan.contains("network volume") && scan.contains("couldn't identify"));
+        assert!(scan.contains("this computer's own disks"));
+        // Other errors keep the helper's or the platform's own text.
+        assert_eq!(
+            elevate_error_words(&helper_error(bs_ipc::ErrorCode::ScanFailed)),
+            None
+        );
+        assert_eq!(
+            elevate_error_words(&bs_platform::elevate::ElevateError::Declined),
+            None
+        );
+        // The refused delete of a whole request.
+        let end = end_from_error(helper_error(bs_ipc::ErrorCode::RemoteVolume), Vec::new());
+        assert_eq!(
+            end,
+            ElevatedEnd::Failed {
+                message: REMOTE_VOLUME.to_string(),
+                completed: Vec::new()
+            }
+        );
+        // A refused item of a selection.
+        let item = item_from(&bs_ipc::ItemOutcome::Refused(
+            bs_platform::elevate::Refusal::RemoteVolume,
+        ));
+        let ElevatedItem::Refused(words) = item else {
+            panic!("{item:?}");
+        };
+        assert!(words.contains("network volume"), "{words}");
+        assert!(words.contains("couldn't identify"), "{words}");
+        assert_ne!(words, refusal_words(bs_platform::elevate::Refusal::Blocked));
     }
 }

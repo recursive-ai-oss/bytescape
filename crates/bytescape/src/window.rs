@@ -607,10 +607,9 @@ struct Live {
     scan_root: Option<PathBuf>,
     /// Which program or package owns a big folder, worked out after a scan.
     owners: Arc<Matcher>,
-    /// The big folders of a finished scan are being handed to the matcher.
-    owners_queue: Option<Receiver<()>>,
-    /// Matching is under way and the card on screen may need to change.
-    owners_pending: bool,
+    /// Set by the matcher's own thread each time it has new answers; the
+    /// card on screen is built again from them at the next turn of the loop.
+    owners_ready: Arc<std::sync::atomic::AtomicBool>,
     /// The report left by an earlier crash, while the note about it shows.
     crash_report: Option<Report>,
     crash_rx: Option<Receiver<Option<Report>>>,
@@ -994,6 +993,37 @@ fn apply_shell(live: &mut Live, fx: Vec<ShellEffect>, now: Duration) -> Vec<Shel
         }
     }
     left
+}
+
+/// A folder was read again: it counts as finished, and if the read did not
+/// work the folder says so (its numbers are those of the earlier scan).
+fn finish_rescan(live: &mut Live, outcome: crate::live::RescanOutcome, now: Duration) {
+    let name = live
+        .shell
+        .app()
+        .and_then(|app| {
+            app.source()
+                .snapshot()
+                .node(outcome.folder)
+                .map(|n| bs_layout::display_name(n.name()).into_string())
+        })
+        .unwrap_or_default();
+    if let Some(app) = live.shell.app_mut() {
+        let source = app.source_mut();
+        source.set_rescanning(None);
+        source.set_folder_problem(outcome.folder, outcome.problem.clone());
+    }
+    match outcome.problem {
+        Some(_) => {
+            bs_platform::crash::record_action("folder rescan failed");
+            // The folder's card says why; the toast stays short.
+            live.shell.notify(
+                format!("Couldn't read {name} again. Its sizes are from the earlier scan"),
+                now,
+            );
+        }
+        None => bs_platform::crash::record_action("folder rescan finished"),
+    }
 }
 
 /// Puts delete marks on the finished tree and lays the view out again. The
@@ -1602,6 +1632,45 @@ impl WinApp {
         self.begin_map(ScanDriver::start(path), root, None, from_picker, now);
     }
 
+    /// Reads one folder of the finished map again, in place: the view, the
+    /// breadcrumb, the selection and the folder's place all stay, and the
+    /// folder shows "Scanning…" until it is counted again.
+    fn rescan_folder(&mut self, target: bs_ui::Target, now: Duration) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let say = |live: &mut Live, why: &str| {
+            live.shell.notify(format!("Rescan this folder: {why}"), now);
+        };
+        if live.fast.is_some() {
+            say(live, bs_ui::action::reason::FULL_SCAN_RUNNING);
+            return;
+        }
+        let (Some(node), true) = (target.node, target.is_folder) else {
+            say(live, bs_ui::action::reason::NOT_A_FOLDER);
+            return;
+        };
+        let Some(scan) = live.scan.as_mut() else {
+            return;
+        };
+        match scan.start_rescan(node, target.path) {
+            Ok(()) => {
+                bs_platform::crash::record_action("folder rescan started");
+                if let Some(app) = live.shell.app_mut() {
+                    app.source_mut().set_rescanning(Some(node));
+                }
+                live.rate = RateMeter::default();
+                live.shell.set_status("Scanning…".into(), true);
+                live.shell.begin_scan(now);
+                update_readout(live);
+                live.blocks_dirty = true;
+                refresh_chrome(live, now);
+                live.window.request_redraw();
+            }
+            Err(why) => say(live, &why),
+        }
+    }
+
     /// Scans the open place again from the start.
     fn rescan(&mut self, now: Duration) {
         let Some(live) = self.live.as_mut() else {
@@ -1736,9 +1805,7 @@ impl WinApp {
                         bs_ui::ViewSource::target(live.shell.app()?.source(), view, id)
                     });
                     if let Some(t) = target {
-                        // The folder becomes the map: its contents are read
-                        // again from disk.
-                        self.open_path(t.path, now);
+                        self.rescan_folder(t, now);
                     }
                 }
                 ShellEffect::ScanFolder => {
@@ -1788,7 +1855,21 @@ impl WinApp {
             Some(s) => attrs
                 .with_inner_size(PhysicalSize::new(s.0, s.1))
                 .with_resizable(false),
-            None => attrs.with_inner_size(LogicalSize::new(1280.0, 800.0)),
+            None => {
+                // Never larger than the screen: on a small one the status
+                // bar and the RecursiveAI.org link would be off the bottom.
+                let monitor = el
+                    .primary_monitor()
+                    .or_else(|| el.available_monitors().next());
+                let (w, h) = match monitor {
+                    Some(m) => {
+                        let size = m.size();
+                        initial_window_size((size.width, size.height), m.scale_factor())
+                    }
+                    None => (DEFAULT_WINDOW.0, DEFAULT_WINDOW.1),
+                };
+                attrs.with_inner_size(LogicalSize::new(w, h))
+            }
         };
         let window = Arc::new(el.create_window(attrs).map_err(|e| e.to_string())?);
         let access = with_access.then(|| Access::new(el, &window, self.proxy.clone()));
@@ -1890,6 +1971,7 @@ impl WinApp {
             renderer.set_items(Arc::new(placeholders(map, scale)));
         }
         let (notices_tx, notices_rx) = mpsc::channel();
+        let owners_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let disposer = SystemDisposer::new();
         shell.set_disposer(disposer.clone());
         self.live = Some(Live {
@@ -1922,9 +2004,19 @@ impl WinApp {
             next_readout: Instant::now(),
             next_card_update: Instant::now(),
             scan_root: None,
-            owners: Arc::new(Matcher::new()),
-            owners_queue: None,
-            owners_pending: false,
+            owners: {
+                let owners = Arc::new(Matcher::new());
+                let ready = Arc::clone(&owners_ready);
+                let gate = self.redraw_gate.clone();
+                let w = window.clone();
+                // No polling: the matcher says when a batch is done.
+                owners.on_finished(move || {
+                    ready.store(true, std::sync::atomic::Ordering::Release);
+                    gate.ask(|| w.request_redraw());
+                });
+                owners
+            },
+            owners_ready,
             crash_report: None,
             crash_rx: None,
             software_rx: None,
@@ -2172,14 +2264,17 @@ impl WinApp {
         refresh_chrome(live, now);
         self.stats.layouts_us.push(stats.took.as_micros() as u64);
         self.stats.layout_boxes.push(stats.items as u64);
-        if stats.items >= 2 && !self.map_seen {
+        let finished = std::mem::take(&mut self.final_requested);
+        // A finished scan of an empty folder has nothing but the folder's own
+        // box; that is the map, and it counts as the first one.
+        if (stats.items >= 2 || finished) && !self.map_seen {
             self.map_seen = true;
             self.map_pending = true;
         }
         if let Some(scan) = live.scan.as_mut() {
             scan.note_layout_cost(stats.took);
         }
-        if std::mem::take(&mut self.final_requested) {
+        if finished {
             self.finish_pending = true;
         }
         self.stats
@@ -2303,13 +2398,21 @@ impl WinApp {
         }
         live.snapshot = Some(Arc::clone(&snapshot));
         update_capacity(live, now);
+        if let Some(outcome) = live.scan.as_mut().and_then(ScanDriver::take_rescan_outcome) {
+            finish_rescan(live, outcome, now);
+        }
         if done {
             self.stats.scan_done_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
             // Which program or package owns the big folders is worked out in
             // the background, after the scan, and never delays it.
-            if matches!(self.mode, Mode::Interactive { .. }) && !snapshot.scan_stopped() {
+            if should_match_owners(
+                matches!(self.mode, Mode::Interactive { .. }),
+                done,
+                snapshot.scan_stopped(),
+            ) {
                 bs_platform::crash::record_action("scan finished");
-                live.owners_queue = Some(bs_ui::owners::request_in_background(
+                // The answers arrive through the matcher's finished hook.
+                drop(bs_ui::owners::request_in_background(
                     live.owners.clone(),
                     Arc::clone(&snapshot),
                 ));
@@ -2318,6 +2421,19 @@ impl WinApp {
         match live.shell.app_mut() {
             Some(app) => {
                 app.source_mut().set_snapshot(Arc::clone(&snapshot));
+                // A rescan cuts off the folders it replaces: a view inside
+                // one moves up to the nearest folder that is still there.
+                let moved = app.leave_gone_views();
+                if !moved.is_empty() {
+                    apply(&mut live.renderer, moved, now);
+                    live.shell.notify(
+                        "The folder you were in was read again, so you are one level up",
+                        now,
+                    );
+                }
+                let Some(app) = live.shell.app_mut() else {
+                    return;
+                };
                 match app.begin_relayout() {
                     Some(pending) => {
                         spawn_relayout(live, pending);
@@ -2364,7 +2480,7 @@ impl WinApp {
                     }
                     self.stats.layouts_us.push(stats.took.as_micros() as u64);
                     self.stats.layout_boxes.push(stats.items as u64);
-                    if stats.items >= 2 && !self.map_seen {
+                    if (stats.items >= 2 || done) && !self.map_seen {
                         self.map_seen = true;
                         self.map_pending = true;
                     }
@@ -2529,26 +2645,14 @@ impl WinApp {
                 Err(TryRecvError::Empty) => soonest(Duration::from_millis(50)),
             }
         }
-        if let Some(rx) = live.owners_queue.as_ref() {
-            match rx.try_recv() {
-                Ok(()) => {
-                    live.owners_queue = None;
-                    live.owners_pending = true;
-                }
-                Err(TryRecvError::Disconnected) => live.owners_queue = None,
-                Err(TryRecvError::Empty) => soonest(Duration::from_millis(100)),
-            }
-        }
-        if live.owners_pending {
+        if live
+            .owners_ready
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
             // The card on screen is built again when the answers are in.
-            if live.owners.is_idle() {
-                live.owners_pending = false;
-                live.shell.owners_changed();
-                refresh_chrome(live, now);
-                redraw = true;
-            } else {
-                soonest(Duration::from_millis(150));
-            }
+            live.shell.owners_changed();
+            refresh_chrome(live, now);
+            redraw = true;
         }
         if let Some(d) = live.shell.next_deadline(now) {
             soonest(d.max(Duration::from_millis(1)));
@@ -2920,6 +3024,11 @@ impl ApplicationHandler<UserEvent> for WinApp {
                     refresh_chrome(live, now);
                     live.window.request_redraw();
                 }
+            } else if self.text.no_fonts_found() {
+                // Without a font there is no text to draw: say so and leave.
+                self.error = Some(crate::startup::NO_FONTS.to_string());
+                el.exit();
+                return;
             } else {
                 sooner(&mut poll, Duration::from_millis(16));
             }
@@ -2940,6 +3049,86 @@ impl ApplicationHandler<UserEvent> for WinApp {
             Some(d) => el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + d)),
             None => el.set_control_flow(ControlFlow::Wait),
         }
+    }
+}
+
+/// The window's usual size, in logical pixels.
+const DEFAULT_WINDOW: (f64, f64) = (1280.0, 800.0);
+
+/// The size to open the window at on a screen of `monitor` physical pixels:
+/// the usual size, or less where the screen leaves no room for it (a title
+/// bar and a panel take some of the height and width).
+fn initial_window_size(monitor: (u32, u32), scale: f64) -> (f64, f64) {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let room = (
+        f64::from(monitor.0) / scale * 0.96,
+        f64::from(monitor.1) / scale * 0.88,
+    );
+    (
+        DEFAULT_WINDOW.0.min(room.0).max(320.0).floor(),
+        DEFAULT_WINDOW.1.min(room.1).max(240.0).floor(),
+    )
+}
+
+/// Whether the big folders of the tree are handed to the program and package
+/// matcher now: only in the normal window, only once the scan has ended, and
+/// not for a scan that was stopped part way. The matching itself runs on a
+/// worker thread, so it never slows the scan.
+fn should_match_owners(interactive: bool, finished: bool, stopped: bool) -> bool {
+    interactive && finished && !stopped
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::should_match_owners;
+
+    #[test]
+    fn the_window_never_opens_larger_than_the_screen() {
+        use super::initial_window_size as size;
+        // A roomy screen keeps the usual size.
+        assert_eq!(size((3840, 2160), 1.0), (1280.0, 800.0));
+        assert_eq!(size((3840, 2160), 2.0), (1280.0, 800.0));
+        // Small screens shrink it, leaving room for the title bar and panel.
+        let (w, h) = size((1100, 700), 1.0);
+        assert!(w <= 1100.0 && h < 700.0, "{w}x{h}");
+        // At a scale above 1 the logical screen is smaller.
+        let (w, h) = size((1600, 900), 1.5);
+        assert!(w <= 1600.0 / 1.5 && h < 900.0 / 1.5, "{w}x{h}");
+        // Odd answers from the system are survivable.
+        assert_eq!(size((0, 0), 0.0), (320.0, 240.0));
+        assert_eq!(size((1100, 700), f64::NAN).0, 1056.0);
+    }
+
+    #[test]
+    fn matching_starts_only_after_a_scan_has_completed() {
+        assert!(should_match_owners(true, true, false));
+        // Still scanning: every snapshot on the way is not a reason to ask.
+        assert!(!should_match_owners(true, false, false));
+        // Stopped part way: the sizes are not final.
+        assert!(!should_match_owners(true, true, true));
+        // Measurements and pictures do not look programs up.
+        assert!(!should_match_owners(false, true, false));
+    }
+
+    #[test]
+    fn the_matcher_says_when_a_batch_is_done_so_nothing_has_to_poll() {
+        use bs_platform::software::{Candidate, MIN_MATCH_BYTES, Matcher};
+        let matcher = Matcher::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        matcher.on_finished(move || {
+            let _ = tx.send(());
+        });
+        matcher.request(&[Candidate {
+            path: std::env::temp_dir(),
+            bytes: MIN_MATCH_BYTES,
+        }]);
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the finished hook ran");
+        assert!(matcher.is_idle(), "nothing more is pending");
     }
 }
 

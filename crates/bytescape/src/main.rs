@@ -8,6 +8,7 @@ mod fast;
 mod live;
 mod real;
 mod shots;
+mod startup;
 mod synth;
 mod system;
 mod window;
@@ -278,14 +279,10 @@ pub(crate) fn about() -> bs_ui::notice::AboutInfo {
     )
 }
 
-/// What the About box says about this build, with the drawing backend added
-/// to the target line (for example "Drawing: GPU (name)").
+/// What the About box says about this build, with the drawing backend on a
+/// line of its own (for example "Drawing: GPU (name)").
 pub(crate) fn about_with(drawing: &str) -> bs_ui::notice::AboutInfo {
-    bs_ui::notice::AboutInfo::new(
-        env!("BYTESCAPE_VERSION"),
-        env!("BYTESCAPE_BUILD_DATE"),
-        &format!("{} · {drawing}", env!("BYTESCAPE_TARGET")),
-    )
+    about().with_drawing(drawing)
 }
 
 fn main() -> ExitCode {
@@ -314,10 +311,34 @@ fn main() -> ExitCode {
     }
     // The window never runs with administrator rights. A full scan and a delete
     // that needs them go through the helper, which the system asks for.
-    if is_refused_when_elevated(&mode)
-        && refuse_if_elevated(&bs_platform::elevation::ThisProcess, &mut std::io::stderr())
-    {
-        return ExitCode::FAILURE;
+    if is_refused_when_elevated(&mode) {
+        // A program started from the desktop has no terminal, so the reason
+        // goes to a message box too. A program whose standard error is seen
+        // (a terminal, a pipe, a file: a script, a test, an installer check)
+        // gets the line there and never a box that would wait for a click
+        // nobody can make. On Linux the platform's message is the line on
+        // standard error, so it is not written twice.
+        let mut tell = |title: &str, text: &str| {
+            if cfg!(windows) && stderr_is_unseen() {
+                bs_platform::dialog::message(title, text);
+            }
+        };
+        let refused = if cfg!(windows) {
+            refuse_if_elevated(
+                &bs_platform::elevation::ThisProcess,
+                &mut std::io::stderr(),
+                &mut tell,
+            )
+        } else {
+            refuse_if_elevated(
+                &bs_platform::elevation::ThisProcess,
+                &mut std::io::sink(),
+                &mut |title: &str, text: &str| bs_platform::dialog::message(title, text),
+            )
+        };
+        if refused {
+            return ExitCode::FAILURE;
+        }
     }
     // Still the only thread: the screen-reader setup changes the environment.
     access::prepare(
@@ -335,7 +356,9 @@ fn main() -> ExitCode {
         about().build_epoch().unwrap_or(0),
         env!("BYTESCAPE_TARGET"),
     ));
-    let result = window::run(mode, t0);
+    // A system library that is missing ends the run with one clear line, not
+    // a panic: nothing is wrong with the program, so no crash report either.
+    let result = startup::guard_missing_libraries(|| window::run(mode, t0)).and_then(|r| r);
     // Reaching here is a normal shutdown: a crash report written by a panic
     // that was caught on the way is not something to tell the user about next
     // time.
@@ -349,6 +372,25 @@ fn main() -> ExitCode {
     }
 }
 
+/// Whether a raw standard-error handle value means there is none (a program
+/// started from the desktop has no console and no inherited handle).
+#[cfg(any(windows, test))]
+fn handle_is_missing(raw: isize) -> bool {
+    raw == 0 || raw == -1
+}
+
+/// Whether nothing can see what this program writes to standard error.
+#[cfg(windows)]
+fn stderr_is_unseen() -> bool {
+    use std::os::windows::io::AsRawHandle;
+    handle_is_missing(std::io::stderr().as_raw_handle() as isize)
+}
+
+#[cfg(not(windows))]
+fn stderr_is_unseen() -> bool {
+    false
+}
+
 /// Whether this run is refused when the process has administrator rights:
 /// every run that scans or draws, pictures and measurements included. Only
 /// printing the version or the help is harmless.
@@ -357,14 +399,18 @@ fn is_refused_when_elevated(mode: &Mode) -> bool {
 }
 
 /// Says why the program will not run when its process has administrator
-/// rights, once, on `out`. Returns whether it refused.
+/// rights, once, on `out` and through `tell` (title and text, for a message
+/// the person will see). Returns whether it refused. No crash report comes of
+/// it: nothing has panicked.
 fn refuse_if_elevated(
     rights: &dyn bs_platform::elevation::ProcessRights,
     out: &mut dyn std::io::Write,
+    tell: &mut dyn FnMut(&str, &str),
 ) -> bool {
     match bs_platform::elevation::refusal_for(rights) {
         Some(message) => {
             let _ = writeln!(out, "bytescape: {message}");
+            tell("Bytescape", message);
             true
         }
         None => false,
@@ -390,7 +436,12 @@ mod tests {
     #[test]
     fn an_elevated_process_is_refused_once_with_the_reason() {
         let mut out = Vec::new();
-        assert!(refuse_if_elevated(&Rights(true), &mut out));
+        let mut told: Vec<(String, String)> = Vec::new();
+        let mut tell = |t: &str, m: &str| told.push((t.to_string(), m.to_string()));
+        assert!(refuse_if_elevated(&Rights(true), &mut out, &mut tell));
+        assert_eq!(told.len(), 1, "the message box is shown once");
+        assert_eq!(told[0].0, "Bytescape");
+        assert!(told[0].1.contains("never does"), "{:?}", told[0]);
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.lines().count(), 1);
         assert!(
@@ -398,8 +449,20 @@ mod tests {
             "{text}"
         );
         let mut out = Vec::new();
-        assert!(!refuse_if_elevated(&Rights(false), &mut out));
+        let mut told = 0;
+        let mut tell = |_: &str, _: &str| told += 1;
+        assert!(!refuse_if_elevated(&Rights(false), &mut out, &mut tell));
         assert!(out.is_empty());
+        assert_eq!(told, 0);
+    }
+
+    #[test]
+    fn a_message_box_is_only_for_a_program_nobody_can_hear_from() {
+        // No handle: started from the desktop. Any real handle: someone reads
+        // standard error, and a box would only wait for a click.
+        assert!(handle_is_missing(0));
+        assert!(handle_is_missing(-1));
+        assert!(!handle_is_missing(0x1c4));
     }
 
     #[test]
@@ -425,6 +488,18 @@ mod tests {
             let mode = parse_args(&args(argv)).expect("parses");
             assert!(!is_refused_when_elevated(&mode), "{argv:?}");
         }
+    }
+
+    #[test]
+    fn the_drawing_backend_gets_a_line_of_its_own_in_the_about_box() {
+        let info = about_with("Drawing: GPU (Example)");
+        assert_eq!(info.drawing.as_deref(), Some("Drawing: GPU (Example)"));
+        // The target line stays the target, untouched.
+        assert_eq!(info.target, env!("BYTESCAPE_TARGET"));
+        assert_eq!(info.version, env!("BYTESCAPE_VERSION"));
+        // Nothing to say, no empty line.
+        assert_eq!(about_with("  ").drawing, None);
+        assert_eq!(about().drawing, None);
     }
 
     #[test]

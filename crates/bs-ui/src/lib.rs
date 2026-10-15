@@ -141,6 +141,16 @@ pub trait ViewSource {
     fn describe(&self, _view: ViewId, _id: u32) -> Option<ItemInfo> {
         None
     }
+    /// Whether `view` is a folder that was counted completely and holds
+    /// nothing, so the map has nothing to draw in it.
+    fn view_is_empty(&self, _view: ViewId) -> bool {
+        false
+    }
+    /// Whether the folder behind `view` was cut off by a rescan of a folder
+    /// above it: the view shows something that is not in the tree any more.
+    fn view_is_gone(&self, _view: ViewId) -> bool {
+        false
+    }
     /// Starts laying `view` out again with the data as it is now, on another
     /// thread. `None` when the source can only lay out in place.
     fn begin_relayout(&mut self, _view: ViewId, _map: Rect) -> Option<RelayoutJob> {
@@ -868,6 +878,36 @@ impl<S: ViewSource> App<S> {
         }
         self.generation += 1;
         self.restore_after_relayout(&mut fx);
+        fx
+    }
+
+    /// After a rescan cut off the folders below the one that was read again:
+    /// moves every view that showed one of them to the nearest folder above
+    /// it that is still in the tree, forgets history entries that point into
+    /// the cut-off part, and lays the view now on screen out again. Never
+    /// shows a dead subtree as if it were live. Returns what changed on
+    /// screen; empty when every view is still in the tree.
+    pub fn leave_gone_views(&mut self) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        let source = &self.source;
+        self.history_back.retain(|e| !source.view_is_gone(e.view));
+        self.history_forward
+            .retain(|e| !source.view_is_gone(e.view));
+        let first_gone = self
+            .stack
+            .iter()
+            .position(|l| self.source.view_is_gone(l.view));
+        let Some(first_gone) = first_gone else {
+            return fx;
+        };
+        self.skip_running_animation(&mut fx);
+        // The root never goes: it is the scanned folder.
+        self.stack.truncate(first_gone.max(1));
+        if let Some(level) = self.stack.last_mut() {
+            level.stale = true;
+        }
+        self.refresh_top();
+        self.after_set_view(&mut fx);
         fx
     }
 

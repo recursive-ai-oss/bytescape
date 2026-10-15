@@ -88,4 +88,5 @@ assets = [
 embed-resource = { workspace = true }
 
 [dev-dependencies]
+bs-ipc = { path = "../bs-ipc" }
 tiny-skia = { workspace = true }

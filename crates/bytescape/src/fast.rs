@@ -204,6 +204,9 @@ impl Scanner for HelperScanner {
 
 /// A sentence for a helper that could not run, ending in a full stop.
 fn failure_text(error: &ElevateError) -> String {
+    if let Some(words) = bs_ui::elevation::elevate_error_words(error) {
+        return words;
+    }
     match error {
         ElevateError::Unavailable(why) => why.explanation().to_string(),
         ElevateError::Declined => "administrator rights were declined.".to_string(),
@@ -377,6 +380,24 @@ mod tests {
         };
         assert!(text.contains("not installed"), "{text}");
         assert!(text.ends_with('.'));
+    }
+
+    #[test]
+    fn a_refused_network_volume_is_explained_in_words() {
+        let launcher = Arc::new(Launcher {
+            script: Mutex::new(Some(Err(ElevateError::Protocol(
+                bs_ipc::ClientError::Helper(bs_ipc::ErrorReport {
+                    code: bs_ipc::ErrorCode::RemoteVolume,
+                    message: "remote volume".into(),
+                }),
+            )))),
+        });
+        let scanner = HelperScanner::new(launcher);
+        let (_, finish) = run(&scanner);
+        let Finish::Ended(FastEnd::Failed(text)) = finish else {
+            panic!("{finish:?}");
+        };
+        assert_eq!(text, bs_ui::elevation::REMOTE_VOLUME);
     }
 
     #[test]

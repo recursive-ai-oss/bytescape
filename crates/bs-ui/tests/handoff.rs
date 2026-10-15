@@ -541,6 +541,53 @@ fn only_big_folders_near_the_top_are_handed_to_the_matcher() {
 }
 
 #[test]
+fn the_limit_is_exactly_the_matchers_and_deleted_folders_are_left_out() {
+    let limit = bs_platform::software::MIN_MATCH_BYTES;
+    let mut agg = Aggregator::new();
+    let mut b = Batch::new();
+    b.dir(DirKey(0), DirKey::NONE, b"/data", &meta(4096))
+        .unwrap();
+    for (key, name, bytes) in [
+        (1, &b"just-under"[..], limit - 1 - 4096),
+        (2, b"exactly", limit - 4096),
+        (3, b"binned", limit * 3),
+    ] {
+        b.dir(DirKey(key), DirKey(0), name, &meta(4096)).unwrap();
+        b.file(NodeKind::File, DirKey(key), b"blob.bin", &meta(bytes))
+            .unwrap();
+    }
+    for k in 0..4 {
+        b.listing_done(DirKey(k));
+    }
+    agg.apply(&b);
+    agg.finish();
+    let snap = agg.publish();
+    let binned = snap
+        .root()
+        .unwrap()
+        .children()
+        .find(|c| c.name() == b"binned")
+        .unwrap()
+        .id();
+    agg.mark_deleted(binned, bs_tree::DeleteState::InBin)
+        .unwrap();
+    let snap = agg.publish();
+    let found = bs_ui::owners::candidates(&snap);
+    let sep = std::path::MAIN_SEPARATOR;
+    let paths: Vec<String> = found
+        .iter()
+        .map(|(p, _)| p.to_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !paths.iter().any(|p| p.ends_with("just-under")),
+        "a folder under the limit is never asked about: {paths:?}"
+    );
+    assert!(!paths.iter().any(|p| p.ends_with("binned")), "{paths:?}");
+    assert!(paths.contains(&format!("/data{sep}exactly")), "{paths:?}");
+    assert!(found.iter().all(|(_, bytes)| *bytes >= limit));
+}
+
+#[test]
 fn asking_in_the_background_returns_at_once_and_hands_over_later() {
     let mut agg = Aggregator::new();
     let mut b = Batch::new();

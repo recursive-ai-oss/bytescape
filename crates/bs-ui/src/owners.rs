@@ -123,39 +123,37 @@ impl Owners for Matcher {
 }
 
 /// The folders of a finished scan worth asking the matcher about: those of
-/// at least [`MIN_MATCH_BYTES`] near the top of the tree.
+/// at least [`MIN_MATCH_BYTES`] near the top of the tree, found by the tree's
+/// own large-folder query. The scanned folder itself counts too: it may be a
+/// program's whole install folder.
 pub fn candidates(snapshot: &Snapshot) -> Vec<(PathBuf, u64)> {
     let mut found: Vec<(PathBuf, u64)> = Vec::new();
     let Some(root) = snapshot.root() else {
         return found;
     };
     let separator = if cfg!(windows) { b'\\' } else { b'/' };
-    let mut level = vec![root.id()];
-    let mut depth = 0;
-    while !level.is_empty() && depth <= MOST_DEPTH && found.len() < MOST_CANDIDATES {
-        let mut next = Vec::new();
-        for id in level {
-            let Some(node) = snapshot.node(id) else {
-                continue;
-            };
-            if node.kind() != NodeKind::Dir
-                || node.allocated() < MIN_MATCH_BYTES
-                || node.is_under_synthetic()
-            {
-                continue;
-            }
-            if let Some(raw) = snapshot.path(id, separator)
-                && let Some(path) = crate::tree::path_from_bytes(raw)
-            {
-                found.push((path, node.allocated()));
-            }
-            next.extend(node.children().map(|c| c.id()));
-            if found.len() >= MOST_CANDIDATES {
-                break;
+    let mut add = |id: bs_tree::NodeId, bytes: u64| {
+        if let Some(raw) = snapshot.path(id, separator)
+            && let Some(path) = crate::tree::path_from_bytes(raw)
+        {
+            found.push((path, bytes));
+        }
+    };
+    if root.kind() == NodeKind::Dir
+        && root.allocated() >= MIN_MATCH_BYTES
+        && !root.is_under_synthetic()
+    {
+        add(root.id(), root.allocated());
+    }
+    if let Some(large) =
+        snapshot.large_dirs(root.id(), MIN_MATCH_BYTES, MOST_DEPTH, MOST_CANDIDATES)
+    {
+        for dir in large.dirs {
+            let under_synthetic = snapshot.node(dir.id).is_none_or(|n| n.is_under_synthetic());
+            if !under_synthetic {
+                add(dir.id, dir.allocated);
             }
         }
-        level = next;
-        depth += 1;
     }
     found
 }

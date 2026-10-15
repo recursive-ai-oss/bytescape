@@ -595,6 +595,7 @@ name = "bytescape"
 version = "0.1.0"
 dependencies = [
  "accesskit_winit",
+ "bs-ipc",
  "bs-knowledge",
  "bs-layout",
  "bs-platform",

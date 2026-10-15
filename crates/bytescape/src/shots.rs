@@ -71,6 +71,9 @@ pub fn is_picker_state(state: &str) -> bool {
             | "dialog-admin-linux"
             | "dialog-admin-windows"
             | "dialog-admin-many"
+            | "rescan-midway"
+            | "rescan-failed"
+            | "rescan-refused"
     )
 }
 
@@ -167,7 +170,11 @@ const FOLDERS: [(&str, u64, u8, u32); 7] = [
 fn fixture_agg(finish: bool, stopped: bool) -> (Aggregator, Arc<Snapshot>) {
     let mut agg = Aggregator::new();
     let mut b = Batch::new();
-    let _ = b.dir(DirKey(0), DirKey::NONE, b"/", &meta(4096, 0));
+    // On Windows a root named "/" makes every folder path "/\name", which the
+    // system tables rightly read as part of the operating system; the picture
+    // would then never offer the hold-to-confirm dialog it is made to show.
+    let root: &[u8] = if cfg!(windows) { b"C:\\Fixture" } else { b"/" };
+    let _ = b.dir(DirKey(0), DirKey::NONE, root, &meta(4096, 0));
     for (i, (name, total, category, files)) in FOLDERS.iter().enumerate() {
         let key = DirKey(i as u32 + 1);
         let _ = b.dir(key, DirKey(0), name.as_bytes(), &meta(4096, 0));
@@ -671,7 +678,12 @@ fn actions_scene(
                         _ => None,
                     })
                 })
-                .ok_or("no hold button")?;
+                .ok_or_else(|| {
+                    format!(
+                        "no hold button (the info bar says: {})",
+                        shell.info_line().name
+                    )
+                })?;
             shell.update(
                 InputEvent::PointerDown {
                     x: button.0,
@@ -881,11 +893,9 @@ fn notes_scene(
         }
         _ => bs_render::drawing_line(None, None),
     };
-    shell.set_about(AboutInfo::new(
-        "0.1.0",
-        "2025-08-20",
-        &format!("x86_64-unknown-linux-gnu · {drawing}"),
-    ));
+    shell.set_about(
+        AboutInfo::new("0.1.0", "2025-08-20", "x86_64-unknown-linux-gnu").with_drawing(drawing),
+    );
     shell.set_unix_clock(Box::new(|| 1_792_454_400));
     match state {
         "crash-banner" | "crash-narrow" => {
@@ -941,6 +951,80 @@ fn notes_scene(
     Ok((shell, now))
 }
 
+/// A folder of the finished fixture map read again in place: halfway through,
+/// or after a read that did not work.
+fn rescan_scene(
+    opts: &ShotOptions,
+    dark: bool,
+    text: &TextEngine,
+    state: &str,
+) -> Result<(Shell<TreeSource>, Duration), String> {
+    let (mut shell, mut agg) = map_shell_with(opts, dark, text, true, false);
+    agg.finish();
+    let snapshot = agg.publish();
+    let folder = snapshot
+        .root()
+        .and_then(|r| r.children().find(|c| c.name() == b"Videos"))
+        .map(|n| n.id())
+        .ok_or("the fixture has no Videos folder")?;
+    let now = match state {
+        "rescan-midway" => {
+            agg.begin_rescan(folder, None).map_err(|e| format!("{e}"))?;
+            // The folder's record and a first part of what it holds; the
+            // listing is still open.
+            let mut b = Batch::new();
+            let _ = b.dir(DirKey(0), DirKey::NONE, b"/Videos", &meta(4096, 0));
+            for f in 0..12u64 {
+                let _ = b.file(
+                    NodeKind::File,
+                    DirKey(0),
+                    format!("Videos-{f:03}.dat").as_bytes(),
+                    &meta(GB * 30 / (f + 2) + 1, 1),
+                );
+            }
+            agg.apply(&b);
+            let mid = agg.publish();
+            if let Some(app) = shell.app_mut() {
+                let source = app.source_mut();
+                source.set_rescanning(Some(folder));
+                source.set_snapshot(mid);
+                let moved = app.leave_gone_views();
+                drop(moved);
+                app.update(InputEvent::DataChanged, at(150));
+            }
+            shell.set_status("Scanning…".into(), true);
+            shell.begin_scan(at(100));
+            shell.set_readout(Some(ScanReadout {
+                ratio: None,
+                files: 12,
+                files_per_sec: 9_400.0,
+                elapsed: Duration::from_secs(2),
+            }));
+            rest_on(&mut shell, "Videos", at(200))?;
+            at(1_300)
+        }
+        _ => {
+            let problem = if state == "rescan-refused" {
+                "the path now leads somewhere else (a link), so nothing was read"
+            } else {
+                "it can't be opened (No such file or directory (os error 2))"
+            };
+            if let Some(app) = shell.app_mut() {
+                app.source_mut()
+                    .set_folder_problem(folder, Some(problem.to_string()));
+            }
+            shell.set_status("640 GB in 1.2 million files".into(), false);
+            shell.notify(
+                "Couldn't read Videos again. Its sizes are from the earlier scan",
+                at(120),
+            );
+            rest_on(&mut shell, "Videos", at(200))?;
+            at(400)
+        }
+    };
+    Ok((shell, now))
+}
+
 /// Pictures for the picker states.
 pub fn screenshots(opts: &ShotOptions, states: &[String], text: &TextEngine) -> Result<(), String> {
     let scale = opts.scale;
@@ -965,6 +1049,11 @@ pub fn screenshots(opts: &ShotOptions, states: &[String], text: &TextEngine) -> 
                 | "menu-blocked"
                 | "menu-pending" => {
                     let (shell, at) = actions_scene(opts, dark, text, state)?;
+                    now = at;
+                    shell
+                }
+                "rescan-midway" | "rescan-failed" | "rescan-refused" => {
+                    let (shell, at) = rescan_scene(opts, dark, text, state)?;
                     now = at;
                     shell
                 }

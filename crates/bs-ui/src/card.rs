@@ -60,6 +60,9 @@ pub struct CardData {
     pub delete_state: DeleteMark,
     /// The subtree is fully counted, so actions are allowed.
     pub complete: bool,
+    /// Why reading the folder again did not work, in words. Its numbers are
+    /// then those of the earlier scan.
+    pub problem: Option<String>,
     /// Part of the operating system: never offered for deletion.
     pub blocked: bool,
     /// A full scan is running: nothing that changes the disk may start.
@@ -216,7 +219,10 @@ pub fn why_not(data: &CardData, action: Action) -> Option<&'static str> {
     if data.scan_holds
         && matches!(
             action,
-            Action::Delete | Action::DeletePermanently | Action::Handoff(Handoff::Uninstall)
+            Action::Delete
+                | Action::DeletePermanently
+                | Action::Handoff(Handoff::Uninstall)
+                | Action::Rescan
         )
     {
         return Some(reason::FULL_SCAN_RUNNING);
@@ -500,8 +506,10 @@ pub fn build(
     if let Some(c) = data.category {
         facts.push(c.to_string());
     }
+    // A time of 0 means the scan never learned it (a stand-in folder): no date.
     if let Some(d) = data
         .modified
+        .filter(|&m| m != 0)
         .and_then(|m| m.checked_add(i64::from(data.utc_offset)))
         .and_then(format_date)
     {
@@ -548,6 +556,12 @@ pub fn build(
     }
 
     let mut notes: Vec<(String, CardRole)> = Vec::new();
+    if let Some(problem) = &data.problem {
+        notes.push((
+            format!("Couldn't read this folder again: {problem}. The sizes shown are from the earlier scan."),
+            CardRole::Normal,
+        ));
+    }
     if data.unreal {
         notes.push((
             "Not a real folder: it gathers files that no folder lists, so nothing can be done to it by name."
@@ -713,6 +727,7 @@ mod tests {
             hard_link: false,
             delete_state: DeleteMark::None,
             complete: true,
+            problem: None,
             blocked: false,
             scan_holds: false,
             unreal: false,
@@ -800,6 +815,27 @@ mod tests {
             Rect::new(10.0, 100.0, 100.0, 100.0),
             (50.0, 150.0),
         ));
+    }
+
+    #[test]
+    fn a_time_of_zero_is_not_shown_as_a_date() {
+        // A stand-in folder has no time; 1970-01-01 would be a made-up date.
+        for offset in [0, 3600, -3600] {
+            let mut d = data();
+            d.modified = Some(0);
+            d.utc_offset = offset;
+            let t = texts(&build_at(
+                &d,
+                Rect::new(10.0, 100.0, 100.0, 100.0),
+                (50.0, 150.0),
+            ));
+            assert!(
+                t.iter()
+                    .all(|l| !l.contains("1970") && !l.contains("modified")),
+                "{t:?}"
+            );
+            assert_eq!(t[3], "Video");
+        }
     }
 
     fn owned(owner: Ownership) -> CardData {

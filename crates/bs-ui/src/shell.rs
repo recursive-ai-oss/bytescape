@@ -164,6 +164,9 @@ struct Overlay {
 /// How long the pointer rests on a box before its card shows.
 pub const CARD_REST: Duration = Duration::from_millis(450);
 /// How long the card says "Copied".
+/// What the map says in a folder that holds nothing.
+pub const EMPTY_FOLDER: &str = "This folder is empty";
+
 const COPIED_FOR: Duration = Duration::from_millis(1500);
 /// How long a message stays in the info bar.
 const NOTICE_FOR: Duration = Duration::from_secs(3);
@@ -1159,7 +1162,8 @@ impl<S: ViewSource> Shell<S> {
             let data = self.card_data(view, id, false)?;
             card::why_not(&data, action).or(match action {
                 Action::ZoomInto | Action::Rescan if !data.is_folder => Some(reason::NOT_A_FOLDER),
-                Action::Rescan if !data.complete => Some(reason::SCANNING),
+                // Reading a folder again needs the finished tree to itself.
+                Action::Rescan if self.scanning || !data.complete => Some(reason::SCANNING),
                 _ => None,
             })
         })
@@ -1594,6 +1598,25 @@ impl<S: ViewSource> Shell<S> {
 
     /// The names the breadcrumb shows: the view's trail, else its text, else
     /// what was set before a map existed.
+    /// Where the words for an empty folder go: centred in the map, when the
+    /// view on screen is a folder that holds nothing.
+    fn empty_label_rect(&self, measure: &dyn Fn(&str) -> f32) -> Option<Rect> {
+        let app = self.app.as_ref()?;
+        if app.items().len() > 1 || !app.source().view_is_empty(app.current_view()) {
+            return None;
+        }
+        let map = self.map_rect();
+        let em = self.font_px * self.scale;
+        let w = measure(EMPTY_FOLDER).ceil().min(map.w);
+        let h = (em * 1.4).round();
+        Some(Rect::new(
+            (map.x + (map.w - w) / 2.0).round(),
+            (map.y + (map.h - h) / 2.0).round(),
+            w,
+            h,
+        ))
+    }
+
     fn crumb_segments(&self) -> Vec<String> {
         if let Some(app) = &self.app {
             let view = app.current_view();
@@ -1838,6 +1861,14 @@ impl<S: ViewSource> Shell<S> {
                 }
                 widgets.push(w);
             }
+        }
+        if let Some(rect) = self.empty_label_rect(&measure) {
+            widgets.push(Widget::Text {
+                rect,
+                text: EMPTY_FOLDER.into(),
+                role: TextRole::Secondary,
+                hot: false,
+            });
         }
         widgets.extend(self.crash_widgets());
         if let Some(o) = self.overlay() {
