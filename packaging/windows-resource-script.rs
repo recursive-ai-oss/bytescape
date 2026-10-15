@@ -39,3 +39,27 @@ pub fn resource_script(
     ));
     script
 }
+
+/// Whether the Windows resources are to be skipped. `skip` is the value of
+/// `BYTESCAPE_SKIP_WINRES`, `in_ci` says the build runs in CI and `release`
+/// says it is a release-profile build. The skip is
+/// for a developer who only wants `cargo clippy` or `cargo check` for a
+/// Windows target on a machine with no resource compiler: the result is a
+/// program without icon, version information or administrator manifest, so
+/// it must never be built in CI or released. Unset (or empty) means build the
+/// resources, and a missing resource compiler fails the build.
+pub fn winres_skip(skip: Option<&str>, in_ci: bool, release: bool) -> Result<bool, String> {
+    match skip {
+        None | Some("") => Ok(false),
+        Some("1") if in_ci => Err(String::from(
+            "BYTESCAPE_SKIP_WINRES is set in CI: a build without the Windows resources must never be built there",
+        )),
+        Some("1") if release => Err(String::from(
+            "BYTESCAPE_SKIP_WINRES is set for a release build: a release program must have its Windows resources",
+        )),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!(
+            "BYTESCAPE_SKIP_WINRES must be 1 or unset, not {other:?}"
+        )),
+    }
+}

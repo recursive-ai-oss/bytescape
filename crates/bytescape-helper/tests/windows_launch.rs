@@ -115,18 +115,28 @@ fn server(name: &str) -> PipeEnd {
     unsafe { PipeEnd::from_raw(handle) }
 }
 
-/// Stops the test with a clear message unless this process has an
-/// administrator token (`net session` needs one).
-fn require_administrator() {
-    let admin = Command::new("net")
-        .arg("session")
+/// True when this process has an elevated (administrator) token. `whoami
+/// /groups` lists the token's mandatory integrity level: High (S-1-16-12288)
+/// or System (S-1-16-16384) means elevated. This does not depend on any
+/// service running, unlike `net session`, which needs the Server service.
+fn is_elevated() -> bool {
+    Command::new("whoami")
+        .arg("/groups")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
+        .output()
+        .is_ok_and(|output| {
+            let text = String::from_utf8_lossy(&output.stdout);
+            output.status.success()
+                && (text.contains("S-1-16-12288") || text.contains("S-1-16-16384"))
+        })
+}
+
+/// Stops the test with a clear message unless this process has an
+/// administrator token.
+fn require_administrator() {
     assert!(
-        admin,
+        is_elevated(),
         "these tests start bytescape-helper.exe, whose manifest requires administrator rights: run them from an elevated prompt"
     );
 }

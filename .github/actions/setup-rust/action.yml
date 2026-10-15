@@ -4,6 +4,17 @@ description: Installs the Rust release pinned in rust-toolchain.toml, with the c
 runs:
   using: composite
   steps:
+    # BYTESCAPE_SKIP_WINRES=1 skips the Windows resources so a developer can
+    # lint Windows code without a resource compiler. A build made that way has
+    # no icon, version information or administrator manifest, so no CI or
+    # release job may run with it. Every job that builds uses this action.
+    - name: Refuse a build that skips the Windows resources
+      shell: bash
+      run: |
+        if [ -n "${BYTESCAPE_SKIP_WINRES:-}" ]; then
+          echo "::error title=Windows resources skipped::BYTESCAPE_SKIP_WINRES is set. It is for local linting only and must not be set in CI or release builds."
+          exit 1
+        fi
     # The pin lives in one place, rust-toolchain.toml. Reading it here (instead
     # of repeating the version in this workflow) keeps every job, the lints
     # included, on the same compiler, and works with any rustup version.

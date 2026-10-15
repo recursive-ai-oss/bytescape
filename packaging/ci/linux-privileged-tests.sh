@@ -39,8 +39,29 @@ fi
 
 log="$(mktemp)"
 build_log="$(mktemp)"
-trap 'rm -f "$log" "$build_log"' EXIT
 target="${CARGO_TARGET_DIR:-target}"
+
+# The helper's tests build their fixtures in folders named bs-helper-it-*,
+# below /tmp or $TMPDIR, and the root test leaves a set-user-id root copy of
+# `env` in one of them. A test program that is killed (a step time limit, for
+# one) never reaches its own clean-up, so this script removes the folders when
+# it exits, as root where it needs to, whatever the exit status. It only
+# looks at the top level of those two folders.
+cleanup_helper_dirs() {
+  local dir
+  for dir in /tmp "${TMPDIR:-/tmp}"; do
+    [ -d "$dir" ] || continue
+    # The folders this user made go first; what is left belongs to root.
+    find "$dir" -maxdepth 1 -type d -name 'bs-helper-it-*' -exec rm -rf -- {} + 2> /dev/null || true
+    if [ -n "$(find "$dir" -maxdepth 1 -type d -name 'bs-helper-it-*' -print -quit)" ] && [ "$(id -u)" != 0 ]; then
+      find "$dir" -maxdepth 1 -type d -name 'bs-helper-it-*' -exec sudo rm -rf -- {} + || true
+    fi
+    if [ -n "$(find "$dir" -maxdepth 1 -type d -name 'bs-helper-it-*' -print -quit)" ]; then
+      echo "warning: could not remove the bs-helper-it-* folders in $dir" >&2
+    fi
+  done
+}
+trap 'cleanup_helper_dirs; rm -f "$log" "$build_log"' EXIT
 
 # Build first, as the current user. Cargo prints where each test program is.
 cargo test --locked -p bs-scan --no-run \
@@ -99,7 +120,9 @@ fix_ownership() {
     sudo chown -R "$(id -u):$(id -g)" "$target"
   fi
 }
-trap 'fix_ownership; rm -f "$log" "$build_log"' EXIT
+# The clean-up comes first and each part is allowed to fail: one that cannot
+# do its job (no sudo, say) must not stop the others.
+trap 'cleanup_helper_dirs; rm -f "$log" "$build_log"; fix_ownership || true' EXIT
 
 echo "== as root"
 (

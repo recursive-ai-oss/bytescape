@@ -1,11 +1,52 @@
-# Crates the elevated helper may use at build time (its direct build
-# dependencies, all four release targets). `cargo xtask helper-deps` fails when
-# the helper has a build dependency that is not listed here.
+# Crates that run while bytescape-helper is compiled, on all four release
+# targets: the build dependencies of the helper and of every crate linked into
+# it (its own workspace crates, libc, windows-sys, and the rest of its normal
+# closure), and everything those depend on through normal or build edges.
+# The list is pinned. `cargo xtask helper-deps` fails when that set contains any
+# crate that is not named here, however deep in the tree it is and whichever of
+# those crates asks for it.
 #
-# Build dependencies run while the helper is compiled. Nothing of them is
-# linked into the program except what they write, so they are not in
-# helper-deps.allow. Code that runs in the build of a program that runs with
-# administrator rights is reviewed all the same, so every entry needs a
-# maintainer's explicit approval and a reason here.
+# They are not in helper-deps.allow because nothing of them is linked into the
+# program except what they write. Code that runs in the build of a program that
+# runs with administrator rights is reviewed all the same, so every new entry
+# needs a maintainer's explicit approval. Names only: a new version of a listed
+# crate is a Cargo.lock change and is reviewed with it.
 
-embed-resource  # Windows only: compiles the icon, version information and application manifest (requireAdministrator) into bytescape-helper.exe. On Linux its build script does nothing.
+# The one direct build dependency. Windows only: compiles the icon, version
+# information and application manifest (requireAdministrator) into
+# bytescape-helper.exe. On Linux its build script does nothing.
+embed-resource
+
+# Under embed-resource: reads Cargo.toml-style resource settings.
+toml
+toml_datetime
+toml_parser
+toml_writer
+serde_spanned
+serde_core
+winnow
+indexmap
+equivalent
+hashbrown
+foldhash
+
+# Under embed-resource: finds the Windows resource compiler and the C
+# toolchain.
+cc
+find-msvc-tools
+shlex
+jobserver
+vswhom
+vswhom-sys
+winreg
+rustc_version
+semver
+
+# Shared low-level crates.
+cfg-if
+libc
+memchr
+getrandom
+rand_core
+windows-sys
+windows-link

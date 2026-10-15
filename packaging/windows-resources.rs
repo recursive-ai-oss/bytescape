@@ -7,14 +7,42 @@
 // the file paths filled in, then compiled by the `embed-resource` crate for
 // the named program only (not for its test programs). On other systems
 // nothing happens.
+//
+// BYTESCAPE_SKIP_WINRES=1 skips the compile with a warning, for checking
+// Windows code (cargo clippy, cargo check) on a machine with no resource
+// compiler. CI builds and release-profile builds fail if it is set. See
+// docs/building.md.
 
 include!("windows-resource-script.rs");
 
 /// Compiles the resources into the program `bin` when building for Windows.
 pub fn embed_windows_resources(bin: &str, description: &str, with_icon: bool) {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=BYTESCAPE_SKIP_WINRES");
+    println!("cargo:rerun-if-env-changed=PROFILE");
+    println!("cargo:rerun-if-env-changed=CI");
+    println!("cargo:rerun-if-env-changed=GITHUB_ACTIONS");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
+    }
+    let in_ci = std::env::var_os("CI").is_some() || std::env::var_os("GITHUB_ACTIONS").is_some();
+    let release = std::env::var("PROFILE").as_deref() == Ok("release");
+    match winres_skip(
+        std::env::var("BYTESCAPE_SKIP_WINRES").ok().as_deref(),
+        in_ci,
+        release,
+    ) {
+        Ok(true) => {
+            println!(
+                "cargo:warning=BYTESCAPE_SKIP_WINRES is set: the Windows resources for {bin} were NOT compiled. This build is for checking only; never release it."
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
     }
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
     let packaging = std::path::Path::new(&manifest_dir).join("../../packaging");

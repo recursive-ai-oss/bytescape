@@ -52,3 +52,13 @@ cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnullvm -- -D 
 ```
 
 That checks the Windows-only code paths for errors. It does not run them; Windows tests run on Windows in CI.
+
+Building for Windows also compiles the icon, the version information and the application manifest into each program, and that needs a resource compiler for the target (`windres` from llvm-mingw or MinGW-w64 for the `gnullvm` and `gnu` targets, or the Windows SDK on Windows). Without one the build stops, which is the right default: a Windows program without its manifest must not be built by accident.
+
+If you only want to lint or type-check Windows code on a machine that has no resource compiler, you can say so explicitly:
+
+```sh
+BYTESCAPE_SKIP_WINRES=1 cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnullvm -- -D warnings
+```
+
+The two build scripts then skip the resources and print a warning saying so. Use it only for `clippy` and `check`. Programs built this way have no icon, no version information and no administrator manifest, so they must never be run for real or released. The variable only accepts `1`. CI and the release builds fail at the first step if it is set, `packaging/windows/build-windows.sh` refuses it, and the build scripts refuse it when they see they run in CI or build with the release profile.

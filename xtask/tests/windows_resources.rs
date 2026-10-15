@@ -6,6 +6,20 @@ mod script {
     include!("../../packaging/windows-resource-script.rs");
 }
 
+#[test]
+fn the_resources_are_skipped_only_on_an_explicit_request_outside_ci() {
+    assert_eq!(script::winres_skip(None, false, false), Ok(false));
+    assert_eq!(script::winres_skip(Some(""), false, false), Ok(false));
+    assert_eq!(script::winres_skip(Some("1"), false, false), Ok(true));
+    // CI and release builds never skip, and a loose value is not taken as a
+    // request.
+    assert_eq!(script::winres_skip(None, true, true), Ok(false));
+    assert!(script::winres_skip(Some("1"), true, false).is_err());
+    assert!(script::winres_skip(Some("1"), false, true).is_err());
+    assert!(script::winres_skip(Some("0"), false, false).is_err());
+    assert!(script::winres_skip(Some("yes"), false, false).is_err());
+}
+
 fn make(version: &str) -> String {
     script::resource_script(
         version,

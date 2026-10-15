@@ -972,7 +972,7 @@ fn helper_deps_fails_when_the_helper_is_missing() {
 }
 
 #[test]
-fn helper_build_dependencies_must_be_listed() {
+fn helper_build_closure_flags_a_direct_build_dependency_that_is_not_listed() {
     let doc = metadata(&[
         (
             "bytescape-helper",
@@ -997,7 +997,90 @@ fn helper_build_dependencies_must_be_listed() {
 }
 
 #[test]
-fn helper_build_dependencies_fail_when_the_helper_is_missing() {
+fn helper_build_closure_follows_normal_and_build_edges_of_build_dependencies() {
+    let doc = metadata(&[
+        (
+            "bytescape-helper",
+            &[],
+            &[("embed-resource", Some("build"))],
+        ),
+        (
+            "embed-resource",
+            &[],
+            &[
+                ("toml", None),
+                ("vswhom", Some("build")),
+                ("tester", Some("dev")),
+            ],
+        ),
+        ("toml", &[], &[("serde-spanned", None)]),
+        ("serde-spanned", &[], &[]),
+        ("vswhom", &[], &[]),
+        ("tester", &[], &[]),
+    ]);
+    let found = helper_deps::helper_build_closure(&doc).expect("helper present");
+    assert_eq!(
+        found,
+        allow(&["embed-resource", "toml", "serde-spanned", "vswhom"])
+    );
+    // A new crate deep in the closure fails even though no direct dependency changed.
+    let findings = helper_deps::check_build_dependencies(
+        &doc,
+        "t",
+        &allow(&["embed-resource", "toml", "vswhom"]),
+    );
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].subject, "serde-spanned");
+}
+
+#[test]
+fn helper_build_closure_covers_build_dependencies_of_the_linked_crates() {
+    // A build dependency planted on a crate the helper links in (here bs-ipc,
+    // two steps down) runs while the helper is built, so it is listed too.
+    let doc = metadata(&[
+        ("bytescape-helper", &[], &[("bs-ipc", None)]),
+        ("bs-ipc", &[], &[("bs-tree", None), ("itoa", Some("build"))]),
+        (
+            "bs-tree",
+            &[],
+            &[("cc", Some("build")), ("tester", Some("dev"))],
+        ),
+        ("itoa", &[], &[("memchr", None)]),
+        ("cc", &[], &[]),
+        ("memchr", &[], &[]),
+        ("tester", &[], &[]),
+        ("unrelated", &[], &[("serde", Some("build"))]),
+        ("serde", &[], &[]),
+    ]);
+    let found = helper_deps::helper_build_closure(&doc).expect("helper present");
+    assert_eq!(found, allow(&["itoa", "memchr", "cc"]));
+    let findings = helper_deps::check_build_dependencies(&doc, "t", &allow(&["cc"]));
+    let subjects: Vec<&str> = findings.iter().map(|f| f.subject.as_str()).collect();
+    assert_eq!(subjects, ["itoa", "memchr"]);
+    assert!(
+        helper_deps::check_build_dependencies(&doc, "t", &allow(&["cc", "itoa", "memchr"]))
+            .is_empty()
+    );
+}
+
+#[test]
+fn helper_build_closure_ignores_the_normal_closure_and_dev_dependencies() {
+    let doc = metadata(&[
+        (
+            "bytescape-helper",
+            &[],
+            &[("bs-ipc", None), ("tester", Some("dev"))],
+        ),
+        ("bs-ipc", &[], &[("itoa", None)]),
+        ("itoa", &[], &[]),
+        ("tester", &[], &[]),
+    ]);
+    let found = helper_deps::helper_build_closure(&doc).expect("helper present");
+    assert!(found.is_empty());
+}
+
+#[test]
+fn helper_build_closure_fails_when_the_helper_is_missing() {
     let doc = metadata(&[("bytescape", &[], &[])]);
     assert_eq!(
         helper_deps::check_build_dependencies(&doc, "t", &allow(&[])).len(),

@@ -605,6 +605,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Refuse a build that skips the Windows resources
+        run: |
+          if [ -n "${BYTESCAPE_SKIP_WINRES:-}" ]; then
+            echo "::error title=Windows resources skipped::BYTESCAPE_SKIP_WINRES is set. It is for local linting only and must not be set in release builds."
+            exit 1
+          fi
       - name: Install snapcraft
         timeout-minutes: 10
         run: sudo snap install snapcraft --classic
@@ -668,8 +674,8 @@ jobs:
 
   # ---- Files together ------------------------------------------------------
 
-  # Gathers every file, writes the checksums, generates the winget and
-  # Chocolatey files from them, and records where the files were built.
+  # Gathers every file, writes the checksums, and generates the winget and
+  # Chocolatey files from them.
   assemble:
     name: assemble
     needs: [prepare, windows-check, linux-check, snap]
@@ -679,12 +685,11 @@ jobs:
     if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.windows-check.result == 'success' && needs.linux-check.result == 'success' && needs.snap.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    # The two extra permissions are for the build-provenance statement, which
-    # needs no stored secret. It is made only in a public repository.
+    # Read-only. This job compiles the project's own tool (xtask), so it holds
+    # nothing else; the build-provenance statement is made by the `attest` job
+    # below, which compiles nothing.
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -705,17 +710,6 @@ jobs:
           date="$(date -u -d "@$(git log -1 --format=%ct)" +%F)"
           cargo xtask manifests --version "${{ needs.prepare.outputs.version }}" --sums dist/SHA256SUMS --date "$date" --out manifests
           (cd manifests && zip -r -q "../dist/bytescape-${{ needs.prepare.outputs.version }}-package-manifests.zip" .)
-      - name: Record how the files were built
-        if: ${{ !github.event.repository.private }}
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: |
-            dist/*-setup.exe
-            dist/*-portable.zip
-            dist/*-symbols.zip
-            dist/*.deb
-            dist/*.AppImage
-            dist/*.snap
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-files
@@ -726,6 +720,41 @@ jobs:
           name: package-manifests
           path: manifests/
           if-no-files-found: error
+
+  # Records where the files were built (a build-provenance statement). It needs
+  # no stored secret, only a login token and the right to write attestations,
+  # and it is made only in a public repository. It downloads the finished files
+  # and runs no project code, so nothing that compiles ever holds these
+  # permissions. It downloads the per-platform files that the build and
+  # signing jobs uploaded, not the `release-files` bundle that `assemble`
+  # makes after running the project's own tool over them, so what is attested
+  # is what those jobs produced.
+  attest:
+    name: attest
+    needs: assemble
+    if: ${{ !cancelled() && needs.assemble.result == 'success' && !github.event.repository.private }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "{windows,linux,snap}-*"
+          merge-multiple: true
+          path: dist
+      - name: Record how the files were built
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*-setup.exe
+            dist/*-portable.zip
+            dist/*-symbols.zip
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.snap
 
   # The Chocolatey package must build with the real tool.
   chocolatey-pack:
@@ -748,8 +777,10 @@ jobs:
   # A tag creates the draft. Publishing it is a person's decision.
   draft-release:
     name: draft release
-    needs: [prepare, assemble, chocolatey-pack, windows-sign-installer, linux-sign]
-    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.assemble.result == 'success' && needs.chocolatey-pack.result == 'success' }}
+    needs: [prepare, assemble, attest, chocolatey-pack, windows-sign-installer, linux-sign]
+    # The statement is skipped in a private repository, which is fine; where it
+    # is made, a failure to make it stops the draft.
+    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.assemble.result == 'success' && (needs.attest.result == 'success' || needs.attest.result == 'skipped') && needs.chocolatey-pack.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

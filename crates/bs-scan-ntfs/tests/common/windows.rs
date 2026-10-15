@@ -17,6 +17,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+/// True when this process has an elevated (administrator) token. `whoami
+/// /groups` lists the token's mandatory integrity level: High (S-1-16-12288)
+/// or System (S-1-16-16384) means elevated. This does not depend on any
+/// service running, unlike `net session`, which needs the Server service.
+pub fn is_elevated() -> bool {
+    Command::new("whoami")
+        .arg("/groups")
+        .output()
+        .is_ok_and(|o| {
+            let text = String::from_utf8_lossy(&o.stdout);
+            o.status.success() && (text.contains("S-1-16-12288") || text.contains("S-1-16-16384"))
+        })
+}
+
 /// True when the test may run; otherwise says `NOT RUN` and returns false.
 /// A test that is allowed to run but cannot (no administrator rights) fails.
 pub fn allowed(test: &str) -> bool {
@@ -24,12 +38,8 @@ pub fn allowed(test: &str) -> bool {
         println!("NOT RUN: {test} needs BYTESCAPE_DISPOSABLE_HOST=1 (it attaches virtual disks)");
         return false;
     }
-    let admin = Command::new("net")
-        .arg("session")
-        .output()
-        .is_ok_and(|o| o.status.success());
     assert!(
-        admin,
+        is_elevated(),
         "{test}: BYTESCAPE_DISPOSABLE_HOST is set but this is not an administrator shell"
     );
     true

@@ -77,15 +77,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     # The job limit is the sum of its step limits plus 15 minutes for checkout,
     # toolchain and cache, so a step's own limit is always what ends a hang.
-    # Linux: 5 + 20 + 15 (ext4) + 15 (btrfs) + 20 = 75, limit 90. Windows:
-    # 10 + 20 = 30, limit 45.
+    # Linux: 5 + 20 + 15 (ext4) + 15 (btrfs) + 15 (mounts) + 20 = 90, limit
+    # 105. Windows: 10 + 20 = 30, limit 45.
     timeout-minutes: ${{ matrix.limit }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
-            limit: 90
+            limit: 105
           - os: windows-2025
             limit: 45
     env:
@@ -151,6 +151,19 @@ jobs:
         if: ${{ runner.os == 'Linux' && !cancelled() }}
         timeout-minutes: 15
         run: cargo test --locked -p bs-scan-btrfs --features image-tests --no-fail-fast
+      # Tests that mount real file systems inside a private user and mount
+      # namespace. Without the variable they print NOT RUN and pass when the
+      # namespace cannot be made; with it they fail instead, so a runner that
+      # loses the ability to make one turns the job red and never skips quietly.
+      - name: Namespace mount tests (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        timeout-minutes: 15
+        env:
+          BYTESCAPE_REQUIRE_NAMESPACES: "1"
+        run: |
+          cargo test --locked -p bs-scan-xfs --test mount_real -- --nocapture
+          cargo test --locked -p bs-scan-btrfs --lib mounts -- --nocapture
+          cargo test --locked -p bs-platform --lib delete -- --nocapture
       # The tests that need a private namespace or root, run for real. The
       # script fails when any of them reports NOT RUN.
       - name: Namespace and root tests (Linux)
@@ -244,9 +257,9 @@ jobs:
     name: arm64 (${{ matrix.os }})
     if: ${{ vars.ARM64_CI == 'true' }}
     runs-on: ${{ matrix.os }}
-    # Sum of the step limits below (Linux 5 + 20 + 20 + 20 + 10, Windows 20 + 10
-    # + 20 + 10) plus 15 minutes for checkout, toolchain and cache.
-    timeout-minutes: 90
+    # Sum of the step limits below (Linux 5 + 20 + 20 + 15 + 20 + 10, Windows
+    # 20 + 10 + 20 + 10) plus 15 minutes for checkout, toolchain and cache.
+    timeout-minutes: 105
     strategy:
       fail-fast: false
       matrix:
@@ -289,6 +302,19 @@ jobs:
         if: ${{ runner.os == 'Linux' && !cancelled() }}
         timeout-minutes: 20
         run: cargo test --locked --workspace
+      # Tests that mount real file systems inside a private user and mount
+      # namespace. Without the variable they print NOT RUN and pass when the
+      # namespace cannot be made; with it they fail instead, so a runner that
+      # loses the ability to make one turns the job red and never skips quietly.
+      - name: Namespace mount tests (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        timeout-minutes: 15
+        env:
+          BYTESCAPE_REQUIRE_NAMESPACES: "1"
+        run: |
+          cargo test --locked -p bs-scan-xfs --test mount_real -- --nocapture
+          cargo test --locked -p bs-scan-btrfs --lib mounts -- --nocapture
+          cargo test --locked -p bs-platform --lib delete -- --nocapture
       - name: Namespace and root tests (Linux)
         if: ${{ runner.os == 'Linux' && !cancelled() }}
         timeout-minutes: 20
@@ -486,6 +512,58 @@ jobs:
         with:
           name: bench-cold-xfs-${{ github.run_id }}
           path: bench-results/
+          if-no-files-found: error
+
+  # The io_uring statx experiment, cold: the page, dentry and inode caches are
+  # dropped before every timed run, which takes root, so it runs on the
+  # GitHub-hosted runner (passwordless sudo, throwaway machine) and only on
+  # request or on the weekly schedule. It measures and records; it does not
+  # decide anything by itself. The script refuses to run (exit 3) instead of
+  # measuring warm when it is not root or cannot empty the caches. Hosted
+  # runners have virtual SSDs, so a run on a rotational disk needs a
+  # self-hosted runner.
+  iouring-cold:
+    name: iouring-cold
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Look for the benchmark script
+        id: script
+        run: |
+          if [ -f crates/bs-scan/bench/uring-bench.sh ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=iouring-cold skipped::crates/bs-scan/bench/uring-bench.sh does not exist yet, so there is nothing to measure."
+          fi
+      - uses: ./.github/actions/setup-rust
+        if: steps.script.outputs.present == 'true'
+      # Built as the runner's own user first, so the run as root below does
+      # not install a toolchain or leave root-owned files in the target folder.
+      - name: Build the benchmark programs
+        if: steps.script.outputs.present == 'true'
+        timeout-minutes: 20
+        run: cargo build --release --locked -p bs-scan --features iouring-bench --examples
+      - name: io_uring statx experiment (cold, page cache + dentries + inodes dropped before every run)
+        if: steps.script.outputs.present == 'true'
+        timeout-minutes: 30
+        env:
+          BYTESCAPE_DISPOSABLE_HOST: "1"
+          BENCH_RESULTS: ${{ runner.temp }}/uring-bench
+          BENCH_RUNS: "10"
+        run: |
+          sudo -E env "PATH=$PATH" crates/bs-scan/bench/uring-bench.sh --threads 4,16 --depths 128,512 --async off
+          sudo -E env "PATH=$PATH" BENCH_RESULTS="$BENCH_RESULTS-sink-tree" \
+            crates/bs-scan/bench/uring-bench.sh --sink tree --threads 4,16 --depths 128 --async off
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() && steps.script.outputs.present == 'true' }}
+        with:
+          name: iouring-cold
+          path: ${{ runner.temp }}/uring-bench*
           if-no-files-found: error
 
   # The NTFS table reader on Linux (images made with ntfs-3g) and on Windows

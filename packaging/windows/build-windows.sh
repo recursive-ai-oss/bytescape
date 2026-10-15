@@ -41,6 +41,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# A build without the Windows resources (BYTESCAPE_SKIP_WINRES, a local
+# linting aid) must never become a release file: no icon, no version
+# information and, for the helper, no administrator manifest.
+if [ -n "${BYTESCAPE_SKIP_WINRES:-}" ]; then
+  echo "BYTESCAPE_SKIP_WINRES is set; it is for local linting only and must not be set when building Windows files" >&2
+  exit 2
+fi
+
 version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "bytescape") | .version')"
 
 need_arch() {
