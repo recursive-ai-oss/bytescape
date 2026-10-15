@@ -17,7 +17,7 @@ use crate::{Inodes, XfsError};
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -40,11 +40,32 @@ pub struct IoctlInodes {
 impl IoctlInodes {
     /// Opens the directory `path` and checks that it is on XFS.
     pub fn open(path: &Path) -> Result<IoctlInodes, XfsError> {
+        IoctlInodes::open_pinned(path, None)
+    }
+
+    /// Like [`IoctlInodes::open`], and with a pinned root to hold the
+    /// directory to: the descriptor that was opened must be on the pin's mount
+    /// (compared with the same function that made the pin's key), or the open
+    /// fails with [`XfsError::RootMoved`] before anything else is asked of the
+    /// file system. The directory is opened without following a final link.
+    /// The caller keeps the pin alive until the scan has ended.
+    pub fn open_pinned(
+        path: &Path,
+        pin: Option<&bs_scan::RootPin>,
+    ) -> Result<IoctlInodes, XfsError> {
         let file = File::options()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
         let fd: OwnedFd = file.into();
+        match bs_scan::check_root_pin(pin, fd.as_fd()) {
+            Ok(()) => {}
+            Err(bs_scan::ScanError::RootMoved { pinned, found }) => {
+                return Err(XfsError::RootMoved { pinned, found });
+            }
+            Err(bs_scan::ScanError::Root(e)) => return Err(XfsError::Io(e)),
+            Err(other) => return Err(XfsError::Io(io::Error::other(other))),
+        }
         let mut st = MaybeUninit::<libc::statfs>::zeroed();
         // SAFETY: `fd` is an open descriptor and `st` is a writable buffer of
         // the size `fstatfs` fills; it was zeroed, so it is initialized

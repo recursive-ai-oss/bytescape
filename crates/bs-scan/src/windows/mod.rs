@@ -71,7 +71,7 @@ use crate::threads;
 use crate::wininfo::{self, EntryClass, Layout};
 use bs_tree::{DirKey, FileKey, Meta, NodeFlags, NodeKind, ReadErrorKind, ReadFailure};
 use std::io;
-use std::os::windows::io::OwnedHandle;
+use std::os::windows::io::{AsHandle, OwnedHandle};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,6 +163,10 @@ impl Scanner for Walker {
         let mut with_nul = path.clone();
         with_nul.push(0);
         let handle = sys::open_dir(&with_nul).map_err(ScanError::Root)?;
+        // The root the caller judged must be the one this very handle is on
+        // (volume serial number and file ID). Checked before anything is sent
+        // or read.
+        crate::check_root_pin(ctx.options().pinned_root.as_ref(), handle.as_handle())?;
         let info = sys::handle_info(&handle).map_err(ScanError::Root)?;
         if info.attributes & wininfo::attr::DIRECTORY == 0 {
             return Err(ScanError::NotADirectory(canonical));

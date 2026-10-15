@@ -334,8 +334,10 @@ impl Scanner for XfsScanner {
 
     fn scan(&self, root: &Path, ctx: &ScanContext) -> Result<ScanEnd, ScanError> {
         let canonical: PathBuf = std::fs::canonicalize(root).map_err(ScanError::Root)?;
-        let inodes = IoctlInodes::open(&canonical).map_err(into_scan_error)?;
-        let names = FsNames::new(canonical.clone());
+        let pinned = ctx.options().pinned_root.clone();
+        let inodes =
+            IoctlInodes::open_pinned(&canonical, pinned.as_ref()).map_err(into_scan_error)?;
+        let names = FsNames::new(canonical.clone()).pinned_to(pinned);
         let mut options = self.options.clone();
         options.max_memory_bytes = memory_cap(options.max_memory_bytes);
         let threads = options.threads.unwrap_or_else(default_threads);
@@ -363,6 +365,7 @@ impl Scanner for XfsScanner {
 fn into_scan_error(e: XfsError) -> ScanError {
     match e {
         XfsError::Io(e) => ScanError::Root(e),
+        XfsError::RootMoved { pinned, found } => ScanError::RootMoved { pinned, found },
         other => ScanError::Root(io::Error::new(io::ErrorKind::InvalidData, other)),
     }
 }

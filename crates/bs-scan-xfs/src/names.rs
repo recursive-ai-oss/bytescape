@@ -76,12 +76,25 @@ pub trait Names: Sync {
 #[derive(Debug)]
 pub struct FsNames {
     root: std::path::PathBuf,
+    pinned: Option<bs_scan::RootPin>,
 }
 
 impl FsNames {
     /// A walk of the directory `root`, which must be canonical.
     pub fn new(root: impl Into<std::path::PathBuf>) -> FsNames {
-        FsNames { root: root.into() }
+        FsNames {
+            root: root.into(),
+            pinned: None,
+        }
+    }
+
+    /// Holds the walk to the pinned root: the root directory, when it is
+    /// opened, must be on the pin's mount, or opening it fails with
+    /// [`crate::XfsError::RootMoved`]. The pin is kept for the walk.
+    #[must_use]
+    pub fn pinned_to(mut self, pinned: Option<bs_scan::RootPin>) -> FsNames {
+        self.pinned = pinned;
+        self
     }
 }
 
@@ -126,7 +139,21 @@ mod real {
 
         fn root(&self) -> io::Result<OpenedDir<OwnedFd>> {
             rawdir::raise_open_file_limit();
-            opened(rawdir::open_root(&self.root)?)
+            let fd = rawdir::open_root(&self.root)?;
+            // The walk opens the root by name once more, apart from the
+            // inode source; this descriptor must be on the checked mount too.
+            match bs_scan::check_root_pin(self.pinned.as_ref(), fd.as_fd()) {
+                Ok(()) => {}
+                Err(bs_scan::ScanError::RootMoved { pinned, found }) => {
+                    return Err(io::Error::other(crate::error::RootMovedError {
+                        pinned,
+                        found,
+                    }));
+                }
+                Err(bs_scan::ScanError::Root(e)) => return Err(e),
+                Err(other) => return Err(io::Error::other(other)),
+            }
+            opened(fd)
         }
 
         fn list(&self, dir: &OwnedFd, each: &mut dyn FnMut(RawName<'_>)) -> io::Result<()> {

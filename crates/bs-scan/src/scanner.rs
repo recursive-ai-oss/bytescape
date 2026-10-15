@@ -30,6 +30,7 @@
 
 use crate::boundary::Boundary;
 use crate::classify::Classifier;
+use crate::pin::{RootKey, RootPin};
 use bs_knowledge::Environment;
 use bs_tree::{Aggregator, Batch, DirKey, ReadErrorKind, ReadFailure, SnapshotReader};
 use std::fmt;
@@ -57,6 +58,17 @@ pub enum ScanError {
     /// A thread of the scan panicked. The scan was stopped and what had been
     /// counted is kept, marked incomplete. The text is the panic message.
     Panicked(String),
+    /// The caller pinned the scan root (see [`ScanOptions::pin_root`]) and the
+    /// folder the scanner actually opened is not it, or the scanner cannot
+    /// tell. Nothing was read and nothing was sent.
+    RootMoved {
+        /// The key of the root the caller judged.
+        pinned: RootKey,
+        /// The key of the folder (or device) the scanner opened; `None` when
+        /// the system does not say (before Linux 5.8, a volume without file
+        /// IDs, a device that is not a block device).
+        found: Option<RootKey>,
+    },
 }
 
 impl fmt::Display for ScanError {
@@ -67,6 +79,20 @@ impl fmt::Display for ScanError {
             ScanError::Unsupported => f.write_str("scanning is not supported on this platform"),
             ScanError::Threads(e) => write!(f, "cannot start scan threads: {e}"),
             ScanError::Panicked(m) => write!(f, "the scan stopped after an internal error: {m}"),
+            ScanError::RootMoved {
+                pinned,
+                found: Some(found),
+            } => write!(
+                f,
+                "the scan root is {found}, not {pinned}, which was checked; nothing was read"
+            ),
+            ScanError::RootMoved {
+                pinned,
+                found: None,
+            } => write!(
+                f,
+                "cannot tell what the scan root is, and {pinned} was checked; nothing was read"
+            ),
         }
     }
 }
@@ -107,9 +133,37 @@ pub struct ScanOptions {
     /// user) gives the user's here instead, so that no scan has to change
     /// the process environment first.
     pub environment: Option<Environment>,
+    /// The root the caller judged, if the scan is to be held to it. Set with
+    /// [`ScanOptions::pin_root`].
+    pub pinned_root: Option<RootPin>,
 }
 
 impl ScanOptions {
+    /// Binds the scan to the root the caller judged.
+    ///
+    /// A caller that decides something about a folder (that it is on a local
+    /// disk, say) and then hands the scanner the folder's *name* leaves a gap:
+    /// the name can lead somewhere else by the time the scanner opens it. With
+    /// a pin, the scanner checks the directory it actually opened for the
+    /// root, on that very descriptor, before it reads or sends anything. If it
+    /// is not the judged root's mount (Linux) or folder (Windows), or the
+    /// system does not say, the scan ends with [`ScanError::RootMoved`].
+    ///
+    /// The pin keeps the judged descriptor open, and that is what makes the
+    /// comparison sound; see [`RootPin`] for what the caller must hold on to.
+    /// The options carry the pin, so they must stay alive until the scan has
+    /// ended.
+    ///
+    /// Enforced by the Linux walker, the btrfs reader and the XFS reader (the
+    /// mount), by the ext4 reader (the device its file system is on), and by
+    /// the Windows walker (volume serial number and file ID). No pin, the
+    /// default, changes nothing.
+    #[must_use]
+    pub fn pin_root(mut self, pin: RootPin) -> ScanOptions {
+        self.pinned_root = Some(pin);
+        self
+    }
+
     /// These options with the category lookups resolved against `environment`
     /// instead of the process environment.
     #[must_use]
@@ -128,6 +182,7 @@ impl Default for ScanOptions {
             publish_interval: Duration::from_millis(100),
             categories: true,
             environment: None,
+            pinned_root: None,
         }
     }
 }
@@ -448,7 +503,10 @@ fn failure_of(error: &ScanError) -> ReadFailure {
             kind: ReadErrorKind::NotFound,
             code: 0,
         },
-        ScanError::Unsupported | ScanError::Threads(_) | ScanError::Panicked(_) => ReadFailure {
+        ScanError::Unsupported
+        | ScanError::Threads(_)
+        | ScanError::Panicked(_)
+        | ScanError::RootMoved { .. } => ReadFailure {
             kind: ReadErrorKind::Other,
             code: 0,
         },

@@ -2,7 +2,7 @@
 //! line of totals, for timing and for comparing with the walker. Needs
 //! administrator rights.
 //!
-//! scan [--no-categories] [--no-census] [--runs N] [--quiet] DIRECTORY
+//! scan_btrfs [--no-categories] [--no-census] [--runs N] [--quiet] DIRECTORY
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 mod linux {
     use bs_scan::{ScanOptions, start};
@@ -28,7 +28,9 @@ mod linux {
             }
         }
         let Some(dir) = dir else {
-            eprintln!("usage: scan [--no-categories] [--no-census] [--runs N] [--quiet] DIRECTORY");
+            eprintln!(
+                "usage: scan_btrfs [--no-categories] [--no-census] [--runs N] [--quiet] DIRECTORY"
+            );
             std::process::exit(2);
         };
         for run in 0..runs {

@@ -106,11 +106,32 @@ impl IoctlSource {
     /// source and where the scan starts: the directory's own subvolume and
     /// inode.
     pub fn open(path: &Path) -> Result<(IoctlSource, Start), BtrfsError> {
+        IoctlSource::open_pinned(path, None)
+    }
+
+    /// Like [`IoctlSource::open`], and with a pinned root to hold the
+    /// directory to: the descriptor that was opened must be on the pin's mount
+    /// (compared with the same function that made the pin's key), or the open
+    /// fails with [`BtrfsError::RootMoved`] before anything else is asked of
+    /// the file system. The directory is opened without following a final
+    /// link. The caller keeps the pin alive until the scan has ended.
+    pub fn open_pinned(
+        path: &Path,
+        pin: Option<&bs_scan::RootPin>,
+    ) -> Result<(IoctlSource, Start), BtrfsError> {
         let file = File::options()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
         let fd: OwnedFd = file.into();
+        match bs_scan::check_root_pin(pin, fd.as_fd()) {
+            Ok(()) => {}
+            Err(bs_scan::ScanError::RootMoved { pinned, found }) => {
+                return Err(BtrfsError::RootMoved { pinned, found });
+            }
+            Err(bs_scan::ScanError::Root(e)) => return Err(BtrfsError::Io(e)),
+            Err(other) => return Err(BtrfsError::Io(io::Error::other(other))),
+        }
         if statfs_of(fd.as_raw_fd())? != BTRFS_MAGIC {
             return Err(BtrfsError::NotBtrfs);
         }
@@ -118,9 +139,11 @@ impl IoctlSource {
         let tree = tree_of_fd(fd.as_raw_fd())?;
         let uuid = uuid_of_fd(fd.as_raw_fd())?;
         let source = IoctlSource {
+            // The mount table names canonical paths. Asked of the descriptor
+            // that was checked, so the name is of that directory and not of
+            // whatever the path leads to by now.
+            root: path_of_fd(fd.as_raw_fd()).map_or_else(|| std::fs::canonicalize(path), Ok)?,
             fd,
-            // The mount table names canonical paths.
-            root: std::fs::canonicalize(path)?,
             uuid,
         };
         Ok((
@@ -170,6 +193,19 @@ impl IoctlSource {
             inode: stat.st_ino,
         })
     }
+}
+
+/// The path the system gives for an open directory, if it will say.
+///
+/// A directory that has been removed since it was opened is named with a
+/// trailing " (deleted)". That is not a place any mount can be below, so it is
+/// refused here and the caller falls back to resolving the path it was given.
+fn path_of_fd(fd: RawFd) -> Option<PathBuf> {
+    let path = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+    if path.as_os_str().as_bytes().ends_with(b" (deleted)") {
+        return None;
+    }
+    path.is_absolute().then_some(path)
 }
 
 /// How the file system under a mount relates to the scan's.
@@ -491,6 +527,40 @@ mod tests {
         assert_eq!(IOC_TREE_SEARCH_V2, 0xC070_9411);
         assert_eq!(IOC_INO_LOOKUP, 0xD000_9412);
         assert_eq!(IOC_FS_INFO, 0x8400_941F);
+    }
+
+    #[test]
+    fn the_name_of_an_open_directory_follows_the_directory_and_not_the_old_name() {
+        let base = std::env::temp_dir().join(format!("bs-btrfs-fdname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("first")).unwrap();
+        let held = open_dir(base.join("first").to_str().unwrap());
+        let canonical = std::fs::canonicalize(base.join("first")).unwrap();
+        assert_eq!(path_of_fd(held.as_raw_fd()), Some(canonical));
+        // The directory is moved and another put at the old name: the held
+        // descriptor is still the first one, and so is the name asked of it.
+        std::fs::rename(base.join("first"), base.join("second")).unwrap();
+        std::fs::create_dir(base.join("first")).unwrap();
+        assert_eq!(
+            path_of_fd(held.as_raw_fd()),
+            Some(std::fs::canonicalize(base.join("second")).unwrap())
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_removed_directory_has_no_name_to_place_mounts_under() {
+        let base = std::env::temp_dir().join(format!("bs-btrfs-deleted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("gone")).unwrap();
+        let held = open_dir(base.join("gone").to_str().unwrap());
+        assert!(path_of_fd(held.as_raw_fd()).is_some());
+        std::fs::remove_dir(base.join("gone")).unwrap();
+        // The system now names it "... (deleted)"; that is refused outright.
+        let named = std::fs::read_link(format!("/proc/self/fd/{}", held.as_raw_fd())).unwrap();
+        assert!(named.to_string_lossy().ends_with(" (deleted)"), "{named:?}");
+        assert_eq!(path_of_fd(held.as_raw_fd()), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn open_dir(path: &str) -> OwnedFd {

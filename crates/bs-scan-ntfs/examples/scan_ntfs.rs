@@ -1,7 +1,7 @@
 //! Reads an NTFS volume or image and prints what it found: the totals, the
 //! report, and optionally every path. For timing and inspection.
 //!
-//! `scan <image-or-\\.\C:> [--listing] [--threads N] [--paths] [--sep /]`
+//! `scan_ntfs <image-or-\\.\C:> [--listing] [--threads N] [--paths] [--sep /]`
 
 use bs_scan::{ScanOptions, start};
 use bs_scan_ntfs::{Accounting, NtfsOptions, NtfsScanner};
@@ -27,7 +27,9 @@ fn main() {
         }
     }
     let Some(device) = device else {
-        eprintln!("usage: scan <image-or-volume> [--listing] [--threads N] [--paths] [--sep C]");
+        eprintln!(
+            "usage: scan_ntfs <image-or-volume> [--listing] [--threads N] [--paths] [--sep C]"
+        );
         std::process::exit(2);
     };
     let scanner = Arc::new(NtfsScanner::new(device, options));
@@ -40,7 +42,7 @@ fn main() {
     let result = handle.wait();
     let elapsed = begun.elapsed();
     if let Some(e) = &result.stats.error {
-        eprintln!("scan failed: {e}");
+        eprintln!("scan_ntfs failed: {e}");
         std::process::exit(1);
     }
     let root = result.snapshot.root().expect("a root");

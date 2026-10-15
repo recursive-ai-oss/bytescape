@@ -21,6 +21,14 @@ pub(crate) fn set_ignore_mount_ids(on: bool) {
     IGNORE_MOUNT_IDS.store(on, Ordering::Relaxed);
 }
 
+/// When set, the unique mount ID is left out of a root's identity, so the
+/// older, reusable ID is what gets compared (as before Linux 6.8).
+static IGNORE_UNIQUE_IDS: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_ignore_unique_mount_ids(on: bool) {
+    IGNORE_UNIQUE_IDS.store(on, Ordering::Relaxed);
+}
+
 /// The fields of `statx` the walker uses.
 #[derive(Clone, Copy, Debug)]
 pub struct Stat {
@@ -101,19 +109,93 @@ pub fn stat_fd(fd: BorrowedFd<'_>) -> io::Result<Stat> {
     statx_raw(fd.as_raw_fd(), c"".as_ptr(), FLAGS | libc::AT_EMPTY_PATH)
 }
 
+/// `STATX_MNT_ID_UNIQUE` (Linux 6.8 and later): a mount ID that the system
+/// never hands out a second time. The `libc` crate has no name for it yet.
+const STATX_MNT_ID_UNIQUE: libc::c_uint = 0x4000;
+
+/// What identifies the mount and file system an open directory is on.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RootIdentity {
+    /// The unique mount ID where the system has one, else the older one;
+    /// `None` when the system gives neither (before Linux 5.8, or the test
+    /// switch for that case is on).
+    pub key: Option<crate::RootKey>,
+    /// The device number of the file system, as `stat` reports it.
+    pub major: u32,
+    pub minor: u32,
+}
+
+/// The identity of the mount an open directory is on, asked the same way for
+/// the descriptor a caller judged and the one a scanner opened, so the two can
+/// be compared.
+pub(crate) fn root_identity(fd: BorrowedFd<'_>) -> io::Result<RootIdentity> {
+    // The unique ID is not asked for where a test stands in for an older
+    // kernel: asking for it makes the kernel put it in the one field both
+    // kinds share.
+    let want = if IGNORE_UNIQUE_IDS.load(Ordering::Relaxed) {
+        libc::STATX_MNT_ID
+    } else {
+        libc::STATX_MNT_ID | STATX_MNT_ID_UNIQUE
+    };
+    loop {
+        let mut buf = MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: the path is the empty string with `AT_EMPTY_PATH`, so the
+        // call describes `fd` itself; the buffer is writable and statx-sized,
+        // and was zeroed, so every field is initialized either way. Mask bits
+        // an older kernel does not know are ignored by it and left clear in
+        // the result mask.
+        let rc = unsafe {
+            libc::statx(
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                FLAGS | libc::AT_EMPTY_PATH,
+                want,
+                buf.as_mut_ptr(),
+            )
+        };
+        if rc == 0 {
+            // SAFETY: zero-initialized above and, on success, written by the kernel.
+            let raw = unsafe { buf.assume_init() };
+            let key = if IGNORE_MOUNT_IDS.load(Ordering::Relaxed) {
+                None
+            } else if raw.stx_mask & STATX_MNT_ID_UNIQUE != 0 {
+                Some(crate::RootKey::Mount {
+                    id: raw.stx_mnt_id,
+                    unique: true,
+                })
+            } else if raw.stx_mask & libc::STATX_MNT_ID != 0 {
+                Some(crate::RootKey::Mount {
+                    id: raw.stx_mnt_id,
+                    unique: false,
+                })
+            } else {
+                None
+            };
+            return Ok(RootIdentity {
+                key,
+                major: raw.stx_dev_major,
+                minor: raw.stx_dev_minor,
+            });
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
 const DIR_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
 /// Opens the scan root. The caller has resolved the path, so symbolic links in
-/// it are the user's choice; nothing below the root is followed.
+/// it are the user's choice; but the last part is opened without following a
+/// link, so a root that has become a link since it was resolved is refused
+/// (`ENOTDIR` or `ELOOP`) and not followed. Nothing below the root is followed
+/// either.
 pub fn open_root(path: &Path) -> io::Result<OwnedFd> {
     let c = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    open_raw(
-        libc::AT_FDCWD,
-        &c,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-    )
+    open_raw(libc::AT_FDCWD, &c, DIR_FLAGS)
 }
 
 /// Opens the directory `name` inside `dir`. Fails with `ELOOP` or `ENOTDIR` if

@@ -214,6 +214,35 @@ fn the_reader_matches_the_walker_on_a_btrfs_file_system() {
     }
     assert!(outcome.is_clean(), "{text}");
     assert_eq!(report.diagnostics.total(), 0, "{:?}", report.diagnostics);
+    // The path the elevated helper takes: the same scan, pinned to the root
+    // that was judged, from a descriptor the caller still holds. It must give
+    // exactly the unpinned result.
+    let judged = std::sync::Arc::new(bs_scan::rawdir::open_root(&fs.mnt).unwrap());
+    let pin = bs_scan::RootPin::from_fd(std::sync::Arc::clone(&judged)).unwrap();
+    let pinned_scanner = Arc::new(BtrfsScanner::new(BtrfsOptions::default()));
+    let pinned = start(
+        pinned_scanner.clone(),
+        fs.mnt.clone(),
+        ScanOptions::default().pin_root(pin),
+    )
+    .wait();
+    assert!(pinned.stats.error.is_none(), "{:?}", pinned.stats.error);
+    let pinned_tree = tree_of(&pinned.snapshot);
+    let same = compare(&r, &pinned_tree, &[]);
+    assert!(
+        same.is_clean(),
+        "pinned differs from unpinned: {}",
+        same.render()
+    );
+    assert_eq!(
+        pinned.snapshot.root().unwrap().allocated(),
+        reader.snapshot.root().unwrap().allocated()
+    );
+    assert_eq!(
+        pinned.snapshot.root().unwrap().logical(),
+        reader.snapshot.root().unwrap().logical()
+    );
+    drop(judged);
     // The claim behind the "compressed extents" entry, and that it covers the
     // one compressible file of the fixture and nothing else.
     assert_eq!(nbytes, md.len(), "the kernel counts the file at its length");

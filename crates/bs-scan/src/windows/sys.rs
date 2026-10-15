@@ -16,7 +16,7 @@
 use crate::wininfo::{self, Layout};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
@@ -29,13 +29,13 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FIND_FIRST_EX_LARGE_FETCH,
-    FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdExtdDirectoryInfo,
-    FileIdExtdDirectoryRestartInfo, FindClose, FindExInfoBasic, FindExSearchNameMatch,
-    FindFirstFileExW, FindNextFileW, GetDiskFreeSpaceExW, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OPEN_EXISTING, SYNCHRONIZE,
-    WIN32_FIND_DATAW,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FIND_FIRST_EX_LARGE_FETCH, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
+    FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo, FindClose,
+    FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, GetDiskFreeSpaceExW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    OPEN_EXISTING, SYNCHRONIZE, WIN32_FIND_DATAW,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -242,6 +242,36 @@ pub(crate) fn handle_info(h: &OwnedHandle) -> io::Result<HandleInfo> {
         file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         last_write_ticks: (i64::from(ft.dwHighDateTime) << 32) | i64::from(ft.dwLowDateTime),
     })
+}
+
+/// The key that identifies the folder an open handle is: the volume serial
+/// number and the 128-bit file ID (`FILE_ID_INFO`). Asked the same way for the
+/// handle a caller judged and the one the walker opened, so the two can be
+/// compared. Fails on a volume that gives no 128-bit file ID.
+pub(crate) fn root_key_of_borrowed(h: BorrowedHandle<'_>) -> io::Result<crate::RootKey> {
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: the handle is open for the duration of the call; `info` is a
+    // writable `FILE_ID_INFO` and the size passed is its size.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            h.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            std::ptr::from_mut(&mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error());
+    }
+    Ok(crate::RootKey::Volume {
+        serial: info.VolumeSerialNumber,
+        file_id: u128::from_le_bytes(info.FileId.Identifier),
+    })
+}
+
+/// [`root_key_of_borrowed`] for an owned handle.
+pub(crate) fn root_key(h: &OwnedHandle) -> io::Result<crate::RootKey> {
+    root_key_of_borrowed(h.as_handle())
 }
 
 /// A buffer for directory records, aligned the way the system structures

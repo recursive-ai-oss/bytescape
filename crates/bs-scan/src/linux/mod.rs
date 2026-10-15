@@ -85,6 +85,28 @@ pub(crate) fn set_before_open_hook(hook: Option<OpenHook>) {
     *slot = hook;
 }
 
+type RootHook = crate::RootOpenHook;
+
+static ROOT_HOOK: std::sync::Mutex<Option<RootHook>> = std::sync::Mutex::new(None);
+
+/// Installs (or removes) the hook that runs between resolving the scan root
+/// and opening it. For tests only.
+pub(crate) fn set_before_root_open_hook(hook: Option<RootHook>) {
+    let mut slot = ROOT_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = hook;
+}
+
+fn run_before_root_open_hook(resolved: &Path) {
+    let slot = ROOT_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(hook) = slot.as_ref() {
+        hook(resolved);
+    }
+}
+
 fn run_before_open_hook(name_with_nul: &[u8]) {
     if !OPEN_HOOK_ON.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -132,6 +154,7 @@ fn scan_with_variant(
         // The root is the user's own choice, so links in it are resolved once
         // here. Nothing below it is ever followed.
         let canonical = std::fs::canonicalize(root).map_err(ScanError::Root)?;
+        run_before_root_open_hook(&canonical);
         let fd = sys::open_root(&canonical).map_err(|e| {
             if e.raw_os_error() == Some(libc::ENOTDIR) {
                 ScanError::NotADirectory(canonical.clone())
@@ -140,6 +163,9 @@ fn scan_with_variant(
             }
         })?;
         let st = sys::stat_fd(fd.as_fd()).map_err(ScanError::Root)?;
+        // The root the caller judged must be the one this very descriptor is
+        // on. Checked before anything is sent or read.
+        crate::check_root_pin(ctx.options().pinned_root.as_ref(), fd.as_fd())?;
         let boundary = ctx.options().boundary.including(Placement {
             mount_id: st.mnt_id,
             device: st.dev,

@@ -49,6 +49,13 @@ impl FileSource {
         let len = file.seek(SeekFrom::End(0))?;
         Ok(FileSource { file, len })
     }
+
+    /// The open file, for asking the system what it is (a block device and
+    /// which one) without opening the name a second time.
+    #[must_use]
+    pub fn file(&self) -> &File {
+        &self.file
+    }
 }
 
 impl ByteSource for FileSource {

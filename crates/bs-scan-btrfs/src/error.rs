@@ -29,6 +29,15 @@ pub enum BtrfsError {
     /// mount hides, as if it were the mount's contents, so there is no tree
     /// and the caller falls back to the walker.
     MountNotPlaced(&'static str),
+    /// The caller pinned the scan root to a mount and the directory that was
+    /// opened is on another one, or the system does not say which. Nothing was
+    /// read.
+    RootMoved {
+        /// The root the caller judged.
+        pinned: bs_scan::RootKey,
+        /// The mount the opened directory is on, if the system says.
+        found: Option<bs_scan::RootKey>,
+    },
 }
 
 impl fmt::Display for BtrfsError {
@@ -40,6 +49,10 @@ impl fmt::Display for BtrfsError {
             BtrfsError::BadRoot(why) => write!(f, "unusable start directory: {why}"),
             BtrfsError::TooLarge(why) => write!(f, "file system too large to read: {why}"),
             BtrfsError::MountNotPlaced(why) => write!(f, "cannot place a mount: {why}"),
+            BtrfsError::RootMoved { pinned, found } => write!(
+                f,
+                "the scan root is not on the mount that was checked ({pinned}; found {found:?})"
+            ),
         }
     }
 }

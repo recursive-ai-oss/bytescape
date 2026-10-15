@@ -22,6 +22,15 @@ pub enum XfsError {
     BadRoot(&'static str),
     /// The file system would need more memory than the reader's limit.
     TooLarge(&'static str),
+    /// The caller pinned the scan root to a mount and the directory that was
+    /// opened is on another one, or the system does not say which. Nothing was
+    /// read.
+    RootMoved {
+        /// The root the caller judged.
+        pinned: bs_scan::RootKey,
+        /// The mount the opened directory is on, if the system says.
+        found: Option<bs_scan::RootKey>,
+    },
 }
 
 impl fmt::Display for XfsError {
@@ -32,6 +41,10 @@ impl fmt::Display for XfsError {
             XfsError::Hostile(why) => write!(f, "implausible bulk inode reply: {why}"),
             XfsError::BadRoot(why) => write!(f, "unusable start directory: {why}"),
             XfsError::TooLarge(why) => write!(f, "file system too large to read: {why}"),
+            XfsError::RootMoved { pinned, found } => write!(
+                f,
+                "the scan root is not on the mount that was checked ({pinned}; found {found:?})"
+            ),
         }
     }
 }
@@ -45,9 +58,38 @@ impl std::error::Error for XfsError {
     }
 }
 
+/// The error a directory source gives, through `io::Error`, when the root it
+/// opened is not on the pinned mount.
+#[derive(Debug)]
+pub(crate) struct RootMovedError {
+    pub pinned: bs_scan::RootKey,
+    pub found: Option<bs_scan::RootKey>,
+}
+
+impl fmt::Display for RootMovedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the scan root is not on the mount that was checked ({}; found {:?})",
+            self.pinned, self.found
+        )
+    }
+}
+
+impl std::error::Error for RootMovedError {}
+
 impl From<io::Error> for XfsError {
     fn from(e: io::Error) -> Self {
-        XfsError::Io(e)
+        match e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<RootMovedError>())
+        {
+            Some(moved) => XfsError::RootMoved {
+                pinned: moved.pinned,
+                found: moved.found,
+            },
+            None => XfsError::Io(e),
+        }
     }
 }
 

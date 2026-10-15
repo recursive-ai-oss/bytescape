@@ -38,6 +38,7 @@ mod boundary;
 mod classify;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod dirent;
+mod pin;
 mod pool;
 mod rescan;
 mod scanner;
@@ -58,6 +59,7 @@ pub use bs_knowledge::Environment;
 /// The category lookup the walker uses, and the path joining it expects, for
 /// other producers that must give the same entries the same categories.
 pub use classify::{Classifier, MAX_PATH_BYTES, join as join_path};
+pub use pin::{RootKey, RootPin, check_device_pin, check_root_pin, split_device};
 pub use rescan::{RescanRefused, node_path, start_rescan};
 pub use scanner::{
     ScanContext, ScanEnd, ScanError, ScanHandle, ScanOptions, ScanProgress, ScanResult, ScanStats,
@@ -121,6 +123,20 @@ pub fn set_before_open_hook(hook: Option<OpenHook>) {
     windows::set_before_open_hook(hook);
 }
 
+/// The hook type for [`set_before_root_open_hook`].
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub type RootOpenHook = Box<dyn Fn(&std::path::Path) + Send + Sync>;
+
+/// Calls `hook` with the resolved scan root just before the Linux walker opens
+/// it, so a test can change what the path leads to at that moment. For tests
+/// only; affects the whole process.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn set_before_root_open_hook(hook: Option<RootOpenHook>) {
+    linux::set_before_root_open_hook(hook);
+}
+
 /// Makes the Linux walker behave as on a kernel that does not report mount IDs
 /// (before 5.8), so the fallback to device numbers can be tested. Affects the
 /// whole process; for tests only.
@@ -129,6 +145,17 @@ pub fn set_before_open_hook(hook: Option<OpenHook>) {
 pub fn force_device_fallback(on: bool) {
     linux::sys::set_ignore_mount_ids(on);
 }
+
+/// Makes the root pin behave as on a kernel without the unique mount ID
+/// (before Linux 6.8): only the older, reusable ID is compared, which is safe
+/// only while the pin holds the judged mount. Affects the whole process; for
+/// tests only.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn force_legacy_mount_ids(on: bool) {
+    linux::sys::set_ignore_unique_mount_ids(on);
+}
+
 #[cfg(windows)]
 pub use windows::Walker;
 

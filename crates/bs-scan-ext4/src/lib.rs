@@ -393,6 +393,16 @@ fn rotational_in(sys_dev_block: &Path, major: u64, minor: u64) -> Option<bool> {
     None
 }
 
+/// Holds the device that was opened to the pinned root's file system.
+fn check_device_pin(pin: Option<&bs_scan::RootPin>, src: &FileSource) -> Result<(), ScanError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    if pin.is_none() {
+        return Ok(());
+    }
+    let meta = src.file().metadata().map_err(ScanError::Root)?;
+    bs_scan::check_device_pin(pin, meta.file_type().is_block_device(), meta.rdev())
+}
+
 impl Scanner for Ext4Scanner {
     fn name(&self) -> &'static str {
         "ext4-raw"
@@ -400,6 +410,11 @@ impl Scanner for Ext4Scanner {
 
     fn scan(&self, root: &Path, ctx: &ScanContext) -> Result<ScanEnd, ScanError> {
         let src = FileSource::open(&self.device).map_err(ScanError::Root)?;
+        // This reader opens a device, not a folder, so a pin on the judged
+        // root is held to the device: the one opened here must be the block
+        // device the judged mount's file system is on. Checked on the opened
+        // file, before a byte is read from it.
+        check_device_pin(ctx.options().pinned_root.as_ref(), &src)?;
         let mut options = self.options.clone();
         options.max_memory_bytes = memory_cap(options.max_memory_bytes);
         let threads = options

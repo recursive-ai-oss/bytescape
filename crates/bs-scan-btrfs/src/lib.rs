@@ -410,7 +410,8 @@ impl Scanner for BtrfsScanner {
 
     fn scan(&self, root: &Path, ctx: &ScanContext) -> Result<ScanEnd, ScanError> {
         let canonical = std::fs::canonicalize(root).map_err(ScanError::Root)?;
-        let (src, start) = IoctlSource::open(&canonical).map_err(into_scan_error)?;
+        let (src, start) = IoctlSource::open_pinned(&canonical, ctx.options().pinned_root.as_ref())
+            .map_err(into_scan_error)?;
         let mut options = self.options.clone();
         options.max_memory_bytes = memory_cap(options.max_memory_bytes);
         ctx.set_threads(1);
@@ -430,6 +431,7 @@ impl Scanner for BtrfsScanner {
 fn into_scan_error(e: BtrfsError) -> ScanError {
     match e {
         BtrfsError::Io(e) => ScanError::Root(e),
+        BtrfsError::RootMoved { pinned, found } => ScanError::RootMoved { pinned, found },
         other => ScanError::Root(io::Error::new(io::ErrorKind::InvalidData, other)),
     }
 }

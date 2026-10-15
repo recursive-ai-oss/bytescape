@@ -61,7 +61,7 @@ fi
 
 (cd "$repo" && cargo build --release --locked -p bs-scan-xfs -p bs-scan --examples >&2)
 target_dir="$(cd "$repo" && cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
-scan="$target_dir/release/examples/scan"
+scan="$target_dir/release/examples/scan_xfs"
 walk="$target_dir/release/examples/walk"
 for b in "$scan" "$walk"; do [ -x "$b" ] || { echo "not built: $b" >&2; exit 2; }; done
 
