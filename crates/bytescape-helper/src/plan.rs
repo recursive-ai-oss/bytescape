@@ -140,6 +140,12 @@ impl Scanner for Chosen {
             None => Walker.scan(root, ctx),
             Some(Ok(end)) => Ok(end),
             Some(Err(error)) => {
+                // The scan root is not the folder that was judged. The walker
+                // is held to the same pin and would refuse too, but a scan
+                // that found the ground moved is not retried by another reader.
+                if matches!(error, ScanError::RootMoved { .. }) {
+                    return Err(error);
+                }
                 // A raw reader only fails before it has sent anything. If
                 // something was sent the walker must not repeat it.
                 if ctx.progress().batches > 0 {
@@ -385,23 +391,24 @@ pub(crate) fn open_scan_root(root: &Path) -> Option<std::fs::File> {
         .ok()
 }
 
-/// The mount ID that `statx` reports for the folder `root`, if the kernel
-/// reports one (Linux 5.8 and later).
+/// The mount ID that `statx` reports for an open folder, if the kernel reports
+/// one (Linux 5.8 and later). Asked of the descriptor, never of a name.
 #[cfg(target_os = "linux")]
-pub(crate) fn mount_id_of(root: &Path) -> Option<u64> {
+pub(crate) fn mount_id_of_fd(folder: std::os::fd::BorrowedFd<'_>) -> Option<u64> {
     use std::os::fd::AsRawFd;
-    // The folder is held open while it is asked about.
-    let folder = open_scan_root(root)?;
     bs_fsops::remove::fstat(folder.as_raw_fd()).ok()?.mnt
 }
 
-/// The plan for a scan on this computer.
+/// The plan for a scan on this computer. `root_mount_id` is the mount ID of
+/// the judged root, taken from the descriptor the helper holds for it: the
+/// plan does not open the root again.
 #[cfg(target_os = "linux")]
 pub(crate) fn plan_for(
     requested: Backend,
     root: &Path,
     host: &crate::scan::Host,
     requested_mounts: &[u64],
+    root_mount_id: Option<u64>,
 ) -> Plan {
     let mounts = std::fs::read(&host.mountinfo)
         .map(|text| crate::mounts::parse(&text))
@@ -412,7 +419,7 @@ pub(crate) fn plan_for(
         &mounts,
         &is_block_device_under_dev,
         requested_mounts,
-        mount_id_of(root),
+        root_mount_id,
     )
 }
 
@@ -496,6 +503,7 @@ pub(crate) fn plan_for(
     root: &Path,
     _host: &crate::scan::Host,
     _requested_mounts: &[u64],
+    _root_mount_id: Option<u64>,
 ) -> Plan {
     let drives = crate::windows::fixed_ntfs_drives();
     choose_windows(
@@ -512,6 +520,7 @@ pub(crate) fn plan_for(
     _root: &Path,
     _host: &crate::scan::Host,
     _requested_mounts: &[u64],
+    _root_mount_id: Option<u64>,
 ) -> Plan {
     Plan::walker(match requested {
         Backend::Auto | Backend::Walker => Fallback::None,
@@ -757,6 +766,36 @@ mod tests {
         assert!(end.is_err(), "the error reaches the caller");
         // What ran is still the reader: the walker did not start over.
         assert_eq!(chosen.outcome(), (Backend::Ntfs, Fallback::None));
+    }
+
+    #[test]
+    fn a_root_that_moved_is_not_handed_to_another_reader() {
+        let fx = folder_with_files();
+        // Whichever reader found the root moved, the walker does not take over:
+        // the scan ends with the error, nothing is read, and what ran is still
+        // the reader that refused.
+        for backend in [Backend::Ntfs, Backend::Btrfs, Backend::Xfs, Backend::Ext4] {
+            let (chosen, mut tree, end) = run_chosen(
+                stub_plan(
+                    backend,
+                    || ScanError::RootMoved {
+                        pinned: bs_scan::RootKey::Mount {
+                            id: 7,
+                            unique: true,
+                        },
+                        found: None,
+                    },
+                    false,
+                ),
+                &fx.p("tree"),
+            );
+            assert!(
+                matches!(end, Err(ScanError::RootMoved { .. })),
+                "{backend:?}: {end:?}"
+            );
+            assert_eq!(files_below_root(&mut tree), 0, "{backend:?}");
+            assert_eq!(chosen.outcome(), (backend, Fallback::None), "{backend:?}");
+        }
     }
 
     #[test]

@@ -184,6 +184,11 @@ pub enum ErrorCode {
     /// what a server hands to an administrator account is not the server's
     /// to decide. Nothing was read or deleted.
     RemoteVolume,
+    /// The folder to scan was not the folder the helper had checked when it
+    /// came to read it: it was replaced, or its volume was changed, in
+    /// between. Nothing was read and nothing was sent; asking again judges
+    /// the folder afresh. No other way of reading it is tried.
+    RootMoved,
 }
 
 impl ErrorCode {
@@ -196,6 +201,7 @@ impl ErrorCode {
             ErrorCode::Internal => 5,
             ErrorCode::NoAccount => 6,
             ErrorCode::RemoteVolume => 7,
+            ErrorCode::RootMoved => 8,
         }
     }
 
@@ -208,6 +214,7 @@ impl ErrorCode {
             5 => ErrorCode::Internal,
             6 => ErrorCode::NoAccount,
             7 => ErrorCode::RemoteVolume,
+            8 => ErrorCode::RootMoved,
             _ => return None,
         })
     }

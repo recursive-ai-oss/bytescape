@@ -148,44 +148,140 @@ pub fn linux_verdict(
     }
 }
 
-/// The verdict for the folder `root` of a scan, on this computer.
+/// A scan root the helper has judged to be on a disk of this computer, and
+/// what holds the scan to that very folder.
+pub(crate) struct Judged {
+    /// The judged folder, held open. Every reader checks the root it opened
+    /// against it before it reads or sends anything, so a scan can only run
+    /// on what was judged. It must live until the scan has ended.
+    pub pin: bs_scan::RootPin,
+    /// The mount the judged folder is on, as the kernel numbers it (Linux
+    /// 5.8 and later), taken from the held descriptor. It places the scan in
+    /// the mount table.
+    pub mount_id: Option<u64>,
+    /// Bytes the operating system reports in use on the judged folder's
+    /// volume, for the scan's progress. On Linux it is asked of the held
+    /// descriptor.
+    pub os_used: Option<u64>,
+}
+
+/// Why a scan root was not judged fit for an administrator scan.
+#[derive(Debug)]
+pub(crate) enum NotJudged {
+    /// The volume is on another computer.
+    Remote,
+    /// The helper cannot tell what the volume is, or cannot open the folder
+    /// as a folder.
+    Unknown,
+    /// The volume is local, but the scan cannot be held to the folder that
+    /// was judged. `Unsupported` means this system gives no way to hold it
+    /// (Linux before 5.8); any other error is the system's own refusal.
+    CannotPin(std::io::Error),
+}
+
+/// Judges the folder `root` of a scan, on this computer, and makes the pin
+/// that holds the scan to it.
 ///
-/// The folder is opened once, as a folder and without following a link, and
-/// both the mount and the file system number are asked of that descriptor. The
-/// root's name is attacker-reachable (a folder above it can be swapped after
-/// the caller looked), so it is never opened a second time, and a name that
-/// has become a pipe or a device is never opened at all.
+/// The folder is opened once, as a folder and without following a link. The
+/// verdict (the mount, and the kernel's file system number) is taken from that
+/// descriptor, and the pin is made from the same descriptor. The root's name
+/// is attacker-reachable (a folder above it can be swapped after the caller
+/// looked), so it is never opened a second time for the verdict, the plan or
+/// the pin, and a name that has become a pipe or a device is never opened at
+/// all.
 #[cfg(target_os = "linux")]
-pub(crate) fn of_scan_root(root: &std::path::Path, host: &crate::scan::Host) -> Verdict {
-    use std::os::fd::AsRawFd;
+pub(crate) fn judge_scan_root(
+    root: &std::path::Path,
+    host: &crate::scan::Host,
+) -> Result<Judged, NotJudged> {
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
-    let Ok(text) = std::fs::read(&host.mountinfo) else {
-        return Verdict::Unknown;
-    };
-    let Some(folder) = crate::plan::open_scan_root(root) else {
-        return Verdict::Unknown;
-    };
-    let fd = folder.as_raw_fd();
+    let folder = crate::plan::open_scan_root(root).ok_or(NotJudged::Unknown)?;
+    let held: OwnedFd = folder.into();
+    // The table is read after the folder is open: the open folder keeps its
+    // mount ID from being given to another mount, so the table that is read
+    // next cannot list a different mount under that number.
+    let text = std::fs::read(&host.mountinfo).map_err(|_| NotJudged::Unknown)?;
+    let mount_id = crate::plan::mount_id_of_fd(held.as_fd());
+    let os_used = bs_fsops::remove::fstatvfs_used(held.as_raw_fd()).ok();
     let mounts = crate::mounts::parse(&text);
-    linux_verdict(
+    match linux_verdict(
         &mounts,
-        bs_fsops::remove::fstat(fd).ok().and_then(|meta| meta.mnt),
+        mount_id,
         root.as_os_str().as_bytes(),
-        bs_fsops::remove::fstatfs_type(fd).ok(),
-    )
+        bs_fsops::remove::fstatfs_type(held.as_raw_fd()).ok(),
+    ) {
+        Verdict::Local => {}
+        Verdict::Remote => return Err(NotJudged::Remote),
+        Verdict::Unknown => return Err(NotJudged::Unknown),
+    }
+    let pin = bs_scan::RootPin::from_fd(std::sync::Arc::new(held)).map_err(NotJudged::CannotPin)?;
+    Ok(Judged {
+        pin,
+        mount_id,
+        os_used,
+    })
 }
 
-/// The verdict for the folder `root` of a scan, on this computer.
+/// Judges the folder `root` of a scan, on this computer, and makes the pin
+/// that holds the scan to it.
+///
+/// The folder is opened once for its attributes, as itself (a link or
+/// junction is not followed), and both the verdict and the pin come from that
+/// handle: the verdict from the place the handle really is, the pin from the
+/// handle's volume serial number and file ID.
 #[cfg(windows)]
-pub(crate) fn of_scan_root(root: &std::path::Path, _host: &crate::scan::Host) -> Verdict {
-    SystemDrives::verdict(root)
+pub(crate) fn judge_scan_root(
+    root: &std::path::Path,
+    _host: &crate::scan::Host,
+) -> Result<Judged, NotJudged> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::{AsRawHandle, OwnedHandle};
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const SHARE_ALL: u32 = 7;
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(SHARE_ALL)
+        .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT)
+        .open(root)
+        .map_err(|_| NotJudged::Unknown)?;
+    let meta = file.metadata().map_err(|_| NotJudged::Unknown)?;
+    // The root was resolved to its real place before it got here; a folder
+    // that is a link now has been swapped in, and is not scanned.
+    if !meta.is_dir() || meta.file_attributes() & ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(NotJudged::Unknown);
+    }
+    // Where this handle really is: a share is remote whatever its name looks
+    // like. The wrapper only borrows the handle; the file closes it.
+    let borrowed = std::mem::ManuallyDrop::new(bs_fsops::win::Handle(file.as_raw_handle()));
+    let placed = bs_fsops::win::final_path(&borrowed).map_err(|_| NotJudged::Unknown)?;
+    match SystemDrives::verdict(std::path::Path::new(&placed)) {
+        Verdict::Local => {}
+        Verdict::Remote => return Err(NotJudged::Remote),
+        Verdict::Unknown => return Err(NotJudged::Unknown),
+    }
+    let pin = bs_scan::RootPin::from_handle(std::sync::Arc::new(OwnedHandle::from(file)))
+        .map_err(NotJudged::CannotPin)?;
+    // A figure for the progress of the scan, not a decision.
+    let os_used = bs_scan::VolumeInfo::used_bytes(&bs_scan::StatvfsVolume, root).ok();
+    Ok(Judged {
+        pin,
+        mount_id: None,
+        os_used,
+    })
 }
 
-/// The verdict for the folder `root` of a scan, on a system the helper does
-/// not support.
+/// Judges the folder `root` of a scan, on a system the helper does not
+/// support.
 #[cfg(not(any(target_os = "linux", windows)))]
-pub(crate) fn of_scan_root(_root: &std::path::Path, _host: &crate::scan::Host) -> Verdict {
-    Verdict::Unknown
+pub(crate) fn judge_scan_root(
+    _root: &std::path::Path,
+    _host: &crate::scan::Host,
+) -> Result<Judged, NotJudged> {
+    Err(NotJudged::Unknown)
 }
 
 /// The verdict for a place a delete is about to act in, on this computer.
@@ -579,11 +675,17 @@ mod tests {
             let host = crate::scan::Host::system();
             // Whatever this machine's temporary folder is on, it is not remote
             // (the tests refuse to run in a network home).
-            assert_ne!(of_scan_root(&dir, &host), Verdict::Remote);
+            assert!(!matches!(
+                judge_scan_root(&dir, &host),
+                Err(NotJudged::Remote)
+            ));
             let missing = crate::scan::Host {
                 mountinfo: "/nonexistent/mountinfo".into(),
             };
-            assert_eq!(of_scan_root(&dir, &missing), Verdict::Unknown);
+            assert!(matches!(
+                judge_scan_root(&dir, &missing),
+                Err(NotJudged::Unknown)
+            ));
         }
 
         /// A scratch folder made by one test, removed when it is dropped. Only
@@ -680,7 +782,10 @@ mod tests {
             // SAFETY: a NUL-terminated path that outlives the call.
             assert_eq!(unsafe { libc::mkfifo(c_path(&fifo).as_ptr(), 0o600) }, 0);
             let watcher = PipeWatcher::start(&fifo);
-            assert_eq!(of_scan_root(&fifo, &host), Verdict::Unknown);
+            assert!(matches!(
+                judge_scan_root(&fifo, &host),
+                Err(NotJudged::Unknown)
+            ));
             assert!(
                 !watcher.was_opened(),
                 "the check opened a named pipe that was named as the root"
@@ -690,16 +795,64 @@ mod tests {
             // either: both are refused as unplaceable.
             let file = scratch.0.join("file");
             std::fs::write(&file, b"x").unwrap();
-            assert_eq!(of_scan_root(&file, &host), Verdict::Unknown);
+            assert!(matches!(
+                judge_scan_root(&file, &host),
+                Err(NotJudged::Unknown)
+            ));
             std::fs::create_dir(scratch.0.join("real")).unwrap();
             std::os::unix::fs::symlink(scratch.0.join("real"), scratch.0.join("link")).unwrap();
-            assert_eq!(
-                of_scan_root(&scratch.0.join("link"), &host),
-                Verdict::Unknown
-            );
-            assert_ne!(
-                of_scan_root(&scratch.0.join("real"), &host),
-                Verdict::Unknown
+            assert!(matches!(
+                judge_scan_root(&scratch.0.join("link"), &host),
+                Err(NotJudged::Unknown)
+            ));
+            assert!(!matches!(
+                judge_scan_root(&scratch.0.join("real"), &host),
+                Err(NotJudged::Unknown)
+            ));
+        }
+
+        /// The mount table is read after the root is open, so the open folder
+        /// keeps its mount ID from being given to another mount before the
+        /// table that is matched against it is read. The table here is a named
+        /// pipe, so the read stays pending while the test looks at the
+        /// helper's open files.
+        #[test]
+        fn the_mount_table_is_read_after_the_root_is_open() {
+            let scratch = Scratch::new("table-after-open");
+            let root = scratch.0.join("root");
+            std::fs::create_dir(&root).unwrap();
+            let table = scratch.0.join("mountinfo");
+            // SAFETY: a NUL-terminated path that outlives the call.
+            assert_eq!(unsafe { libc::mkfifo(c_path(&table).as_ptr(), 0o600) }, 0);
+            let judge = {
+                let (root, table) = (root.clone(), table.clone());
+                std::thread::spawn(move || {
+                    let host = crate::scan::Host { mountinfo: table };
+                    // Whatever the verdict, only the order is looked at.
+                    let _ = judge_scan_root(&root, &host);
+                })
+            };
+            let is_open = || {
+                std::fs::read_dir("/proc/self/fd")
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| std::fs::read_link(entry.path()).is_ok_and(|to| to == root))
+            };
+            let started = std::time::Instant::now();
+            let mut open_while_reading = false;
+            while started.elapsed() < std::time::Duration::from_secs(3) {
+                if is_open() {
+                    open_while_reading = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Let the read finish, whatever was seen, so the thread ends.
+            std::fs::write(&table, std::fs::read("/proc/self/mountinfo").unwrap()).unwrap();
+            judge.join().unwrap();
+            assert!(
+                open_while_reading,
+                "the mount table was read before the root was open"
             );
         }
 
@@ -756,7 +909,7 @@ mod tests {
                     continue;
                 }
                 checked += 1;
-                let _ = of_scan_root(&real, &host);
+                let _ = judge_scan_root(&real, &host);
             }
             stop.store(true, Ordering::SeqCst);
             racer.join().unwrap();

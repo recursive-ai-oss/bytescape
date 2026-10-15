@@ -12,7 +12,6 @@ use crate::session::{Event, Exit, Out};
 use bs_ipc::{ErrorCode, Message, Progress, ScanDone, ScanEnd, ScanRequest, path_from_wire};
 use bs_scan::{
     Boundary, ScanContext, ScanEnd as EngineEnd, ScanError, ScanOptions, ScanProgress, Scanner,
-    StatvfsVolume, VolumeInfo,
 };
 use bs_tree::{Batch, NodeKind, Record};
 use std::io::Write;
@@ -53,7 +52,15 @@ pub fn plan_summary(
     host: &Host,
     requested_mounts: &[u64],
 ) -> (bs_ipc::Backend, bs_ipc::Fallback, Vec<u64>) {
-    let plan = plan_for(requested, root, host, requested_mounts);
+    // The root is opened once and asked about through that descriptor.
+    #[cfg(target_os = "linux")]
+    let root_mount_id = crate::plan::open_scan_root(root).and_then(|folder| {
+        use std::os::fd::AsFd;
+        crate::plan::mount_id_of_fd(folder.as_fd())
+    });
+    #[cfg(not(target_os = "linux"))]
+    let root_mount_id = None;
+    let plan = plan_for(requested, root, host, requested_mounts, root_mount_id);
     (plan.backend, plan.fallback, plan.mount_ids)
 }
 
@@ -143,6 +150,60 @@ fn scan_root(wire: &[u8]) -> Result<PathBuf, &'static str> {
     Ok(real)
 }
 
+/// Judges the scan root and makes everything the scan runs on from that one
+/// judgement: the plan, and the options that hold the scan to the judged
+/// folder.
+///
+/// Only disks of this computer are read with administrator rights. The folder
+/// is judged once, and the same open folder holds the scan to what was
+/// judged: a name swapped after the check leads nowhere. The pin is part of
+/// the returned options, so it lives as long as the scan that uses them.
+pub(crate) fn prepare(
+    root: &std::path::Path,
+    backend: bs_ipc::Backend,
+    extra_mount_ids: &[u64],
+    places: &[(&'static str, std::ffi::OsString)],
+    host: &Host,
+) -> Result<(crate::plan::Plan, ScanOptions), crate::volume::NotJudged> {
+    let judged = crate::volume::judge_scan_root(root, host)?;
+    let plan = plan_for(backend, root, host, extra_mount_ids, judged.mount_id);
+    // Only mounts of the drive's own filesystem are entered, and the user's
+    // places come from the request alone.
+    let options = ScanOptions {
+        boundary: Boundary::with_mount_ids(plan.mount_ids.iter().copied()),
+        os_used_bytes: judged.os_used,
+        ..ScanOptions::default()
+    }
+    // Held in the options, and so until the scan has ended: the readers check
+    // their root against it more than once.
+    .pin_root(judged.pin)
+    .with_environment(crate::places::environment(places));
+    Ok((plan, options))
+}
+
+/// What the interface is told when the root was not judged fit.
+fn words_for_refusal(refused: &crate::volume::NotJudged) -> (ErrorCode, &'static str) {
+    use crate::volume::NotJudged;
+    match refused {
+        NotJudged::Remote => (
+            ErrorCode::RemoteVolume,
+            "network volumes are not scanned with administrator rights",
+        ),
+        NotJudged::Unknown => (
+            ErrorCode::Refused,
+            "the helper cannot tell what kind of volume this is, so it does not scan it",
+        ),
+        NotJudged::CannotPin(error) if error.kind() == std::io::ErrorKind::Unsupported => (
+            ErrorCode::Unsupported,
+            "this system cannot hold an administrator scan to the folder that was checked, so nothing was scanned",
+        ),
+        NotJudged::CannotPin(_) => (
+            ErrorCode::Refused,
+            "the helper cannot hold the scan to the folder it checked, so nothing was scanned",
+        ),
+    }
+}
+
 /// Serves a scan request.
 pub(crate) fn serve<W: Write>(
     request: ScanRequest,
@@ -166,28 +227,20 @@ pub(crate) fn serve<W: Write>(
         Ok(root) => root,
         Err(why) => tell!(ErrorCode::BadRequest, why),
     };
-    // Only disks of this computer are read with administrator rights.
-    match crate::volume::of_scan_root(&root, host) {
-        crate::volume::Verdict::Local => {}
-        crate::volume::Verdict::Remote => tell!(
-            ErrorCode::RemoteVolume,
-            "network volumes are not scanned with administrator rights"
-        ),
-        crate::volume::Verdict::Unknown => tell!(
-            ErrorCode::Refused,
-            "the helper cannot tell what kind of volume this is, so it does not scan it"
-        ),
-    }
-    let plan = plan_for(request.backend, &root, host, &request.extra_mount_ids);
-    let os_used = StatvfsVolume.used_bytes(&root).ok();
-    // Only mounts of the drive's own filesystem are entered, and the user's
-    // places come from the request alone.
-    let options = ScanOptions {
-        boundary: Boundary::with_mount_ids(plan.mount_ids.iter().copied()),
-        os_used_bytes: os_used,
-        ..ScanOptions::default()
-    }
-    .with_environment(crate::places::environment(&places));
+    let (plan, options) = match prepare(
+        &root,
+        request.backend,
+        &request.extra_mount_ids,
+        &places,
+        host,
+    ) {
+        Ok(prepared) => prepared,
+        Err(refused) => {
+            let (code, why) = words_for_refusal(&refused);
+            tell!(code, why)
+        }
+    };
+    let os_used = options.os_used_bytes;
     let (ctx, batches) = ScanContext::channel(options, 64);
     let ctx = Arc::new(ctx);
     let chosen = Arc::new(Chosen::new(plan));
@@ -281,15 +334,29 @@ pub(crate) fn serve<W: Write>(
                 Err(exit) => exit,
             }
         }
-        Err(ScanError::Root(_) | ScanError::NotADirectory(_)) => {
-            tell!(ErrorCode::ScanFailed, "the volume cannot be read")
+        Err(error) => {
+            let (code, why) = words_for_scan_error(&error);
+            tell!(code, why)
         }
-        Err(ScanError::Unsupported) => {
-            tell!(ErrorCode::Unsupported, "scanning is not supported here")
+    }
+}
+
+/// What the interface is told when a scan ends in an error.
+fn words_for_scan_error(error: &ScanError) -> (ErrorCode, &'static str) {
+    match error {
+        ScanError::Root(_) | ScanError::NotADirectory(_) => {
+            (ErrorCode::ScanFailed, "the volume cannot be read")
         }
-        Err(_) => tell!(
+        ScanError::Unsupported => (ErrorCode::Unsupported, "scanning is not supported here"),
+        // No other reader is tried: the folder was judged, and what was found
+        // there is something else.
+        ScanError::RootMoved { .. } => (
+            ErrorCode::RootMoved,
+            "The folder changed while it was being checked, so nothing was scanned. Try again.",
+        ),
+        _ => (
             ErrorCode::ScanFailed,
-            "the scan stopped after an internal error"
+            "the scan stopped after an internal error",
         ),
     }
 }
@@ -305,6 +372,12 @@ fn send_batch<W: Write>(out: &mut Out<W>, batch: Batch) -> Result<(), Exit> {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+mod pin_namespace_tests;
+
+#[cfg(all(test, windows))]
+mod windows_pin_tests;
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     #![allow(
         clippy::unwrap_used,
@@ -318,6 +391,66 @@ mod tests {
     #![allow(clippy::disallowed_types, clippy::disallowed_methods)]
     use super::*;
     use bs_tree::{Category, DirKey, Meta, NodeFlags};
+
+    // ------------------------------------------------------------ Words
+
+    #[test]
+    fn a_root_that_moved_has_its_own_code_and_plain_words() {
+        let moved = ScanError::RootMoved {
+            pinned: bs_scan::RootKey::Mount {
+                id: 1,
+                unique: true,
+            },
+            found: None,
+        };
+        let (code, why) = words_for_scan_error(&moved);
+        assert_eq!(code, ErrorCode::RootMoved);
+        assert_eq!(
+            why,
+            "The folder changed while it was being checked, so nothing was scanned. Try again."
+        );
+        // The other failures keep their codes.
+        let unreadable = ScanError::Root(std::io::Error::other("x"));
+        assert_eq!(words_for_scan_error(&unreadable).0, ErrorCode::ScanFailed);
+        assert_eq!(
+            words_for_scan_error(&ScanError::Unsupported).0,
+            ErrorCode::Unsupported
+        );
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_pinned_is_refused_in_words() {
+        use crate::volume::NotJudged;
+        let old_kernel =
+            NotJudged::CannotPin(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        let (code, why) = words_for_refusal(&old_kernel);
+        assert_eq!(code, ErrorCode::Unsupported);
+        assert!(why.contains("nothing was scanned"), "{why}");
+        let other = NotJudged::CannotPin(std::io::Error::other("x"));
+        assert_eq!(words_for_refusal(&other).0, ErrorCode::Refused);
+        assert_eq!(
+            words_for_refusal(&NotJudged::Remote).0,
+            ErrorCode::RemoteVolume
+        );
+        assert_eq!(words_for_refusal(&NotJudged::Unknown).0, ErrorCode::Refused);
+    }
+
+    #[test]
+    fn a_judged_local_folder_carries_its_pin_and_the_figure_for_progress() {
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let host = Host::system();
+        match prepare(&dir, bs_ipc::Backend::Walker, &[], &[], &host) {
+            Ok((_, options)) => {
+                assert!(options.pinned_root.is_some());
+                assert!(options.os_used_bytes.is_some_and(|used| used > 0));
+            }
+            // A kernel before 5.8 cannot pin: the scan is refused, not run.
+            Err(crate::volume::NotJudged::CannotPin(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+            }
+            Err(other) => panic!("the temporary folder was not judged fit: {other:?}"),
+        }
+    }
 
     // -------------------------------------------------------- Splitting
 

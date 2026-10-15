@@ -809,6 +809,7 @@ fn every_fallback_and_error_code_round_trips_and_an_unknown_one_is_refused() {
         ErrorCode::Internal,
         ErrorCode::NoAccount,
         ErrorCode::RemoteVolume,
+        ErrorCode::RootMoved,
     ] {
         let error = Message::Error(ErrorReport {
             code,
@@ -825,6 +826,40 @@ fn every_fallback_and_error_code_round_trips_and_an_unknown_one_is_refused() {
             decode_body(&damaged, Direction::ToInterface),
             Err(DecodeError::BadValue)
         ));
+    }
+}
+
+#[test]
+fn a_scan_root_that_moved_has_its_own_error_code() {
+    let error = Message::Error(ErrorReport {
+        code: ErrorCode::RootMoved,
+        message: "The folder changed while it was being checked.".into(),
+    });
+    let bytes = frame(&error);
+    // Frame body: version, kind, then the code.
+    assert_eq!(bytes[4 + 2], 8, "the code of RootMoved");
+    assert_eq!(
+        decode_body(&bytes[4..], Direction::ToInterface).unwrap(),
+        error
+    );
+    // The code after it is not known yet, and ends decoding.
+    let mut damaged = bytes[4..].to_vec();
+    damaged[2] = 9;
+    assert!(matches!(
+        decode_body(&damaged, Direction::ToInterface),
+        Err(DecodeError::BadValue)
+    ));
+    // The codes before it keep their numbers.
+    for (code, number) in [
+        (ErrorCode::BadRequest, 1u8),
+        (ErrorCode::NoAccount, 6),
+        (ErrorCode::RemoteVolume, 7),
+    ] {
+        let bytes = frame(&Message::Error(ErrorReport {
+            code,
+            message: String::new(),
+        }));
+        assert_eq!(bytes[4 + 2], number, "{code:?}");
     }
 }
 

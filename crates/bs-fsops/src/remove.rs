@@ -249,6 +249,32 @@ pub fn fstatfs_type(fd: RawFd) -> io::Result<i64> {
     })
 }
 
+/// Bytes in use on the file system of an open folder or file: blocks minus free
+/// blocks (the part kept back for the superuser is not counted as used), asked
+/// of the descriptor itself so that no name is looked up again.
+pub fn fstatvfs_used(fd: RawFd) -> io::Result<u64> {
+    retry(|| {
+        let mut buf = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+        // SAFETY: `buf` is writable storage of the type `fstatvfs` fills in,
+        // and the caller's descriptor stays open for the call.
+        let status = unsafe { libc::fstatvfs(fd, buf.as_mut_ptr()) };
+        if status != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: zeroed above and, on success, filled in by the kernel.
+        let raw = unsafe { buf.assume_init() };
+        // The fields are 64 bits on the supported targets; `u64::from` keeps
+        // the product exact where they are narrower.
+        #[allow(clippy::useless_conversion)]
+        let (blocks, free, unit) = (
+            u64::from(raw.f_blocks),
+            u64::from(raw.f_bfree),
+            u64::from(raw.f_frsize),
+        );
+        Ok(blocks.saturating_sub(free).saturating_mul(unit))
+    })
+}
+
 /// The limits of one operation: the device and mount it started on. Anything
 /// on another device or another mount is left alone, because a bind mount
 /// shows other data under a name inside the folder being worked on.
@@ -453,5 +479,48 @@ pub fn delete_named(
     match tally.first_error.take() {
         None => Ok(removed),
         Some(error) => Err(DeleteError::Partial { removed, error }),
+    }
+}
+
+#[cfg(test)]
+mod used_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    // The `statvfs` fields are narrower on some targets; the sums are widened.
+    #![allow(clippy::useless_conversion)]
+    use crate::testutil::Fixture;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn the_bytes_in_use_are_asked_of_the_descriptor_and_not_of_a_name() {
+        use std::os::fd::AsRawFd;
+        let f = Fixture::new("target-used");
+        f.mkdir("a");
+        let folder = fs::File::open(f.path().join("a")).unwrap();
+        let used = crate::remove::fstatvfs_used(folder.as_raw_fd()).unwrap();
+        // Blocks minus free blocks, times the unit, as `statvfs` reports them.
+        let name = std::ffi::CString::new(f.path().join("a").to_str().unwrap()).unwrap();
+        let mut raw = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+        // SAFETY: `name` is NUL-terminated; `raw` is a writable `statvfs`.
+        assert_eq!(unsafe { libc::statvfs(name.as_ptr(), raw.as_mut_ptr()) }, 0);
+        // SAFETY: filled in by the successful call above.
+        let raw = unsafe { raw.assume_init() };
+        let total = u64::from(raw.f_blocks) * u64::from(raw.f_frsize);
+        assert!(used <= total, "{used} > {total}");
+        let by_name = u64::from(raw.f_blocks).saturating_sub(u64::from(raw.f_bfree))
+            * u64::from(raw.f_frsize);
+        // Other tests write meanwhile: the two figures agree to within a little.
+        assert!(used.abs_diff(by_name) < (1 << 30), "{used} vs {by_name}");
+        // A descriptor that is not open gives an error, not a figure.
+        assert!(crate::remove::fstatvfs_used(-1).is_err());
+        // The answer follows the descriptor when the name is swapped.
+        fs::rename(f.path().join("a"), f.path().join("moved")).unwrap();
+        symlink("/dev", f.path().join("a")).unwrap();
+        assert!(
+            crate::remove::fstatvfs_used(folder.as_raw_fd())
+                .unwrap()
+                .abs_diff(used)
+                < (1 << 30)
+        );
     }
 }
