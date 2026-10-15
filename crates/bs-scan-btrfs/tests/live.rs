@@ -219,19 +219,29 @@ fn the_reader_matches_the_walker_on_a_btrfs_file_system() {
     assert_eq!(nbytes, md.len(), "the kernel counts the file at its length");
     assert_eq!(nbytes, md.blocks() * 512);
     assert!(r["text.txt"].allocated < nbytes, "it is smaller on disk");
+    // The paths an exception covers, as a sorted set: the outcome lists them
+    // in the order the two trees were enumerated, which is the file
+    // system's and not the fixture's.
     let covered = |name: &str| -> Vec<&str> {
-        outcome
+        let mut paths: Vec<&str> = outcome
             .explained
             .iter()
             .filter(|(_, n)| *n == name)
             .map(|(f, _)| f.path.as_str())
-            .collect()
+            .collect();
+        paths.sort_unstable();
+        paths
     };
-    assert_eq!(covered("compressed extents"), vec!["text.txt"]);
+    let sorted = |paths: &[&'static str]| -> Vec<&'static str> {
+        let mut v = paths.to_vec();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(covered("compressed extents"), sorted(&["text.txt"]));
     // The folders the kernel makes up have no time on disk; they are the two
     // snapshots' copies of the entry for `sub1/inner`, and the report counts
     // them.
-    assert_eq!(covered("stand-in directory time"), STAND_INS);
+    assert_eq!(covered("stand-in directory time"), sorted(STAND_INS));
     assert_eq!(report.stand_in_dirs, 2);
     for p in STAND_INS {
         assert!(!r[*p].failed && !w[*p].failed, "{p}");
