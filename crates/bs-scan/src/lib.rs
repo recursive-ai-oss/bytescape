@@ -48,6 +48,9 @@ mod linux;
 mod windows;
 
 pub use boundary::{Boundary, Placement};
+/// The category lookup the walker uses, and the path joining it expects, for
+/// other producers that must give the same entries the same categories.
+pub use classify::{Classifier, MAX_PATH_BYTES, join as join_path};
 pub use scanner::{
     ScanContext, ScanEnd, ScanError, ScanHandle, ScanOptions, ScanProgress, ScanResult, ScanStats,
     Scanner, start,

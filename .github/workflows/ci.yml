@@ -105,6 +105,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends btrfs-progs
       - run: cargo test --locked --workspace
+      # The raw ext4 reader's image tests build ext4 images with mke2fs and
+      # compare them with the walker and with debugfs (both from e2fsprogs).
+      - name: Raw ext4 reader image tests (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        run: cargo test --locked -p bs-scan-ext4 --features image-tests --no-fail-fast
       # The tests that need a private namespace or root, run for real. The
       # script fails when any of them reports NOT RUN.
       - name: Namespace and root tests (Linux)
@@ -306,6 +311,20 @@ jobs:
             echo "::error title=Benchmark totals differ::A reference tool reported a different total from the walker, or the data changed during the runs. The timings are not a valid comparison; see summary.md in the uploaded results."
           fi
           exit "$status"
+      # The raw reader reads the root device directly, so the job fails here,
+      # loudly, when the root file system is not ext4.
+      - name: Run the raw ext4 reader benchmark
+        if: ${{ !cancelled() && steps.script.outputs.present == 'true' }}
+        run: |
+          fstype="$(findmnt -no FSTYPE /)"
+          echo "root file system: $fstype"
+          if [ "$fstype" != ext4 ]; then
+            echo "::error title=Root is not ext4::the raw reader benchmark needs an ext4 root file system, found $fstype"
+            exit 1
+          fi
+          device="/dev/block/$(awk '$5=="/" {print $3; exit}' /proc/self/mountinfo)"
+          BENCH_RESULTS="$BENCH_RESULTS/ext4" \
+            bash crates/bs-scan-ext4/bench/ext4-bench.sh --device "$device" --mount / --runs 10
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() && steps.script.outputs.present == 'true' }}
         with:

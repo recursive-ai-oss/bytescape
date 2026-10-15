@@ -9,5 +9,34 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[dependencies]
+bs-tree = { path = "../bs-tree" }
+bs-scan = { path = "../bs-scan" }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[features]
+# Tests that build ext4 images with `mke2fs` and compare the reader with the
+# walker and with `debugfs`. They need the e2fsprogs tools and fail loudly
+# without them.
+image-tests = []
+
+[[test]]
+name = "differential"
+required-features = ["image-tests"]
+
+[[test]]
+name = "hostile"
+required-features = ["image-tests"]
+
+[[test]]
+name = "problems"
+required-features = ["image-tests"]
+
+[[test]]
+name = "live"
+required-features = ["image-tests"]
+
 [lints]
 workspace = true

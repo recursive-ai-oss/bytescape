@@ -235,6 +235,11 @@ version = "0.1.0"
 [[package]]
 name = "bs-scan-ext4"
 version = "0.1.0"
+dependencies = [
+ "bs-scan",
+ "bs-tree",
+ "proptest",
+]
 
 [[package]]
 name = "bs-scan-ntfs"

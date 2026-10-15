@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Linux tests that need more than an ordinary user: two that run inside a
-# private user and mount namespace, and one that mounts real file systems as
-# root. A test that cannot do its job prints "NOT RUN" and still passes, so
-# this script fails when it sees that text. A skipped test is not a result.
+# private user and mount namespace, one that mounts real file systems as root,
+# and one that reads the machine's own root device as root. A test that
+# cannot do its job prints "NOT RUN" and still passes, so this script fails
+# when it sees that text. A skipped test is not a result.
 #
 #   BYTESCAPE_DISPOSABLE_HOST=1 packaging/ci/linux-privileged-tests.sh
 #
@@ -77,6 +78,27 @@ echo "== as root"
   fi
 ) 2>&1 | tee -a "$log"
 
+echo "== raw ext4 reader on this machine's own root file system"
+# Reads the root device as root and compares the raw reader with the walker.
+# On a root file system that is not ext4 the test prints NOT RUN, and the
+# check at the end fails the script: a skipped comparison is not a result.
+cargo test --locked -p bs-scan-ext4 --features image-tests --test live --no-run 2>&1 | tee "$build_log"
+live_test="$(sed 's/\x1b\[[0-9;]*m//g' "$build_log" |
+  sed -n 's|^ *Executable tests/live\.rs (\(.*\))$|\1|p')"
+if [ -z "$live_test" ] || [ ! -x "$live_test" ]; then
+  echo "could not find the built live test program" >&2
+  exit 1
+fi
+live_test="$(cd "$(dirname "$live_test")" && pwd)/$(basename "$live_test")"
+(
+  cd crates/bs-scan-ext4
+  if [ "$(id -u)" = 0 ]; then
+    BYTESCAPE_DISPOSABLE_HOST=1 "$live_test" --nocapture --test-threads=1
+  else
+    sudo -E env BYTESCAPE_DISPOSABLE_HOST=1 "$live_test" --nocapture --test-threads=1
+  fi
+) 2>&1 | tee -a "$log"
+
 fix_ownership
 if [ "$(id -u)" != 0 ] && [ -n "$(find "$target" -user root -print -quit)" ]; then
   echo "files owned by root are left in $target" >&2
@@ -89,8 +111,8 @@ if grep -q 'NOT RUN' "$log"; then
   exit 1
 fi
 # Every test program must have run at least one test.
-if [ "$(grep -c '^test result: ok\. [1-9][0-9]* passed' "$log")" -ne 3 ]; then
-  echo "expected three test programs that each passed at least one test" >&2
+if [ "$(grep -c '^test result: ok\. [1-9][0-9]* passed' "$log")" -ne 4 ]; then
+  echo "expected four test programs that each passed at least one test" >&2
   exit 1
 fi
 echo "all privileged and namespace tests ran"

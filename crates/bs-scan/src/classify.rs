@@ -16,7 +16,7 @@ use bs_knowledge::{Environment, Knowledge, classify_name};
 use bs_tree::{Category, NodeKind};
 
 /// The knowledge tables resolved for this process, built once per scan.
-pub(crate) struct Classifier {
+pub struct Classifier {
     knowledge: Knowledge,
 }
 
@@ -71,12 +71,12 @@ pub(crate) struct Here<'a> {
 /// place is the place of that prefix: places apply to everything below them,
 /// so only a folder that sits deeper than this in a path of very long names
 /// can be missed.
-pub(crate) const MAX_PATH_BYTES: usize = 4096;
+pub const MAX_PATH_BYTES: usize = 4096;
 
 /// The path of an entry inside a directory: `parent`, a separator unless it
 /// ends in one already (a drive root), and `name`. Once `parent` is
 /// [`MAX_PATH_BYTES`] long the result is `parent` itself.
-pub(crate) fn join(parent: &[u8], name: &[u8], separator: u8) -> Box<[u8]> {
+pub fn join(parent: &[u8], name: &[u8], separator: u8) -> Box<[u8]> {
     if parent.len() >= MAX_PATH_BYTES {
         return parent.into();
     }
