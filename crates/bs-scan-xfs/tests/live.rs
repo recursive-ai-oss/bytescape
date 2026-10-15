@@ -71,7 +71,12 @@ struct Fs {
 
 impl Fs {
     fn new(name: &str) -> Fs {
-        let dir = std::env::temp_dir().join(format!("bs-xfs-live-{}-{name}", std::process::id()));
+        // The tests of this file run side by side in one process: each gets a
+        // directory, image and mount of its own, named by test and by turn.
+        static TURN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let turn = TURN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("bs-xfs-live-{}-{turn}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mnt = dir.join("mnt");
         std::fs::create_dir_all(&mnt).unwrap();
@@ -91,13 +96,27 @@ impl Fs {
 
 impl Drop for Fs {
     fn drop(&mut self) {
-        let _ = Command::new("umount").arg(self.mnt.join("other")).status();
+        // Only the fixture with a nested file system has a mount to undo
+        // there.
+        let nested = self.mnt.join("other");
+        if nested.exists() {
+            let _ = Command::new("umount").arg(&nested).status();
+        }
         let _ = Command::new("umount").arg(&self.mnt).status();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
 /// Everything the reader describes that an XFS file system can hold.
+/// The modification time given to the folder that holds the nested file
+/// system, and to the nested file system's root, so that they agree. A
+/// mount point has two times: the walker asks the kernel about the name and
+/// is answered for the file system mounted there, while the reader reads the
+/// folder in this file system that the mount covers. Left to the clock they
+/// agree only when the two were written in the same second, which made the
+/// comparison depend on when the second ticked over.
+const MOUNT_POINT_TIME: u64 = 1_700_000_000;
+
 fn build_fixture(fs: &Fs) {
     let m = fs.mnt.display();
     let d = fs.dir.display();
@@ -121,11 +140,16 @@ mkfifo fifo
 printf x > "$(printf 'odd-\377-name\nwith-newline')"
 head -c 300000 /dev/urandom > deep/a/b/c/d/leaf.bin
 # Another file system mounted inside this one: not entered by either tool.
+# The covered folder is dated before the mount, the mounted root after the
+# last write into it, both to the same time.
+touch -d @{t} '{m}/other'
 truncate -s 300M '{d}/other.img'
 mkfs.xfs -q -f '{d}/other.img'
 mount -o loop '{d}/other.img' '{m}/other'
 head -c 100000 /dev/urandom > '{m}/other/not-ours.bin'
-"#
+touch -d @{t} '{m}/other'
+"#,
+        t = MOUNT_POINT_TIME
     ));
 }
 
@@ -173,6 +197,10 @@ fn the_reader_matches_the_walker_on_an_xfs_file_system() {
     // What the fixture is meant to show.
     assert!(w["other"].flags.contains(NodeFlags::NOT_FOLLOWED));
     assert!(r["other"].flags.contains(NodeFlags::NOT_FOLLOWED));
+    // Both tools describe the mount point with the time the fixture gave it,
+    // so the equal times above are by construction and not by the clock.
+    let given = MOUNT_POINT_TIME as i64;
+    assert_eq!((w["other"].mtime, r["other"].mtime), (given, given));
     assert!(!r.contains_key("other/not-ours.bin"));
     assert!(r.keys().filter(|k| k.starts_with("big-dir/")).count() == 3000);
     assert!(r["hard-readme"].flags.contains(NodeFlags::HARD_LINK));
