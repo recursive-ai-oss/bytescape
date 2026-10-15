@@ -11,7 +11,12 @@
 #
 # The only library the program links is the C library, and the display
 # libraries are loaded at run time from the system, so there is nothing to
-# bundle with linuxdeploy. Build on the oldest system you want to support: the
+# bundle with linuxdeploy. The host must have them: libx11-6, libx11-xcb1,
+# libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0 and
+# libwayland-client0 and a font such as fonts-dejavu-core (Debian and Ubuntu
+# names; every desktop installation has them, a minimal one may not), and
+# optionally libvulkan1 for GPU drawing.
+# docs/installing.md lists them for users. Build on the oldest system you want to support: the
 # release workflow uses Ubuntu 22.04.
 #
 # appimagetool is downloaded into the tools folder and checked against the

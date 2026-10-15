@@ -50,6 +50,18 @@ parts:
     build-attributes: [enable-patchelf]
     build-packages:
       - pkg-config
+    stage-packages:
+      # The display libraries the program opens by name when it starts.
+      - libx11-6
+      - libx11-xcb1
+      - libxcb1
+      - libxcursor1
+      - libxi6
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libwayland-client0
+      # The program has no text to draw without a font.
+      - fonts-dejavu-core
     build-environment:
       - SOURCE_DATE_EPOCH: "$(git -C $CRAFT_PART_SRC log -1 --format=%ct 2>/dev/null || echo 0)"
     override-build: |

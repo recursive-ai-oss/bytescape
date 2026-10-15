@@ -119,14 +119,20 @@ jobs:
       # tests need them, and a test that cannot run would pass quietly, so the
       # restriction is lifted on this throwaway runner. btrfs-progs is for the
       # test that builds a btrfs file system; e2fsprogs for the ext4 images the
-      # scanner and helper tests build; xfsprogs for the XFS reader tests.
+      # scanner and helper tests build; xfsprogs for the XFS reader tests. The
+      # window tests run the program under xvfb-run. The program loads its
+      # display libraries when it starts (X11, XCB, XInput, cursors, the
+      # keyboard library and its X11 part, Wayland), so a plain install of
+      # xvfb is not enough: without libxkbcommon-x11 it stops at once. The
+      # Vulkan loader and Mesa's software driver give the GPU picture tests a
+      # software adapter to run on.
       - name: Allow user namespaces, install file system tools
         if: runner.os == 'Linux'
         timeout-minutes: 5
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends btrfs-progs e2fsprogs xfsprogs
+          sudo apt-get install -y --no-install-recommends btrfs-progs e2fsprogs xfsprogs xvfb xauth libx11-6 libx11-xcb1 libxcb1 libxcursor1 libxi6 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libvulkan1 mesa-vulkan-drivers
       # The btrfs image tests make their file systems with `mkfs.btrfs --subvol`,
       # which Ubuntu 24.04's btrfs-progs (6.6) lacks. This builds a pinned,
       # checksummed upstream release (6.17.1: `--subvol` needs 6.12 and
@@ -391,7 +397,7 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends btrfs-progs e2fsprogs xfsprogs
+          sudo apt-get install -y --no-install-recommends btrfs-progs e2fsprogs xfsprogs xvfb xauth libx11-6 libx11-xcb1 libxcb1 libxcursor1 libxi6 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libvulkan1 mesa-vulkan-drivers
       - name: Clippy
         timeout-minutes: 20
         run: cargo clippy --locked --workspace --all-targets -- -D warnings

@@ -15,8 +15,8 @@ deb="${1:?usage: smoke-deb.sh PATH-TO-DEB}"
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -qq > /dev/null
-apt-get install -y -qq --no-install-recommends "$deb" lintian pkexec desktop-file-utils appstream libxml2-utils dbus > /dev/null 2>&1 \
-  || apt-get install -y -qq --no-install-recommends "$deb" lintian policykit-1 desktop-file-utils appstream libxml2-utils dbus
+apt-get install -y -qq --no-install-recommends "$deb" lintian pkexec desktop-file-utils appstream libxml2-utils dbus xvfb xauth > /dev/null 2>&1 \
+  || apt-get install -y -qq --no-install-recommends "$deb" lintian policykit-1 desktop-file-utils appstream libxml2-utils dbus xvfb xauth
 
 fail=0
 check() { if "$@"; then echo "ok: $*"; else echo "FAILED: $*" >&2; fail=1; fi; }
@@ -46,6 +46,19 @@ check test "$status" -ne 0
 check grep -q 'running with administrator rights, which it never does' <<< "$refusal"
 # Printing the version is harmless and still works as root.
 check /usr/bin/bytescape --version
+
+echo "== starts as an ordinary user with only the package's own dependencies"
+# xvfb and xauth are installed above, but not the display libraries or a
+# font: the package must have pulled those in itself (it is installed without its
+# recommended packages).
+useradd --create-home smoke
+# A folder with something in it to draw.
+mkdir -p /home/smoke/map
+cp -r /usr/share/polkit-1 /usr/share/applications /usr/share/doc /home/smoke/map/ 2> /dev/null || true
+chown -R smoke:smoke /home/smoke/map
+# The run is bounded: a program that does not exit must fail the check
+# quickly and say so, not use up the job.
+check timeout 120 setpriv --reuid=smoke --regid=smoke --init-groups env -u WAYLAND_DISPLAY HOME=/home/smoke xvfb-run -a /usr/bin/bytescape --bench-first-frame /home/smoke/map
 
 echo "== polkit"
 check xmllint --noout /usr/share/polkit-1/actions/org.recursiveai.bytescape.helper.policy

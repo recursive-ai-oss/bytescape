@@ -34,7 +34,7 @@ Windows ARM64 files are built on an x64 machine. They are marked as such in the 
 
 **The `.deb`.** `sudo apt install ./bytescape-<version>-linux-x64.deb`. It installs `/usr/bin/bytescape`, the helper at `/usr/libexec/bytescape/bytescape-helper`, a polkit policy, a menu entry, icons, and "Analyze with Bytescape" for Dolphin. For Nautilus, install `python3-nautilus` as well (the package suggests it). Full scans and deletes that need administrator rights ask for your password through `pkexec`: scans may keep the authorization for your session, deletes ask every time.
 
-**The AppImage.** It contains the interface only. An AppImage is mounted for your account alone, so a program started with administrator rights could not read it. If the `.deb` is installed too, the interface finds its helper at the path above.
+**The AppImage.** It contains the interface only. An AppImage is mounted for your account alone, so a program started with administrator rights could not read it. It uses the display libraries of your system and does not carry its own: a desktop installation has them, and on a minimal system install `libx11-6 libx11-xcb1 libxcb1 libxcursor1 libxi6 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0`, and a font such as `fonts-dejavu-core` (Debian and Ubuntu package names). `libvulkan1` is optional and turns on GPU drawing. If the `.deb` is installed too, the interface finds its helper at the path above.
 
 **The snap.** The strict edition reads your home folder, removable media and the mount table, and has no administrator access, so it has no "Full scan" button. A classic edition, with whole-disk reach and the helper, is planned once the snap store approves classic confinement.
 

@@ -50,10 +50,16 @@ what is there and leaves the decisions to you. It never connects to the
 internet. The elevated helper, started through pkexec only when you ask for
 a full scan or a delete that needs administrator rights, is installed in
 /usr/libexec/bytescape."""
-depends = "$auto"
-# The display and keyboard libraries are loaded when the program starts, so
-# the automatic list cannot see them; a desktop already has them.
-recommends = "pkexec | policykit-1, libx11-6, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, fonts-dejavu-core | fonts-noto-core"
+# The display and keyboard libraries are opened by name when the program
+# starts, so the automatic list cannot see them; they are named here. The
+# program stops at once without them, so they are required, not recommended.
+# The same goes for a font: it has no text to draw without one.
+# libxcb1 is also pulled in by libx11-6; it is named because the program opens
+# it directly.
+depends = "$auto, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, fonts-dejavu-core | fonts-noto-core"
+# Nice to have: the administrator prompt, and the Vulkan loader for GPU
+# drawing (software drawing is used without it).
+recommends = "pkexec | policykit-1, libvulkan1"
 suggests = "python3-nautilus"
 assets = [
     ["target/release/bytescape", "usr/bin/bytescape", "755"],

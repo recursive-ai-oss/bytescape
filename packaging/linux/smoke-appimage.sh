@@ -40,7 +40,7 @@ as_user bash -euo pipefail -c '
   test ! -e squashfs-root/usr/bin/bytescape-helper
   find squashfs-root -type f | sort | sed -n 1,40p
   mkdir -p /home/smoke/map && cp -r /repo/packaging /home/smoke/map/ 2> /dev/null || true
-  env -u WAYLAND_DISPLAY xvfb-run -a ./squashfs-root/AppRun --bench-first-frame /home/smoke/map
+  env -u WAYLAND_DISPLAY timeout 120 xvfb-run -a ./squashfs-root/AppRun --bench-first-frame /home/smoke/map
 '
 
 # As root it must refuse, say why, and exit with a failure.
