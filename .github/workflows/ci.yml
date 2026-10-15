@@ -736,7 +736,10 @@ jobs:
           CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
         run: |
-          cargo test --locked --release --no-fail-fast -p bs-scan-ntfs -- --nocapture --test-threads=1 2>&1 | tee ntfs-test.log
+          # The timing test is left out: it prints NOT RUN unless the timing
+          # variable is set, and it runs in the timed step below, where the
+          # variable is set.
+          cargo test --locked --release --no-fail-fast -p bs-scan-ntfs -- --nocapture --test-threads=1 --skip reader_against_walker 2>&1 | tee ntfs-test.log
           # A test that cannot do its job prints NOT RUN and still passes, and
           # a skipped test is not a result.
           if grep -q 'NOT RUN' ntfs-test.log; then
