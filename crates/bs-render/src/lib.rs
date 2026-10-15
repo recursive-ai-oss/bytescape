@@ -25,7 +25,7 @@ pub mod warm;
 pub mod zoom;
 
 pub use canvas::{Canvas, Hatch, HatchAngle, RecordingCanvas, Stroke, TextStyle};
-pub use card::{COPIED_TEXT, Card, CardPart, CardRole};
+pub use card::{COPIED_TEXT, Card, CardPart, CardRole, Popup};
 pub use chrome::{Chrome, Glyph, SegmentKind, TextRole, Widget};
 pub use geom::{Color, IRect, Rect};
 pub use renderer::{PaintTimings, Painted, Renderer, ZOOM_DURATION, ZoomDirection};

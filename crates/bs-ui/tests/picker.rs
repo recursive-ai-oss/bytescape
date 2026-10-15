@@ -373,7 +373,7 @@ fn hovering_a_block_describes_it_and_clicking_unreadable_asks_for_a_full_scan() 
     let fx = shell.update(InputEvent::Click { x, y }, t(2));
     assert!(
         !fx.iter()
-            .any(|e| matches!(e, ShellEffect::FullScan | ShellEffect::EmptyBin))
+            .any(|e| matches!(e, ShellEffect::FullScan | ShellEffect::Run(_)))
     );
     // Actions on a block are refused with a reason, never forwarded.
     let fx = shell.update(InputEvent::Key(Key::Delete), t(3));

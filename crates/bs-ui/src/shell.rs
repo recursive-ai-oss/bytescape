@@ -13,6 +13,12 @@ use bs_render::Item;
 
 #[path = "access.rs"]
 pub mod access;
+#[path = "actions.rs"]
+pub mod actions;
+
+pub use actions::{
+    ActOutcome, BinDrive, BinStyle, Capabilities, Disposer, Job, JobResult, Token, TreeChange,
+};
 
 use crate::action::{Action, reason};
 use crate::blocks::Special;
@@ -55,8 +61,14 @@ pub enum ShellEffect {
     /// The Unreadable block was clicked: scan again with the administrator
     /// helper.
     FullScan,
-    /// The Recycle Bin block was clicked.
-    EmptyBin,
+    /// Work for the disk. Run it off the UI thread and hand the result to
+    /// [`Shell::job_done`].
+    Run(Job),
+    /// Change delete marks in the size tree and lay the view out again with
+    /// the new marks: the boxes stay where they are.
+    Tree(Vec<TreeChange>),
+    /// What the bin holds changed: measure it again.
+    BinChanged,
 }
 
 /// What a running scan reads out in the progress overlay.
@@ -225,6 +237,9 @@ pub struct Shell<S: ViewSource> {
     readout: Option<ScanReadout>,
     stopped: bool,
     overlay_hot: Option<OverlayHit>,
+    acts: actions::ActionsUi,
+    /// Effects produced while time passed, for the host to collect.
+    pending_fx: Vec<ShellEffect>,
 }
 
 fn measure_for(text: &TextEngine, font_px: f32, scale: f32) -> Box<dyn TextMeasure> {
@@ -273,7 +288,15 @@ impl<S: ViewSource> Shell<S> {
             readout: None,
             stopped: false,
             overlay_hot: None,
+            acts: actions::ActionsUi::default(),
+            pending_fx: Vec::new(),
         }
+    }
+
+    /// Effects that came from time passing (a hold that completed), to be
+    /// carried out like the ones [`Shell::update`] returns.
+    pub fn take_effects(&mut self) -> Vec<ShellEffect> {
+        std::mem::take(&mut self.pending_fx)
     }
 
     /// Replaces how text is measured (tests use a fixed width).
@@ -341,6 +364,7 @@ impl<S: ViewSource> Shell<S> {
 
     /// Installs the map once the first data is there.
     pub fn set_app(&mut self, app: App<S>) {
+        self.new_scene();
         self.card = CardUi::default();
         self.picker = None;
         self.picker_hot = None;
@@ -350,6 +374,7 @@ impl<S: ViewSource> Shell<S> {
 
     /// Removes the map (a new scan is about to replace it).
     pub fn clear_app(&mut self) {
+        self.new_scene();
         self.card = CardUi::default();
         self.app = None;
         self.readout = None;
@@ -364,6 +389,7 @@ impl<S: ViewSource> Shell<S> {
 
     /// Shows the drive picker in place of a map.
     pub fn set_picker(&mut self, picker: Picker) {
+        self.new_scene();
         self.card = CardUi::default();
         self.app = None;
         self.picker = Some(picker);
@@ -601,6 +627,8 @@ impl<S: ViewSource> Shell<S> {
         self.hot = None;
         self.dim = None;
         self.card = CardUi::default();
+        self.close_menu_if_open();
+        self.rebuild_modal(now);
         let map = self.map_rect();
         self.map_event(InputEvent::Resized { map }, now)
     }
@@ -729,6 +757,7 @@ impl<S: ViewSource> Shell<S> {
             self.show_card(id, pointer);
         }
         self.sync_card();
+        self.note_selection();
         fx
     }
 
@@ -967,6 +996,7 @@ impl<S: ViewSource> Shell<S> {
         if self.esc_armed.is_some_and(|t| now >= t) {
             self.esc_armed = None;
         }
+        changed |= self.actions_tick(now);
         if self.card.shown.is_none()
             && let Some(r) = self.card.rest
             && now.saturating_sub(r.since) >= CARD_REST
@@ -995,6 +1025,9 @@ impl<S: ViewSource> Shell<S> {
         }
         if let Some((_, t)) = &self.notice {
             at(*t);
+        }
+        if let Some(d) = self.actions_deadline(now) {
+            at(now + d);
         }
         soonest
     }
@@ -1047,6 +1080,10 @@ impl<S: ViewSource> Shell<S> {
         items: Vec<u32>,
         now: Duration,
     ) -> Vec<ShellEffect> {
+        // Undo is about the last delete, not about what is selected now.
+        if action == Action::Undo {
+            return self.undo_last(now);
+        }
         if let Some(why) = self.refusal(action, view, &items) {
             self.say(format!("{}: {why}", action.label()), now);
             return Vec::new();
@@ -1078,10 +1115,11 @@ impl<S: ViewSource> Shell<S> {
                 }
                 return Vec::new();
             }
+            Action::Delete => return self.request_delete(false, view, items, now),
+            Action::DeletePermanently => return self.request_delete(true, view, items, now),
+            Action::Undo => return self.undo_last(now),
+            Action::ContextMenu => return self.open_menu_for_selection(now),
             _ => {}
-        }
-        if cfg!(debug_assertions) && !action.is_handled_here() {
-            self.say(format!("{}: not yet", action.label()), now);
         }
         vec![ShellEffect::Action {
             action,
@@ -1091,11 +1129,28 @@ impl<S: ViewSource> Shell<S> {
     }
 
     fn key(&mut self, key: Key, now: Duration) -> Vec<ShellEffect> {
+        if self.modal_open() {
+            return self.modal_input(InputEvent::Key(key), now);
+        }
         if self.picker.is_some() && self.app.is_none() {
             return match key {
                 Key::Escape => Vec::new(),
                 other => self.picker_key(other),
             };
+        }
+        // The toast's Undo button is the first stop of Tab; Enter or Space
+        // presses it, anything else lets go of it.
+        if matches!(key, Key::Tab | Key::BackTab) && self.toast_has_button() {
+            self.acts.toast_focus = !self.acts.toast_focus;
+            return Vec::new();
+        }
+        if self.acts.toast_focus {
+            self.acts.toast_focus = false;
+            match key {
+                Key::Enter | Key::Space => return self.undo_last(now),
+                Key::Escape => return Vec::new(),
+                _ => {}
+            }
         }
         if self.picker_return
             && matches!(key, Key::Backspace | Key::AltUp)
@@ -1149,8 +1204,26 @@ impl<S: ViewSource> Shell<S> {
     /// Handles one event in window coordinates.
     pub fn update(&mut self, event: InputEvent, now: Duration) -> Vec<ShellEffect> {
         self.clock = now;
+        if matches!(event, InputEvent::FocusLost) {
+            self.focus_lost();
+            return Vec::new();
+        }
         if let InputEvent::Key(key) = event {
             return self.key(key, now);
+        }
+        if self.modal_open() {
+            return self.modal_input(event, now);
+        }
+        if let Some(fx) = self.toast_input(event, now) {
+            return fx;
+        }
+        match event {
+            InputEvent::RightClick { x, y } => return self.right_click(x, y, now),
+            // Only dialogs use the button going down and coming up.
+            InputEvent::PointerDown { .. }
+            | InputEvent::PointerUp { .. }
+            | InputEvent::KeyReleased(_) => return Vec::new(),
+            _ => {}
         }
         let point = match event {
             InputEvent::PointerMoved { x, y }
@@ -1241,6 +1314,9 @@ impl<S: ViewSource> Shell<S> {
                 fx.extend(self.map_event(InputEvent::PointerLeft, now));
                 fx
             }
+            InputEvent::Click { x, .. } if hit == Some(Hit::Capacity) => {
+                self.capacity_click(x, now)
+            }
             InputEvent::Click { .. } | InputEvent::ClickWith { .. } => self.chrome_click(hit, now),
             _ => Vec::new(),
         }
@@ -1262,12 +1338,7 @@ impl<S: ViewSource> Shell<S> {
                 );
                 vec![ShellEffect::FullScan]
             }
-            Some(Special::RecycleBin) => {
-                if cfg!(debug_assertions) {
-                    self.say("Empty Recycle Bin: not yet", now);
-                }
-                vec![ShellEffect::EmptyBin]
-            }
+            Some(Special::RecycleBin) => self.request_empty(now),
             _ => Vec::new(),
         }
     }

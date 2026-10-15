@@ -437,7 +437,8 @@ fn finish<C: Canvas>(canvas: &mut C, item: &Item, r: Rect, pal: &Palette, st: &S
                 color: pal.deleted_hatch.with_opacity(0.8),
             },
         );
-        // The label stays fully readable on top of the veil and the hatch.
+        // The label stays fully readable on top of the veil and the hatch,
+        // and so does what was moved or deleted ("Moved to Trash · 12.3 GB").
         if st.labels
             && let Some(label) = &item.label
             && r.w >= 3.5 * st.em
@@ -449,10 +450,45 @@ fn finish<C: Canvas>(canvas: &mut C, item: &Item, r: Rect, pal: &Palette, st: &S
                 color: pal.text,
             };
             draw_name(canvas, &label.name, style, r, st);
+            draw_deleted_size(canvas, item, &label.size, style, r, st);
         }
     }
     if item.flags.contains(Flags::DIMMED) || st.dims(item) {
         canvas.fill_rect(r, pal.bg.with_opacity(0.75));
+    }
+}
+
+/// What a deleted box lost, in full strength: right-aligned in a folder's
+/// title bar, on a second line in a box tall enough to hold one.
+fn draw_deleted_size<C: Canvas>(
+    canvas: &mut C,
+    item: &Item,
+    size: &str,
+    style: TextStyle,
+    r: Rect,
+    st: &SceneStyle,
+) {
+    if size.is_empty() {
+        return;
+    }
+    let pad = st.pad();
+    if item.kind == ItemKind::FolderTitled {
+        let band = title_band(r, st);
+        let Some(w) = canvas.measure_text(size, style.size, st.scale) else {
+            return;
+        };
+        if w + st.em * 3.0 >= band.w - 2.0 * pad {
+            return;
+        }
+        let ty = band.y + ((band.h - st.em * 1.25) / 2.0).round().max(0.0);
+        canvas.push_clip(band);
+        canvas.draw_text(size, style, band.right() - pad - w, ty, w + 2.0);
+        canvas.pop_clip();
+    } else if r.h >= 3.4 * st.em && r.w >= 8.0 * st.em {
+        let ty = r.y + (st.em * 1.8).round();
+        canvas.push_clip(inset(r, 1.0));
+        canvas.draw_text(size, style, r.x + pad, ty, (r.w - 2.0 * pad).max(1.0));
+        canvas.pop_clip();
     }
 }
 
@@ -683,6 +719,37 @@ mod tests {
         assert_eq!(ua, HatchAngle::Rising);
         assert_eq!(da, HatchAngle::Falling);
         assert!(ds < us, "deleted hatch is denser");
+    }
+
+    #[test]
+    fn what_a_deleted_box_lost_stays_readable_over_the_veil() {
+        let pal = Palette::light();
+        let st = style(true);
+        for (kind, rect) in [
+            (ItemKind::FolderTitled, Rect::new(0.0, 0.0, 400.0, 120.0)),
+            (ItemKind::FileTile, Rect::new(0.0, 0.0, 400.0, 120.0)),
+        ] {
+            let mut it = item(kind, rect);
+            it.flags = Flags::DELETED;
+            it.label = Some(Box::new(ItemLabel {
+                name: "Videos".into(),
+                size: "Moved to Trash · 12.3 GB".into(),
+            }));
+            let mut c = RecordingCanvas::new(500, 200);
+            draw_items(&mut c, &[it], &pal, &st, None);
+            let drawn: Vec<_> = c
+                .ops
+                .iter()
+                .filter_map(|o| match o {
+                    Op::Text { text, style, .. } if text == "Moved to Trash · 12.3 GB" => {
+                        Some(style.color)
+                    }
+                    _ => None,
+                })
+                .collect();
+            // The last time it is drawn is on top of the veil, at full strength.
+            assert_eq!(drawn.last(), Some(&pal.text), "{kind:?}");
+        }
     }
 
     #[test]

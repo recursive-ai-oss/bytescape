@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use bs_layout::Metrics;
@@ -17,10 +17,11 @@ use bs_render::{
 };
 use bs_tree::Progress;
 use bs_tree::Snapshot;
+use bs_ui::action::Action;
 use bs_ui::blocks::DriveBlocks;
 use bs_ui::capacity::Breakdown;
 use bs_ui::picker::{CardScan, Picker, StartPlan, plan_start};
-use bs_ui::shell::{Look, ScanReadout, Shell, ShellEffect};
+use bs_ui::shell::{BinDrive, Capabilities, JobResult, Look, ScanReadout, Shell, ShellEffect};
 use bs_ui::tree::{TreeSource, scan_status};
 use bs_ui::{
     App, Direction, Effect, FinishedRelayout, InputEvent, Key, Modifiers, PendingRelayout, chrome,
@@ -34,12 +35,10 @@ use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 use crate::access::{self, Access, UserEvent};
 use crate::bench::{self, FrameSink, Offscreen, Script};
-use crate::clipboard;
-use crate::folder;
 use crate::live::{RateMeter, ScanDriver, Tick};
-use crate::open;
 use crate::shots;
 use crate::synth::{LayoutParams, SynthSource, format_size};
+use crate::system::{self, Choice, SystemDisposer};
 use crate::{Mode, ShotOptions, ZoomOptions, font_px, real};
 
 type Gfx = Presenter<Arc<Window>, Arc<Window>>;
@@ -551,7 +550,16 @@ struct Live {
     /// The scans running behind the picker, one per drive scanned from
     /// launch.
     pool: Vec<PoolScan>,
-    folder_rx: Option<Receiver<folder::Choice>>,
+    folder_rx: Option<Receiver<Choice>>,
+    /// The platform's delete service.
+    disposer: Arc<SystemDisposer>,
+    /// Disk work in flight (deleting, restoring, emptying a bin).
+    jobs: Vec<Receiver<JobResult>>,
+    /// Messages from worker threads for the info bar.
+    notices_tx: Sender<String>,
+    notices_rx: Receiver<String>,
+    /// Whether the file manager has a properties window, once asked.
+    caps_rx: Option<Receiver<bool>>,
     /// The bytes of the open drive's Recycle Bin, once measured.
     bin_rx: Option<Receiver<u64>>,
     /// The drive-level blocks changed and the top view must be laid out
@@ -768,23 +776,57 @@ fn apply_shell(live: &mut Live, fx: Vec<ShellEffect>, now: Duration) -> Vec<Shel
                 apply(&mut live.renderer, vec![e], now);
             }
             ShellEffect::Dim(category) => live.renderer.set_dim(category),
-            ShellEffect::OpenLink(url) => {
-                // Nothing to do if the system has no opener.
-                let _ = open::open_url(url);
-            }
-            ShellEffect::CopyText(text) => {
-                if let Err(message) = clipboard::copy_text(&text) {
-                    live.shell.notify(message, now);
-                }
-            }
+            ShellEffect::OpenLink(url) => system::open_url(url, live.notices_tx.clone()),
+            ShellEffect::CopyText(text) => system::copy_text(text, live.notices_tx.clone()),
             ShellEffect::CancelScan => {
                 if let Some(scan) = &live.scan {
                     scan.cancel();
                 }
             }
-            // Deleting, opening and the rest belong to layers that do not
-            // exist yet; the shell has already said so where it matters.
-            ShellEffect::Action { .. } | ShellEffect::FullScan | ShellEffect::EmptyBin => {}
+            ShellEffect::Run(job) => {
+                let (tx, rx) = mpsc::channel();
+                let spawned =
+                    std::thread::Builder::new()
+                        .name("disk-work".into())
+                        .spawn(move || {
+                            let _ = tx.send(job.run());
+                        });
+                match spawned {
+                    Ok(_) => live.jobs.push(rx),
+                    Err(_) => live
+                        .shell
+                        .notify("Couldn't start the work: no thread was available", now),
+                }
+            }
+            ShellEffect::Tree(changes) => apply_tree(live, &changes, now),
+            ShellEffect::BinChanged => remeasure_bin(live),
+            ShellEffect::Action {
+                action: Action::Rescan,
+                view,
+                items,
+            } => left.push(ShellEffect::Action {
+                action: Action::Rescan,
+                view,
+                items,
+            }),
+            ShellEffect::Action {
+                action,
+                view,
+                items,
+            } => {
+                let target = items.first().and_then(|&id| {
+                    live.shell
+                        .app()
+                        .and_then(|app| bs_ui::ViewSource::target(app.source(), view, id))
+                });
+                match target {
+                    Some(t) => {
+                        system::run_action(action, t.path, t.is_folder, live.notices_tx.clone())
+                    }
+                    None => live.shell.notify("That isn't a file or folder", now),
+                }
+            }
+            ShellEffect::FullScan => {}
             other @ (ShellEffect::PickDrive(_)
             | ShellEffect::ScanFolder
             | ShellEffect::ShowPicker
@@ -792,6 +834,55 @@ fn apply_shell(live: &mut Live, fx: Vec<ShellEffect>, now: Duration) -> Vec<Shel
         }
     }
     left
+}
+
+/// Puts delete marks on the finished tree and lays the view out again. The
+/// sizes do not change, so the boxes stay where they are.
+fn apply_tree(live: &mut Live, changes: &[bs_ui::shell::TreeChange], now: Duration) {
+    let Some(snapshot) = live.scan.as_mut().and_then(|s| s.apply_marks(changes)) else {
+        return;
+    };
+    live.snapshot = Some(Arc::clone(&snapshot));
+    if let Some(app) = live.shell.app_mut() {
+        app.source_mut().set_snapshot(snapshot);
+    }
+    // The next pump lays the current view out on a worker thread.
+    live.blocks_dirty = true;
+    update_capacity(live, now);
+}
+
+/// Measures the open drive's bin again after something moved in or out.
+fn remeasure_bin(live: &mut Live) {
+    let Some(root) = live.drive.as_ref().map(|d| d.root.clone()) else {
+        return;
+    };
+    let (tx, rx) = mpsc::channel();
+    live.bin_rx = Some(rx);
+    let _ = std::thread::Builder::new()
+        .name("bin".into())
+        .spawn(move || {
+            if let Ok(drive) = bs_platform::drives::volume_for_path(&root) {
+                let info = bs_platform::bins::measure(&drive, &BinControl::new());
+                let _ = tx.send(info.bytes_for_display());
+            }
+        });
+}
+
+/// Tells the shell which drive's bin "Empty" acts on.
+fn sync_bin_drive(live: &mut Live) {
+    let drive = live.drive.as_ref().map(|d| {
+        let text = d.root.to_string_lossy();
+        let label = if cfg!(windows) && text.len() >= 2 && text.as_bytes()[1] == b':' {
+            text[..2].to_string()
+        } else {
+            String::new()
+        };
+        BinDrive {
+            mount: d.root.clone(),
+            label,
+        }
+    });
+    live.shell.set_bin_drive(drive);
 }
 
 /// Lists the drives on a worker thread; the picker appears when the answer
@@ -820,7 +911,9 @@ pub(crate) fn refresh_shell_chrome(
 ) -> bool {
     let chrome = shell.chrome(now);
     let card = renderer.set_card(shell.card().cloned());
-    renderer.set_chrome(chrome) | card
+    let toast = renderer.set_toast(shell.toast_card(now));
+    let popup = renderer.set_popup(shell.popup());
+    renderer.set_chrome(chrome) | card | toast | popup
 }
 
 /// The look from the system, with `BYTESCAPE_THEME` as an override for
@@ -1067,12 +1160,12 @@ impl WinApp {
         {
             live.folder_rx = None;
             match choice {
-                folder::Choice::Folder(path) => {
+                Choice::Folder(path) => {
                     self.open_path(path, now);
                     return;
                 }
-                folder::Choice::Cancelled => {}
-                folder::Choice::Unavailable(text) => live.shell.notify(text, now),
+                Choice::Cancelled => {}
+                Choice::Unavailable(text) => live.shell.notify(text, now),
             }
         }
         let Some(live) = self.live.as_mut() else {
@@ -1114,6 +1207,7 @@ impl WinApp {
             drop(ps.driver.discard());
         }
         live.drive = None;
+        sync_bin_drive(live);
         live.drive_rx = None;
         live.bin_rx = None;
         live.relayout = None;
@@ -1246,6 +1340,7 @@ impl WinApp {
                 query_drive(live, root);
             }
         }
+        sync_bin_drive(live);
         let map = live.shell.map_rect();
         live.renderer
             .set_items(Arc::new(vec![scan_placeholder(map)]));
@@ -1263,6 +1358,21 @@ impl WinApp {
                 ShellEffect::PickDrive(i) => self.open_drive(i, true, now),
                 ShellEffect::ShowPicker => self.show_picker(now),
                 ShellEffect::Rescan => self.rescan(now),
+                ShellEffect::Action {
+                    action: Action::Rescan,
+                    view,
+                    items,
+                } => {
+                    let target = self.live.as_ref().and_then(|live| {
+                        let id = *items.first()?;
+                        bs_ui::ViewSource::target(live.shell.app()?.source(), view, id)
+                    });
+                    if let Some(t) = target {
+                        // The folder becomes the map: its contents are read
+                        // again from disk.
+                        self.open_path(t.path, now);
+                    }
+                }
                 ShellEffect::ScanFolder => {
                     let Some(live) = self.live.as_mut() else {
                         return;
@@ -1276,7 +1386,7 @@ impl WinApp {
                     let _ = std::thread::Builder::new()
                         .name("folder-dialog".into())
                         .spawn(move || {
-                            let _ = tx.send(folder::choose(&start));
+                            let _ = tx.send(system::choose_folder(Path::new(&start)));
                         });
                 }
                 _ => {}
@@ -1370,6 +1480,9 @@ impl WinApp {
         } else {
             renderer.set_items(Arc::new(placeholders(map, scale)));
         }
+        let (notices_tx, notices_rx) = mpsc::channel();
+        let disposer = SystemDisposer::new();
+        shell.set_disposer(disposer.clone());
         self.live = Some(Live {
             window: window.clone(),
             access,
@@ -1388,6 +1501,11 @@ impl WinApp {
             drives_rx: None,
             pool: Vec::new(),
             folder_rx: None,
+            disposer,
+            jobs: Vec::new(),
+            notices_tx,
+            notices_rx,
+            caps_rx: None,
             bin_rx: None,
             blocks_dirty: false,
             rate: RateMeter::default(),
@@ -1463,6 +1581,12 @@ impl WinApp {
             }
             // Everything below starts after the first frame is on screen, so
             // nothing it does can delay that frame.
+            if matches!(self.mode, Mode::Interactive { .. }) {
+                live.disposer.warm();
+                let (tx, rx) = mpsc::channel();
+                live.caps_rx = Some(rx);
+                system::probe_properties(tx);
+            }
             if let Some(path) = &self.scan_path {
                 live.scan = Some(ScanDriver::start(path.clone()));
                 live.scan_root = Some(path.clone());
@@ -1645,6 +1769,7 @@ impl WinApp {
         {
             live.drive_rx = None;
             live.drive = state;
+            sync_bin_drive(live);
             update_capacity(live, now);
             refresh_chrome(live, now);
             live.window.request_redraw();
@@ -1831,6 +1956,42 @@ impl WinApp {
             refresh_chrome(live, now);
             redraw = true;
         }
+        let timed = live.shell.take_effects();
+        if !timed.is_empty() {
+            apply_shell(live, timed, now);
+            refresh_chrome(live, now);
+            redraw = true;
+        }
+        // Disk work that finished.
+        let mut finished: Vec<JobResult> = Vec::new();
+        live.jobs.retain(|rx| match rx.try_recv() {
+            Ok(done) => {
+                finished.push(done);
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
+        });
+        for done in finished {
+            let fx = live.shell.job_done(done, now);
+            apply_shell(live, fx, now);
+            refresh_chrome(live, now);
+            redraw = true;
+        }
+        if !live.jobs.is_empty() {
+            soonest(Duration::from_millis(10));
+        }
+        while let Ok(text) = live.notices_rx.try_recv() {
+            live.shell.notify(text, now);
+            refresh_chrome(live, now);
+            redraw = true;
+        }
+        if let Some(rx) = live.caps_rx.as_ref()
+            && let Ok(properties) = rx.try_recv()
+        {
+            live.caps_rx = None;
+            live.shell.set_capabilities(Capabilities { properties });
+        }
         if let Some(d) = live.shell.next_deadline(now) {
             soonest(d.max(Duration::from_millis(1)));
         }
@@ -1977,6 +2138,9 @@ fn translate_key(key: &WKey, mods: ModifiersState) -> Option<Key> {
     let (alt, ctrl, shift) = (mods.alt_key(), mods.control_key(), mods.shift_key());
     Some(match key {
         WKey::Named(NamedKey::Enter) => Key::Enter,
+        WKey::Named(NamedKey::Space) => Key::Space,
+        WKey::Named(NamedKey::Tab) if shift => Key::BackTab,
+        WKey::Named(NamedKey::Tab) => Key::Tab,
         WKey::Named(NamedKey::Backspace) => Key::Backspace,
         WKey::Named(NamedKey::Home) => Key::Home,
         WKey::Named(NamedKey::Escape) => Key::Escape,
@@ -2048,6 +2212,11 @@ impl ApplicationHandler<UserEvent> for WinApp {
                     poll_appearance(live);
                 }
             }
+            WindowEvent::Focused(false) => {
+                // A confirmation being held must not go on counting while
+                // another window has the keyboard.
+                self.feed(InputEvent::FocusLost);
+            }
             WindowEvent::ThemeChanged(theme) => {
                 if theme_override().is_none()
                     && let Some(live) = self.live.as_mut()
@@ -2101,6 +2270,7 @@ impl ApplicationHandler<UserEvent> for WinApp {
                 let (x, y) = self.cursor;
                 match button {
                     MouseButton::Left => {
+                        self.feed(InputEvent::PointerDown { x, y });
                         let now = Instant::now();
                         let double = self.last_click.is_some_and(|(t, (lx, ly))| {
                             now.duration_since(t) < Duration::from_millis(400)
@@ -2120,14 +2290,30 @@ impl ApplicationHandler<UserEvent> for WinApp {
                             self.feed(InputEvent::Click { x, y });
                         }
                     }
+                    MouseButton::Right => self.feed(InputEvent::RightClick { x, y }),
                     MouseButton::Back => self.feed(InputEvent::Key(Key::AltLeft)),
                     MouseButton::Forward => self.feed(InputEvent::Key(Key::AltRight)),
                     _ => {}
                 }
             }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let (x, y) = self.cursor;
+                self.feed(InputEvent::PointerUp { x, y });
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let Some(key) = translate_key(&event.logical_key, self.modifiers) {
                     self.feed(InputEvent::Key(key));
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
+                if let Some(key @ (Key::Enter | Key::Space)) =
+                    translate_key(&event.logical_key, self.modifiers)
+                {
+                    self.feed(InputEvent::KeyReleased(key));
                 }
             }
             _ => {}

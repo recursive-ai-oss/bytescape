@@ -369,6 +369,13 @@ impl Geometry {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_link_target_is_the_project_site() {
+        assert_eq!(LINK_URL, "https://recursiveai.org/");
+        assert_eq!(LINK_TEXT, "Find more free software at RecursiveAI.org");
+        assert_eq!(LINK_TEXT_SHORT, "RecursiveAI.org");
+    }
+
     /// Every character is 0.56 em wide, so layouts are the same on every host.
     struct Fixed(f32);
 

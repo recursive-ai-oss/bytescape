@@ -175,6 +175,21 @@ impl TreeSource {
     }
 }
 
+/// The real path from the bytes the scan recorded. Where paths are text
+/// (Windows), a name that is not valid text gives no path, so nothing is ever
+/// acted on by a guess.
+fn path_from_bytes(raw: Vec<u8>) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(raw)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(raw).ok().map(std::path::PathBuf::from)
+    }
+}
+
 impl ViewSource for TreeSource {
     fn root(&self) -> ViewId {
         self.root
@@ -260,6 +275,24 @@ impl ViewSource for TreeSource {
         Some(bs_layout::display_name(&bytes).into_string())
     }
 
+    fn target(&self, view: ViewId, id: u32) -> Option<crate::Target> {
+        let laid = &self.laid.iter().find(|(v, _)| *v == view)?.1;
+        let ItemRef::Node(node_id) = laid.item_ref(id)? else {
+            return None;
+        };
+        let node = self.snapshot.node(node_id)?;
+        let raw = self.node_path(node_id)?;
+        Some(crate::Target {
+            path: path_from_bytes(raw)?,
+            node: Some(node_id),
+            name: bs_layout::display_name(node.name()).into_string(),
+            bytes: node.allocated(),
+            lower_bound: node.bytes_are_lower_bound(),
+            estimated: node.size_is_estimated(),
+            is_folder: node.kind() == NodeKind::Dir,
+        })
+    }
+
     fn card(&self, view: ViewId, id: u32) -> Option<CardData> {
         let laid = &self.laid.iter().find(|(v, _)| *v == view)?.1;
         let bytes = laid.item(id)?.bytes;
@@ -284,6 +317,7 @@ impl ViewSource for TreeSource {
                 estimated: false,
                 is_folder: false,
                 modified: None,
+                utc_offset: 0,
                 category: None,
                 note: None,
                 handoff: None,
@@ -314,6 +348,11 @@ impl ViewSource for TreeSource {
             estimated: node.size_is_estimated(),
             is_folder,
             modified: Some(node.mtime()).filter(|&t| t != 0),
+            utc_offset: if node.mtime() != 0 {
+                bs_platform::clock::local_utc_offset_seconds_at(node.mtime())
+            } else {
+                0
+            },
             category,
             note: entry.map(|e| e.note),
             handoff: entry.and_then(|e| e.handoff),

@@ -2,6 +2,7 @@
 //! text wraps, where the buttons sit, and where the card goes so that it
 //! never covers the box it describes.
 
+use bs_knowledge::Handoff;
 use bs_render::{Card, CardPart, CardRole, Rect};
 
 use crate::action::{Action, reason};
@@ -32,6 +33,9 @@ pub struct CardData {
     pub is_folder: bool,
     /// Seconds since 1970 (UTC), when known.
     pub modified: Option<i64>,
+    /// Seconds the user's clock is ahead of UTC at that moment, so the date
+    /// shown is the one on their calendar.
+    pub utc_offset: i32,
     /// The category's name.
     pub category: Option<&'static str>,
     /// What the place is and who manages it.
@@ -110,7 +114,8 @@ pub fn bin_name() -> &'static str {
     }
 }
 
-/// The date of `secs` since 1970 as `2024-03-05`, in UTC. `None` for times
+/// The date of `secs` since 1970 as `2024-03-05`, in UTC (add the zone's
+/// offset first for a local date). `None` for times
 /// that cannot be a real file date.
 pub fn format_date(secs: i64) -> Option<String> {
     // Between the years 1 and 9999.
@@ -186,6 +191,9 @@ pub fn why_not(data: &CardData, action: Action) -> Option<&'static str> {
                 gone
             }
         }
+        // Uninstall and the package lookup are not wired up yet; a button
+        // that could only fail says so instead.
+        Action::Handoff(Handoff::Uninstall | Handoff::Package) => Some(reason::NOT_YET),
         _ => gone,
     }
 }
@@ -351,7 +359,11 @@ pub fn build(
     if let Some(c) = data.category {
         facts.push(c.to_string());
     }
-    if let Some(d) = data.modified.and_then(format_date) {
+    if let Some(d) = data
+        .modified
+        .and_then(|m| m.checked_add(i64::from(data.utc_offset)))
+        .and_then(format_date)
+    {
         facts.push(format!("modified {d}"));
     }
     if !facts.is_empty() {
@@ -501,6 +513,8 @@ pub fn build(
             CardPart::Line { rect, .. }
             | CardPart::Path { rect, .. }
             | CardPart::Button { rect, .. }
+            | CardPart::Row { rect, .. }
+            | CardPart::Hold { rect, .. }
             | CardPart::Rule { rect } => *rect = shift(*rect),
         }
     }
@@ -538,6 +552,7 @@ mod tests {
             estimated: false,
             is_folder: true,
             modified: Some(1_709_596_800),
+            utc_offset: 0,
             category: Some("Video"),
             note: None,
             handoff: None,
@@ -578,7 +593,9 @@ mod tests {
             .iter()
             .filter_map(|p| match p {
                 CardPart::Line { text, .. } | CardPart::Path { text, .. } => Some(text.to_string()),
-                CardPart::Button { label, .. } => Some(label.to_string()),
+                CardPart::Button { label, .. }
+                | CardPart::Row { label, .. }
+                | CardPart::Hold { label, .. } => Some(label.to_string()),
                 CardPart::Rule { .. } => None,
             })
             .collect()
@@ -593,6 +610,58 @@ mod tests {
         assert_eq!(format_date(253_402_300_799).as_deref(), Some("9999-12-31"));
         assert_eq!(format_date(i64::MAX), None);
         assert_eq!(format_date(i64::MIN), None);
+    }
+
+    #[test]
+    fn the_modified_date_is_the_one_on_the_users_calendar() {
+        // 2024-03-05 00:00 UTC is still the 4th in a zone an hour behind and
+        // already the 5th in one ahead.
+        let mut behind = data();
+        behind.utc_offset = -3600;
+        let t = texts(&build_at(
+            &behind,
+            Rect::new(10.0, 100.0, 100.0, 100.0),
+            (50.0, 150.0),
+        ));
+        assert_eq!(t[3], "Video · modified 2024-03-04");
+        let mut ahead = data();
+        ahead.utc_offset = 5 * 3600;
+        let t = texts(&build_at(
+            &ahead,
+            Rect::new(10.0, 100.0, 100.0, 100.0),
+            (50.0, 150.0),
+        ));
+        assert_eq!(t[3], "Video · modified 2024-03-05");
+        // A hostile offset cannot overflow.
+        let mut odd = data();
+        odd.modified = Some(i64::MAX);
+        odd.utc_offset = i32::MAX;
+        let _ = texts(&build_at(
+            &odd,
+            Rect::new(10.0, 100.0, 100.0, 100.0),
+            (50.0, 150.0),
+        ));
+    }
+
+    #[test]
+    fn handoffs_that_are_not_wired_up_say_so_instead_of_failing() {
+        let d = data();
+        for h in [Handoff::Uninstall, Handoff::Package] {
+            assert_eq!(
+                why_not(&d, Action::Handoff(h)),
+                Some("Not available in this version"),
+                "{h:?}"
+            );
+        }
+        assert_eq!(why_not(&d, Action::Handoff(Handoff::DiskCleanup)), None);
+        let mut with = data();
+        with.handoff = Some(Handoff::Uninstall);
+        let b = buttons(&with);
+        let (_, reason) = b
+            .iter()
+            .find(|(a, _)| matches!(a, Action::Handoff(_)))
+            .expect("the button is listed");
+        assert_eq!(*reason, Some("Not available in this version"));
     }
 
     #[test]

@@ -151,7 +151,9 @@ fn card_texts(shell: &Shell<TreeSource>) -> Vec<String> {
             .iter()
             .filter_map(|p| match p {
                 CardPart::Line { text, .. } | CardPart::Path { text, .. } => Some(text.to_string()),
-                CardPart::Button { label, .. } => Some(label.to_string()),
+                CardPart::Button { label, .. }
+                | CardPart::Row { label, .. }
+                | CardPart::Hold { label, .. } => Some(label.to_string()),
                 CardPart::Rule { .. } => None,
             })
             .collect()
@@ -569,30 +571,27 @@ fn delete_keys_without_a_selection_say_why_and_do_nothing() {
 }
 
 #[test]
-fn delete_keys_ask_for_the_action_on_a_finished_selection() {
+fn keys_that_act_on_files_are_handed_on_and_the_rest_are_handled_in_the_shell() {
     let mut shell = shell_for(plain(true), 1.0);
     let fs = folders(&shell);
     click_at(&mut shell, title_point(fs[0].rect), 0);
-    for (k, wanted) in [
-        (Key::Delete, bs_ui::action::Action::Delete),
-        (
-            Key::DeletePermanently,
-            bs_ui::action::Action::DeletePermanently,
-        ),
-        (Key::Undo, bs_ui::action::Action::Undo),
-        (Key::ContextMenu, bs_ui::action::Action::ContextMenu),
-        (Key::Rescan, bs_ui::action::Action::Rescan),
-    ] {
-        let fx = key(&mut shell, k, 10);
-        assert!(
-            matches!(&fx[..], [ShellEffect::Action { action, items, .. }]
-                if *action == wanted && items == &vec![fs[0].id]),
-            "{k:?}: {fx:?}"
-        );
-        if cfg!(debug_assertions) {
-            assert!(info(&shell).ends_with(": not yet"), "{}", info(&shell));
-        }
-    }
+    // Scanning a folder again belongs to the host, which owns the scan.
+    let fx = key(&mut shell, Key::Rescan, 10);
+    assert!(
+        matches!(&fx[..], [ShellEffect::Action { action, items, .. }]
+            if *action == bs_ui::action::Action::Rescan && items == &vec![fs[0].id]),
+        "{fx:?}"
+    );
+    // Deleting, undoing and the menu are the shell's own (see tests/actions.rs);
+    // with no platform service behind it, deleting says so and does nothing.
+    let fx = key(&mut shell, Key::Delete, 20);
+    assert!(fx.is_empty());
+    assert_eq!(info(&shell), "Delete: not available here");
+    let fx = key(&mut shell, Key::Undo, 30);
+    assert!(fx.is_empty());
+    assert_eq!(info(&shell), "Nothing to undo");
+    assert!(key(&mut shell, Key::ContextMenu, 40).is_empty());
+    assert!(shell.modal_open());
 }
 
 #[test]

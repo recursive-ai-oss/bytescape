@@ -1,22 +1,32 @@
 //! Pictures of the drive picker, a drive's map with its blocks, the progress
-//! overlay and the stopped banner. They are made from fixture drives and a
-//! fixture tree, through the same shell and renderer the window uses, so no
-//! disk is scanned.
+//! overlay, the stopped banner, and the delete flows (toast, dialogs, menus,
+//! deleted tiles). They are made from fixture drives and a fixture tree,
+//! through the same shell and renderer the window uses, so no disk is scanned
+//! and nothing is deleted.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bs_knowledge::Level;
 use bs_layout::Metrics;
+use bs_platform::delete::{
+    ByteBasis, Decision, EmptyOutcome, Item as DItem, Plan, PlanEntry, ProtectedConfirmation,
+    Reason, RefuseReason, RestoreOutcome,
+};
 use bs_platform::drives::{Capacity, Drive, DriveId, DriveKind, ReservedKind};
-use bs_render::TextEngine;
-use bs_tree::{Aggregator, Batch, Category, DirKey, Meta, NodeKind, Snapshot};
+use bs_render::{ItemKind, TextEngine};
+use bs_tree::{Aggregator, Batch, Category, DeleteState, DirKey, Meta, NodeKind, Snapshot};
 use bs_ui::blocks::DriveBlocks;
 use bs_ui::capacity::Breakdown;
 use bs_ui::picker::{CardScan, Picker};
-use bs_ui::shell::{Look, STOPPED_BANNER, ScanReadout, Shell};
+use bs_ui::shell::{
+    ActOutcome, Capabilities, Disposer, Look, STOPPED_BANNER, ScanReadout, Shell, ShellEffect,
+    Token, TreeChange,
+};
 use bs_ui::tree::TreeSource;
-use bs_ui::{App, InputEvent};
+use bs_ui::{App, InputEvent, Key, Modifiers, ViewSource};
 
 use crate::window::{make_renderer, refresh_shell_chrome};
 use crate::{ShotOptions, font_px};
@@ -25,7 +35,19 @@ use crate::{ShotOptions, font_px};
 pub fn is_picker_state(state: &str) -> bool {
     matches!(
         state,
-        "picker" | "driveblocks" | "stopped" | "progress" | "picker-empty"
+        "picker"
+            | "driveblocks"
+            | "stopped"
+            | "progress"
+            | "picker-empty"
+            | "toast"
+            | "deleted"
+            | "dialog-permanent"
+            | "dialog-hold"
+            | "menu"
+            | "menu-blocked"
+            | "menu-pending"
+            | "dialog-notes"
     )
 }
 
@@ -107,22 +129,23 @@ fn meta(size: u64, category: u8) -> Meta {
     }
 }
 
+const FOLDERS: [(&str, u64, u8, u32); 7] = [
+    ("Videos", 180 * GB, 1, 40),
+    ("Games", 140 * GB, 6, 60),
+    ("Pictures", 70 * GB, 2, 120),
+    ("Projects", 52 * GB, 7, 200),
+    ("Music", 31 * GB, 3, 90),
+    ("Documents", 18 * GB, 4, 80),
+    ("Backups", 66 * GB, 5, 12),
+];
+
 /// A drive's tree: a few big folders full of files. `finish` marks every
 /// listing done.
-fn fixture_tree(finish: bool, stopped: bool) -> Arc<Snapshot> {
-    let folders: [(&str, u64, u8, u32); 7] = [
-        ("Videos", 180 * GB, 1, 40),
-        ("Games", 140 * GB, 6, 60),
-        ("Pictures", 70 * GB, 2, 120),
-        ("Projects", 52 * GB, 7, 200),
-        ("Music", 31 * GB, 3, 90),
-        ("Documents", 18 * GB, 4, 80),
-        ("Backups", 66 * GB, 5, 12),
-    ];
+fn fixture_agg(finish: bool, stopped: bool) -> (Aggregator, Arc<Snapshot>) {
     let mut agg = Aggregator::new();
     let mut b = Batch::new();
     let _ = b.dir(DirKey(0), DirKey::NONE, b"/", &meta(4096, 0));
-    for (i, (name, total, category, files)) in folders.iter().enumerate() {
+    for (i, (name, total, category, files)) in FOLDERS.iter().enumerate() {
         let key = DirKey(i as u32 + 1);
         let _ = b.dir(key, DirKey(0), name.as_bytes(), &meta(4096, 0));
         for f in 0..*files {
@@ -148,7 +171,8 @@ fn fixture_tree(finish: bool, stopped: bool) -> Arc<Snapshot> {
     if stopped {
         agg.mark_stopped();
     }
-    agg.publish()
+    let snapshot = agg.publish();
+    (agg, snapshot)
 }
 
 fn shell_for(opts: &ShotOptions, dark: bool, text: &TextEngine) -> Shell<TreeSource> {
@@ -170,8 +194,18 @@ fn map_shell(
     finish: bool,
     stopped: bool,
 ) -> Shell<TreeSource> {
+    map_shell_with(opts, dark, text, finish, stopped).0
+}
+
+fn map_shell_with(
+    opts: &ShotOptions,
+    dark: bool,
+    text: &TextEngine,
+    finish: bool,
+    stopped: bool,
+) -> (Shell<TreeSource>, Aggregator) {
     let mut shell = shell_for(opts, dark, text);
-    let snapshot = fixture_tree(finish, stopped);
+    let (agg, snapshot) = fixture_agg(finish, stopped);
     let drive = &fixture_drives()[0];
     let cap = drive.capacity.unwrap_or_else(|| {
         Capacity::from_bytes(GB, GB / 2, GB / 2, ReservedKind::FilesystemReserve)
@@ -185,7 +219,375 @@ fn map_shell(
     shell.set_app(App::new(source, map));
     shell.set_capacity(breakdown, Duration::ZERO);
     shell.set_crumb(drive.mount_point.to_string_lossy().into_owned());
+    (shell, agg)
+}
+
+// ---- the delete flows --------------------------------------------------------
+
+/// A stand-in for the platform that deletes nothing: it judges folders by
+/// name (Backups stands for part of the system, Documents is protected) and
+/// answers as a bin would.
+struct ShotDisposer {
+    bytes: HashMap<String, u64>,
+    /// More folders are protected, each with a note of its own.
+    many_notes: bool,
+}
+
+/// Notes for the folders that are protected in the many-notes picture.
+const OTHER_NOTES: [(&str, &str); 3] = [
+    (
+        "Music",
+        "Your music library. Media players keep their database beside it.",
+    ),
+    (
+        "Pictures",
+        "Your photos. The photo apps of the system index them here.",
+    ),
+    (
+        "Projects",
+        "Your work folders. Sync tools and editors keep state in them.",
+    ),
+];
+
+const DOCUMENTS_NOTE: &str = "Your personal files. Windows and many programs keep things here.";
+
+impl ShotDisposer {
+    fn name(item: &DItem) -> String {
+        item.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+}
+
+impl Disposer for ShotDisposer {
+    fn precheck(
+        &self,
+        items: &[DItem],
+        _permanent: bool,
+        confirmed: Option<&ProtectedConfirmation>,
+    ) -> Plan {
+        let entries: Vec<PlanEntry> = items
+            .iter()
+            .map(|i| match Self::name(i).as_str() {
+                name if self.many_notes && OTHER_NOTES.iter().any(|(n, _)| *n == name) => {
+                    let note = OTHER_NOTES
+                        .iter()
+                        .find(|(n, _)| *n == name)
+                        .map_or("", |(_, note)| *note);
+                    PlanEntry {
+                        level: Level::Protected,
+                        reason: Reason::Table,
+                        note: Some(note),
+                        decision: if confirmed.is_some() {
+                            Decision::Proceed
+                        } else {
+                            Decision::Refused(RefuseReason::ProtectedNotConfirmed {
+                                note: Some(note),
+                            })
+                        },
+                    }
+                }
+                "Backups" => PlanEntry {
+                    level: Level::Blocked,
+                    reason: Reason::Table,
+                    note: None,
+                    decision: Decision::Refused(RefuseReason::Blocked {
+                        reason: Reason::Table,
+                        note: None,
+                    }),
+                },
+                "Documents" => PlanEntry {
+                    level: Level::Protected,
+                    reason: Reason::Table,
+                    note: Some(DOCUMENTS_NOTE),
+                    decision: if confirmed.is_some() {
+                        Decision::Proceed
+                    } else {
+                        Decision::Refused(RefuseReason::ProtectedNotConfirmed {
+                            note: Some(DOCUMENTS_NOTE),
+                        })
+                    },
+                },
+                _ => PlanEntry {
+                    level: Level::Normal,
+                    reason: Reason::None,
+                    note: None,
+                    decision: Decision::Proceed,
+                },
+            })
+            .collect();
+        let strictest = entries
+            .iter()
+            .map(|e| e.level)
+            .max()
+            .unwrap_or(Level::Normal);
+        Plan {
+            selection_refused: entries
+                .iter()
+                .any(|e| matches!(e.decision, Decision::Refused(_))),
+            drivers: (0..entries.len())
+                .filter(|&i| entries[i].level == strictest)
+                .collect(),
+            entries,
+            strictest,
+        }
+    }
+
+    fn trash(
+        &self,
+        items: &[DItem],
+        _confirmed: Option<&ProtectedConfirmation>,
+    ) -> Vec<ActOutcome> {
+        items
+            .iter()
+            .map(|i| ActOutcome::MovedToBin {
+                token: Token::new(i.path.clone()),
+                bytes: self.bytes.get(&Self::name(i)).copied().unwrap_or(0),
+                basis: ByteBasis::Allocated,
+                shared_files: 0,
+            })
+            .collect()
+    }
+
+    fn delete_permanently(
+        &self,
+        items: &[DItem],
+        _confirmed: Option<&ProtectedConfirmation>,
+    ) -> Vec<ActOutcome> {
+        items
+            .iter()
+            .map(|i| ActOutcome::Deleted {
+                bytes: self.bytes.get(&Self::name(i)).copied().unwrap_or(0),
+                shared_files: 0,
+            })
+            .collect()
+    }
+
+    fn restore(&self, token: &Token) -> RestoreOutcome {
+        RestoreOutcome::Restored {
+            path: token.get::<PathBuf>().cloned().unwrap_or_default(),
+        }
+    }
+
+    fn empty_bin(&self, _mount: &Path) -> EmptyOutcome {
+        EmptyOutcome::Emptied {
+            bytes: 0,
+            entries: 0,
+        }
+    }
+}
+
+/// The point on the title bar of the folder called `name`.
+fn folder_point(shell: &Shell<TreeSource>, name: &str) -> Option<(f32, f32)> {
     shell
+        .app()?
+        .items()
+        .iter()
+        .find(|i| {
+            i.depth == 1
+                && i.kind == ItemKind::FolderTitled
+                && i.label.as_ref().is_some_and(|l| &*l.name == name)
+        })
+        .map(|i| (i.rect.x + i.rect.w / 2.0, i.rect.y + 3.0))
+}
+
+fn at(ms: u64) -> Duration {
+    Duration::from_millis(ms)
+}
+
+/// Does the disk work and the tree changes the shell asked for, as the
+/// window would.
+fn settle(
+    shell: &mut Shell<TreeSource>,
+    agg: &mut Aggregator,
+    fx: Vec<ShellEffect>,
+    now: Duration,
+) {
+    let mut queue = fx;
+    while let Some(effect) = queue.pop() {
+        match effect {
+            ShellEffect::Run(job) => queue.extend(shell.job_done(job.run(), now)),
+            ShellEffect::Tree(changes) => {
+                apply_changes(shell, agg, &changes, now);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_changes(
+    shell: &mut Shell<TreeSource>,
+    agg: &mut Aggregator,
+    changes: &[TreeChange],
+    now: Duration,
+) {
+    for c in changes {
+        let _ = agg.unmark_deleted(c.node);
+        if c.to != DeleteState::None {
+            let _ = agg.mark_deleted(c.node, c.to);
+        }
+    }
+    let snapshot = agg.publish();
+    if let Some(app) = shell.app_mut() {
+        app.source_mut().set_snapshot(snapshot);
+    }
+    shell.update(InputEvent::DataChanged, now);
+}
+
+/// Builds the scene for a delete-flow picture. Returns the shell, the time to
+/// draw at, and the map's items.
+fn actions_scene(
+    opts: &ShotOptions,
+    dark: bool,
+    text: &TextEngine,
+    state: &str,
+) -> Result<(Shell<TreeSource>, Duration), String> {
+    let (mut shell, mut agg) = map_shell_with(opts, dark, text, true, false);
+    shell.set_status("640 GB in 1.2 million files".into(), false);
+    shell.set_capabilities(Capabilities { properties: true });
+    let bytes: HashMap<String, u64> = shell
+        .app()
+        .map(|a| {
+            let view = a.current_view();
+            a.items()
+                .iter()
+                .filter(|i| i.depth == 1 && i.kind == ItemKind::FolderTitled)
+                .filter_map(|i| {
+                    let t = a.source().target(view, i.id)?;
+                    Some((t.name, t.bytes))
+                })
+                .collect()
+        })
+        .ok_or("the fixture has no folders")?;
+    shell.set_disposer(Arc::new(ShotDisposer {
+        bytes,
+        many_notes: state == "dialog-notes",
+    }));
+    let point = |shell: &Shell<TreeSource>, name: &str| {
+        folder_point(shell, name).ok_or_else(|| format!("no folder called {name}"))
+    };
+    let ctrl = Modifiers {
+        ctrl: true,
+        shift: false,
+    };
+    let mut now = at(100);
+    match state {
+        "toast" | "deleted" => {
+            let (x, y) = point(&shell, "Videos")?;
+            shell.update(InputEvent::Click { x, y }, now);
+            now = at(200);
+            let fx = shell.update(InputEvent::Key(Key::Delete), now);
+            settle(&mut shell, &mut agg, fx, now);
+            // A second item, deleted for good, so both looks show.
+            if state == "deleted" {
+                let (x, y) = point(&shell, "Pictures")?;
+                now = at(300);
+                shell.update(InputEvent::Click { x, y }, now);
+                let fx = shell.update(InputEvent::Key(Key::DeletePermanently), now);
+                settle(&mut shell, &mut agg, fx, now);
+                if let Some(p) = shell.popup() {
+                    let button = p
+                        .card
+                        .parts
+                        .iter()
+                        .find_map(|part| match part {
+                            bs_render::CardPart::Button { rect, label, .. }
+                                if &**label == "Delete permanently" =>
+                            {
+                                Some((rect.x + rect.w / 2.0, rect.y + rect.h / 2.0))
+                            }
+                            _ => None,
+                        })
+                        .ok_or("no confirm button")?;
+                    let fx = shell.update(
+                        InputEvent::Click {
+                            x: button.0,
+                            y: button.1,
+                        },
+                        now,
+                    );
+                    settle(&mut shell, &mut agg, fx, now);
+                }
+                // The toast has gone by the time the picture is taken.
+                now = at(20_000);
+                shell.tick(now);
+                shell.tick(at(20_300));
+                now = at(20_400);
+            } else {
+                now = at(900);
+                shell.tick(now);
+            }
+        }
+        "dialog-permanent" => {
+            let (x, y) = point(&shell, "Games")?;
+            shell.update(InputEvent::Click { x, y }, now);
+            let (x, y) = point(&shell, "Music")?;
+            shell.update(InputEvent::ClickWith { x, y, mods: ctrl }, at(150));
+            let (x, y) = point(&shell, "Projects")?;
+            shell.update(InputEvent::ClickWith { x, y, mods: ctrl }, at(180));
+            let fx = shell.update(InputEvent::Key(Key::DeletePermanently), at(200));
+            settle(&mut shell, &mut agg, fx, at(200));
+            now = at(300);
+        }
+        "dialog-notes" => {
+            let (x, y) = point(&shell, "Documents")?;
+            shell.update(InputEvent::Click { x, y }, now);
+            for (n, name) in ["Music", "Pictures", "Projects"].into_iter().enumerate() {
+                let (x, y) = point(&shell, name)?;
+                shell.update(
+                    InputEvent::ClickWith { x, y, mods: ctrl },
+                    at(150 + 10 * n as u64),
+                );
+            }
+            let fx = shell.update(InputEvent::Key(Key::DeletePermanently), at(200));
+            settle(&mut shell, &mut agg, fx, at(200));
+            now = at(300);
+        }
+        "dialog-hold" => {
+            let (x, y) = point(&shell, "Documents")?;
+            shell.update(InputEvent::Click { x, y }, now);
+            let fx = shell.update(InputEvent::Key(Key::Delete), at(200));
+            settle(&mut shell, &mut agg, fx, at(200));
+            let button = shell
+                .popup()
+                .and_then(|p| {
+                    p.card.parts.iter().find_map(|part| match part {
+                        bs_render::CardPart::Hold { rect, .. } => {
+                            Some((rect.x + rect.w / 2.0, rect.y + rect.h / 2.0))
+                        }
+                        _ => None,
+                    })
+                })
+                .ok_or("no hold button")?;
+            shell.update(
+                InputEvent::PointerDown {
+                    x: button.0,
+                    y: button.1,
+                },
+                at(1_000),
+            );
+            // Partway through the hold.
+            now = at(1_900);
+            shell.tick(now);
+        }
+        "menu" | "menu-blocked" | "menu-pending" => {
+            let name = if state == "menu-blocked" {
+                "Backups"
+            } else {
+                "Projects"
+            };
+            let (x, y) = point(&shell, name)?;
+            let fx = shell.update(InputEvent::RightClick { x, y: y + 20.0 }, now);
+            // The pending picture is taken before the platform has answered.
+            if state != "menu-pending" {
+                settle(&mut shell, &mut agg, fx, now);
+            }
+            now = at(200);
+        }
+        other => return Err(format!("no delete-flow picture called {other}")),
+    }
+    Ok((shell, now))
 }
 
 /// Pictures for the picker states.
@@ -198,7 +600,14 @@ pub fn screenshots(opts: &ShotOptions, states: &[String], text: &TextEngine) -> 
     };
     for state in states {
         for dark in [false, true] {
+            let mut now = Duration::ZERO;
             let mut shell = match state.as_str() {
+                "toast" | "deleted" | "dialog-permanent" | "dialog-hold" | "dialog-notes"
+                | "menu" | "menu-blocked" | "menu-pending" => {
+                    let (shell, at) = actions_scene(opts, dark, text, state)?;
+                    now = at;
+                    shell
+                }
                 "picker" | "picker-empty" => {
                     let mut shell = shell_for(opts, dark, text);
                     let drives = if state == "picker" {
@@ -275,7 +684,7 @@ pub fn screenshots(opts: &ShotOptions, states: &[String], text: &TextEngine) -> 
                 None => shell.app().map(App::items).ok_or("nothing to draw")?,
             };
             renderer.set_items(items);
-            refresh_shell_chrome(&mut renderer, &mut shell, Duration::ZERO);
+            refresh_shell_chrome(&mut renderer, &mut shell, now);
             let name = format!(
                 "{state}-{}-{scale_name}x.png",
                 if dark { "dark" } else { "light" }

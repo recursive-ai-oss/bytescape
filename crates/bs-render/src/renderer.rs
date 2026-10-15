@@ -10,7 +10,7 @@ use std::time::Duration;
 use tiny_skia::{Pixmap, PixmapMut};
 
 use crate::canvas::Canvas;
-use crate::card::{Card, draw_card};
+use crate::card::{Card, Popup, draw_card, draw_popup};
 use crate::chrome::{Chrome, Widget, draw_chrome};
 use crate::geom::{IRect, Rect};
 use crate::pixel;
@@ -82,6 +82,8 @@ pub struct Renderer {
     items: Arc<Vec<Item>>,
     chrome: Chrome,
     card: Option<Card>,
+    toast: Option<Card>,
+    popup: Option<Popup>,
     index: HashMap<u32, usize>,
     front: Pixmap,
     stub: Pixmap,
@@ -135,6 +137,8 @@ impl Renderer {
             items: Arc::new(Vec::new()),
             chrome: Chrome::default(),
             card: None,
+            toast: None,
+            popup: None,
             index: HashMap::new(),
             front,
             stub: Pixmap::new(1, 1)?,
@@ -327,6 +331,59 @@ impl Renderer {
     /// The hover card on screen.
     pub fn card(&self) -> Option<&Card> {
         self.card.as_ref()
+    }
+
+    /// Shows the toast, moves it, or removes it with `None`. Only the
+    /// rectangles of the old and new toast repaint. Returns whether anything
+    /// changed.
+    pub fn set_toast(&mut self, toast: Option<Card>) -> bool {
+        if self.toast == toast {
+            return false;
+        }
+        let scale = self.scale;
+        let region = [&self.toast, &toast]
+            .into_iter()
+            .flatten()
+            .map(|c| c.dirty_rect(scale))
+            .reduce(|a, b| a.union(&b));
+        self.toast = toast;
+        self.repaint_layer(region);
+        true
+    }
+
+    /// Shows a dialog or menu over everything, or removes it with `None`.
+    /// Returns whether anything changed.
+    pub fn set_popup(&mut self, popup: Option<Popup>) -> bool {
+        if self.popup == popup {
+            return false;
+        }
+        let (scale, window) = (self.scale, self.window_rect());
+        let region = [&self.popup, &popup]
+            .into_iter()
+            .flatten()
+            .map(|p| p.dirty_rect(scale, window))
+            .reduce(|a, b| a.union(&b));
+        self.popup = popup;
+        self.repaint_layer(region);
+        true
+    }
+
+    /// The popup on screen.
+    pub fn popup(&self) -> Option<&Popup> {
+        self.popup.as_ref()
+    }
+
+    fn window_rect(&self) -> Rect {
+        Rect::new(0.0, 0.0, self.width as f32, self.height as f32)
+    }
+
+    fn repaint_layer(&mut self, region: Option<Rect>) {
+        if self.anim.is_none()
+            && !self.full_dirty
+            && let Some(region) = region
+        {
+            self.repaint_region(region);
+        }
     }
 
     /// Draws the bars again in `rects` in both images of the running zoom.
@@ -603,6 +660,13 @@ impl Renderer {
         }
         if let Some(card) = &self.card {
             draw_card(&mut canvas, card, &pal, &style, region);
+        }
+        if let Some(toast) = &self.toast {
+            draw_card(&mut canvas, toast, &pal, &style, region);
+        }
+        if let Some(popup) = &self.popup {
+            let window = Rect::new(0.0, 0.0, self.width as f32, self.height as f32);
+            draw_popup(&mut canvas, popup, window, &pal, &style, region);
         }
     }
 

@@ -42,6 +42,10 @@ const LEGEND: NodeId = NodeId(16);
 const OVERFLOW: NodeId = NodeId(17);
 const LINK: NodeId = NodeId(18);
 const NOTICE: NodeId = NodeId(19);
+const POPUP: NodeId = NodeId(20);
+const TOAST: NodeId = NodeId(21);
+const TOAST_UNDO: NodeId = NodeId(22);
+const POPUP_BASE: u64 = 2_000;
 const CRUMB_BASE: u64 = 100;
 const CRUMB_LIMIT: usize = 64;
 const SWATCH_BASE: u64 = 200;
@@ -85,6 +89,10 @@ pub enum AccessTarget {
     FolderButton,
     /// A box of the map, by item id.
     Box(u32),
+    /// A button of the open dialog or a row of the open menu, by position.
+    Popup(usize),
+    /// The Undo button of the toast.
+    ToastUndo,
 }
 
 fn ak_rect(r: Rect) -> AkRect {
@@ -439,8 +447,15 @@ impl<S: ViewSource> Shell<S> {
         }
         tree.chrome.retain(|id, _| fresh_ids.contains(id));
 
-        // Focus follows the keyboard selection.
-        let focus = if let Some(app) = &self.app {
+        // Focus follows the keyboard selection, except while a dialog or
+        // menu is open (it goes to the button or row the keyboard is on) or
+        // the toast's button has the keyboard.
+        let focus = if self.popup_summary().is_some() {
+            self.popup_focus()
+                .map_or(POPUP, |i| NodeId(POPUP_BASE + i as u64))
+        } else if self.toast_focused() {
+            TOAST_UNDO
+        } else if let Some(app) = &self.app {
             app.selected()
                 .map(box_id)
                 .filter(|id| {
@@ -739,6 +754,55 @@ impl<S: ViewSource> Shell<S> {
         status.set_children(kids);
         out.push((STATUS, status));
         root_children.push(STATUS);
+
+        // The toast and the open dialog or menu sit over everything.
+        if let Some((text, rect, undo)) = self.toast_summary(self.clock) {
+            let mut toast = Node::new(Role::Status);
+            toast.set_value(text);
+            toast.set_live(Live::Polite);
+            toast.set_bounds(ak_rect(rect));
+            if let Some(r) = undo {
+                let n = button("Undo", r, true, "");
+                out.push((TOAST_UNDO, n));
+                targets.insert(TOAST_UNDO, AccessTarget::ToastUndo);
+                toast.set_children(vec![TOAST_UNDO]);
+            }
+            out.push((TOAST, toast));
+            root_children.push(TOAST);
+        }
+        if let Some(p) = self.popup_summary() {
+            let mut kids = Vec::new();
+            for (i, (label, note, enabled, hold, rect)) in p.controls.iter().enumerate() {
+                let id = NodeId(POPUP_BASE + i as u64);
+                let mut n = if p.menu {
+                    node(Role::MenuItem, Some(label), *rect)
+                } else {
+                    node(Role::Button, Some(label), *rect)
+                };
+                if !note.is_empty() {
+                    n.set_description(note.as_str());
+                }
+                if !enabled {
+                    n.set_disabled();
+                } else if !hold {
+                    n.add_action(Action::Click);
+                }
+                out.push((id, n));
+                targets.insert(id, AccessTarget::Popup(i));
+                kids.push(id);
+            }
+            let mut group = if p.menu {
+                node(Role::Menu, Some("Actions"), p.rect)
+            } else {
+                let mut d = node(Role::Dialog, Some("Confirm"), p.rect);
+                d.set_description(p.text.as_str());
+                d.set_modal();
+                d
+            };
+            group.set_children(kids);
+            out.push((POPUP, group));
+            root_children.push(POPUP);
+        }
         root_children
     }
 

@@ -4,13 +4,11 @@
 
 mod access;
 mod bench;
-mod clipboard;
-mod folder;
 mod live;
-mod open;
 mod real;
 mod shots;
 mod synth;
+mod system;
 mod window;
 
 use std::path::PathBuf;

@@ -13,6 +13,7 @@ pub mod card;
 pub mod chrome;
 pub mod info;
 pub mod picker;
+pub mod popup;
 pub mod shell;
 pub use shell::access;
 pub mod spatial;
@@ -65,6 +66,24 @@ pub struct ItemInfo {
     pub is_folder: bool,
 }
 
+/// What an action on box `id` of a view would touch on disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    /// The real path, with the bytes the scan saw (not a display string).
+    pub path: std::path::PathBuf,
+    /// The box's node in the size tree, to mark it deleted.
+    pub node: Option<bs_tree::NodeId>,
+    /// The name, converted for display.
+    pub name: String,
+    /// Allocated bytes the box stands for.
+    pub bytes: u64,
+    /// The bytes are only a lower bound (something below could not be read).
+    pub lower_bound: bool,
+    /// The bytes include an estimate.
+    pub estimated: bool,
+    pub is_folder: bool,
+}
+
 /// Where views come from. The real implementation sits on the size tree and
 /// the layout code; tests and the benchmark use a synthetic one.
 pub trait ViewSource {
@@ -94,6 +113,11 @@ pub trait ViewSource {
     }
     /// The full path of box `id` of `view`, converted for display.
     fn path(&self, _view: ViewId, _id: u32) -> Option<String> {
+        None
+    }
+    /// What box `id` of `view` is on disk, for acting on it. `None` for boxes
+    /// that are not a file or folder (groups, free space).
+    fn target(&self, _view: ViewId, _id: u32) -> Option<Target> {
         None
     }
     /// Everything the hover card says about box `id` of `view`.
@@ -156,6 +180,11 @@ pub enum Key {
     Rescan,
     /// Shift+F10 or the menu key.
     ContextMenu,
+    /// Tab and Shift+Tab move between the buttons of a dialog.
+    Tab,
+    BackTab,
+    /// Space presses the focused button of a dialog or menu.
+    Space,
 }
 
 /// An input event, already translated from the windowing system.
@@ -206,7 +235,28 @@ pub enum InputEvent {
         x: f32,
         y: f32,
     },
+    /// The primary button went down. A button that must be held (the
+    /// confirmation of a protected delete) starts counting here.
+    PointerDown {
+        x: f32,
+        y: f32,
+    },
+    /// The primary button came up.
+    PointerUp {
+        x: f32,
+        y: f32,
+    },
+    /// The secondary button: the context menu.
+    RightClick {
+        x: f32,
+        y: f32,
+    },
     Key(Key),
+    /// A key came up (only Enter and Space matter: they can hold a button).
+    KeyReleased(Key),
+    /// The window lost the keyboard focus. A key or button held down for a
+    /// confirmation stops counting: its release may never arrive here.
+    FocusLost,
     /// The window size or scale factor changed.
     Resized {
         map: Rect,
@@ -404,6 +454,11 @@ impl<S: ViewSource> App<S> {
         self.stack.len()
     }
 
+    /// The box at a point of the current view, if any.
+    pub fn item_at(&self, x: f32, y: f32) -> Option<u32> {
+        self.hit(x, y).map(|i| i.id)
+    }
+
     pub fn hover(&self) -> Option<u32> {
         self.hover
     }
@@ -534,8 +589,16 @@ impl<S: ViewSource> App<S> {
                 | Key::Undo
                 | Key::CopyPath
                 | Key::Rescan
-                | Key::ContextMenu,
+                | Key::ContextMenu
+                | Key::Tab
+                | Key::BackTab
+                | Key::Space,
             ) => {}
+            InputEvent::PointerDown { .. }
+            | InputEvent::PointerUp { .. }
+            | InputEvent::RightClick { .. }
+            | InputEvent::FocusLost
+            | InputEvent::KeyReleased(_) => {}
             InputEvent::CrumbClick { index } => {
                 self.skip_running_animation(&mut fx);
                 let view = self.current_view();

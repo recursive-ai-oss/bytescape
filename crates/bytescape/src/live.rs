@@ -10,7 +10,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use bs_scan::{ScanHandle, ScanOptions, ScanStats, Scanner, StatvfsVolume, VolumeInfo, Walker};
-use bs_tree::{Aggregator, Snapshot, SnapshotReader};
+use bs_tree::{Aggregator, DeleteState, Snapshot, SnapshotReader};
+use bs_ui::shell::TreeChange;
 use bs_ui::tree::relayout_interval;
 
 /// How often the scanner publishes snapshots. The window lays out less often
@@ -43,6 +44,9 @@ pub struct ScanDriver {
     /// background can be shown at once when its drive is picked.
     outcome: Option<(Arc<Snapshot>, Option<String>)>,
     replay: bool,
+    /// Delete marks asked for while the scan still owned the tree. They are
+    /// put on as soon as the scan ends.
+    pending_marks: Vec<TreeChange>,
 }
 
 impl ScanDriver {
@@ -81,6 +85,7 @@ impl ScanDriver {
             finished: None,
             outcome: None,
             replay: false,
+            pending_marks: Vec::new(),
         }
     }
 
@@ -153,8 +158,15 @@ impl ScanDriver {
                 .error
                 .as_ref()
                 .map(|e| format!("Couldn't scan: {e}"));
-            let snapshot = result.snapshot;
+            let mut snapshot = result.snapshot;
             self.finished = Some((result.aggregator, result.stats));
+            // What was deleted while the scan ran shows in the final picture.
+            let pending = std::mem::take(&mut self.pending_marks);
+            if !pending.is_empty()
+                && let Some(marked) = self.mark_now(&pending)
+            {
+                snapshot = marked;
+            }
             self.last_epoch = snapshot.epoch();
             self.outcome = Some((Arc::clone(&snapshot), problem.clone()));
             return Tick::Finished(snapshot, problem);
@@ -177,6 +189,44 @@ impl ScanDriver {
             }
         }
         Tick::Idle
+    }
+
+    /// Applies delete marks and publishes the result. The sizes do not change,
+    /// so nothing moves in a layout made from the new snapshot; the boxes just
+    /// take their deleted look.
+    ///
+    /// While the scan still owns the tree the marks wait and are put on when
+    /// it ends; this returns `None` then, and when nothing could be marked.
+    pub fn apply_marks(&mut self, changes: &[TreeChange]) -> Option<Arc<Snapshot>> {
+        if self.finished.is_none() {
+            self.pending_marks.extend_from_slice(changes);
+            return None;
+        }
+        self.mark_now(changes)
+    }
+
+    fn mark_now(&mut self, changes: &[TreeChange]) -> Option<Arc<Snapshot>> {
+        let (aggregator, _) = self.finished.as_mut()?;
+        let mut applied = false;
+        for change in changes {
+            // A new state replaces the old one: take the old mark off first.
+            let unmarked = aggregator.unmark_deleted(change.node).is_ok();
+            applied |= unmarked;
+            if change.to == DeleteState::None {
+                continue;
+            }
+            if aggregator.mark_deleted(change.node, change.to).is_ok() {
+                applied = true;
+            }
+        }
+        if !applied {
+            return None;
+        }
+        let snapshot = aggregator.publish();
+        let problem = self.outcome.as_ref().and_then(|(_, p)| p.clone());
+        self.outcome = Some((Arc::clone(&snapshot), problem));
+        self.last_epoch = snapshot.epoch();
+        Some(snapshot)
     }
 
     /// Records what the last layout cost, so slow ones are spaced further
@@ -460,5 +510,86 @@ mod tests {
         assert!(data <= 3, "{data} layouts for a tiny scan");
         assert!(!driver.running());
         assert!(driver.stats().is_some());
+    }
+
+    #[test]
+    fn delete_marks_on_a_finished_scan_are_published_and_taken_off_again() {
+        let dir = std::env::temp_dir().join(format!("bytescape-marks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        tree(&dir);
+        let mut driver = ScanDriver::start(dir.clone());
+        let snapshot = loop {
+            if let Tick::Finished(s, _) = driver.tick(Instant::now()) {
+                break s;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let _ = fs::remove_dir_all(&dir);
+        let root = snapshot.root().expect("root");
+        let folder = root.children().next().expect("a folder").id();
+        let size = root.allocated();
+        let change = |to| [TreeChange { node: folder, to }];
+
+        let marked = driver
+            .apply_marks(&change(DeleteState::InBin))
+            .expect("marked");
+        assert_eq!(
+            marked.node(folder).unwrap().delete_state(),
+            DeleteState::InBin
+        );
+        assert_eq!(marked.root().unwrap().allocated(), size, "sizes stay");
+        assert!(marked.root().unwrap().delete_totals().in_bin.allocated > 0);
+
+        // The bin was emptied: the same box is now deleted, not in the bin.
+        let gone = driver
+            .apply_marks(&change(DeleteState::Deleted))
+            .expect("changed");
+        assert_eq!(
+            gone.node(folder).unwrap().delete_state(),
+            DeleteState::Deleted
+        );
+        assert_eq!(gone.root().unwrap().delete_totals().in_bin.allocated, 0);
+
+        // A scan shown again offers the marked picture.
+        driver.rewind();
+        match driver.tick(Instant::now()) {
+            Tick::Finished(s, _) => {
+                assert_eq!(s.node(folder).unwrap().delete_state(), DeleteState::Deleted);
+            }
+            _ => panic!("the finished scan is offered again"),
+        }
+
+        let back = driver
+            .apply_marks(&change(DeleteState::None))
+            .expect("unmarked");
+        assert_eq!(back.node(folder).unwrap().delete_state(), DeleteState::None);
+        // Nothing to do twice.
+        assert!(driver.apply_marks(&change(DeleteState::None)).is_none());
+    }
+
+    #[test]
+    fn marks_asked_for_during_a_scan_wait_and_show_in_the_final_picture() {
+        let dir = std::env::temp_dir().join(format!("bytescape-early-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        tree(&dir);
+        let mut driver = ScanDriver::start(dir.clone());
+        // Right away: the scan owns the tree, or has just finished.
+        let early = driver.apply_marks(&[TreeChange {
+            node: bs_tree::NodeId::ROOT,
+            to: DeleteState::InBin,
+        }]);
+        let last = loop {
+            if let Tick::Finished(s, _) = driver.tick(Instant::now()) {
+                break s;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let _ = fs::remove_dir_all(&dir);
+        let shown = early.unwrap_or(last);
+        assert_eq!(
+            shown.root().unwrap().delete_state(),
+            DeleteState::InBin,
+            "the mark is on the final picture"
+        );
     }
 }

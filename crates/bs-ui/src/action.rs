@@ -93,4 +93,6 @@ pub mod reason {
     /// A block that stands for free space or the like, not for a file or
     /// folder.
     pub const NOT_ON_DISK: &str = "Not a file or folder";
+    /// A handoff that is not wired up in this version.
+    pub const NOT_YET: &str = "Not available in this version";
 }
