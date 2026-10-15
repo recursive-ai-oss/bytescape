@@ -135,7 +135,23 @@ impl ViewTable {
                 Some(e) if e.pinned => {}
                 // Another parent owns it; just stop offering it here.
                 Some(e) if e.parent != Some(view) => {}
-                Some(_) => self.remove(old),
+                Some(_) => {
+                    // Another view's latest layout may offer it too (a nested
+                    // folder is a box in its grandparent's layout as well):
+                    // that box must keep its view, so the view moves to that
+                    // parent instead of being dropped.
+                    let other = self
+                        .offered
+                        .iter()
+                        .filter(|(parent, _)| **parent != view)
+                        .filter(|(_, list)| list.contains(&old))
+                        .map(|(parent, _)| *parent)
+                        .min();
+                    match (other, self.entries.get_mut(&old)) {
+                        (Some(parent), Some(entry)) => entry.parent = Some(parent),
+                        _ => self.remove(old),
+                    }
+                }
                 None => {}
             }
         }

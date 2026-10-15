@@ -45,7 +45,7 @@ use crate::bench::{self, FrameSink, Offscreen, Script};
 use crate::fast::{Finish, HelperScanner, SystemLauncher};
 use crate::live::{RateMeter, ScanDriver, Tick};
 use crate::shots;
-use crate::synth::{LayoutParams, SynthSource, format_size};
+use crate::synth::{LayoutParams, SynthSource};
 use crate::system::{self, Choice, SystemDisposer};
 use crate::{Mode, ShotOptions, ZoomOptions, font_px, real};
 
@@ -445,22 +445,31 @@ fn showcase(scene: &mut Scene, scale: f32, em: f32) -> (Vec<Item>, u32, u32) {
     let gap = (8.0 * scale).round();
     let h = ((col.h - 3.0 * gap) / 4.0).floor();
     let specials = [
-        (ItemKind::Free, "Free · 112 GB"),
+        (ItemKind::Free, "Free · 112 GB", "Free · 112 GB"),
         (
             ItemKind::Unreadable,
             "Couldn't read: 23.4 GB · Grant access to see inside",
+            "Couldn't read · 23.4 GB",
         ),
-        (ItemKind::Reserved, "Reserved by filesystem · 18.0 GB"),
-        (ItemKind::RecycleBin, "Recycle Bin · 14.1 GB"),
+        (
+            ItemKind::Reserved,
+            "Reserved by filesystem · 18.0 GB",
+            "Reserved · 18.0 GB",
+        ),
+        (
+            ItemKind::RecycleBin,
+            "Recycle Bin · 14.1 GB",
+            "Bin · 14.1 GB",
+        ),
     ];
-    for (n, (kind, text)) in specials.into_iter().enumerate() {
+    for (n, (kind, text, size)) in specials.into_iter().enumerate() {
         items.push(Item {
             rect: Rect::new(col.x, col.y + n as f32 * (h + gap), col.w, h),
             kind,
             depth: 0,
             label: Some(Box::new(ItemLabel {
                 name: text.into(),
-                size: format_size(1).into(),
+                size: size.into(),
             })),
             id: 900_000 + n as u32,
             category: 0,

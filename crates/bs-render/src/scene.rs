@@ -48,6 +48,11 @@ impl std::ops::BitOr for Flags {
 }
 
 /// The text of a box: name on the left, size on the right.
+///
+/// The drive-level blocks (free space, unreadable, reserved, Recycle Bin) use
+/// the two fields differently: `name` is the full wording and `size` the
+/// short one ("Reserved · 18.0 GB"), and the drawing takes the fullest that
+/// fits the box, then the size alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemLabel {
     pub name: Box<str>,
@@ -332,6 +337,17 @@ fn draw_item<C: Canvas>(canvas: &mut C, item: &Item, pal: &Palette, st: &SceneSt
     }
     let title = pal.title[item.depth as usize % 4];
     let mut label_color = pal.text;
+    // A block's words are chosen first: the icon in its corner gives way to
+    // the size when the two do not fit side by side.
+    let block_words = match &item.label {
+        Some(label) if st.labels && r.h >= 1.6 * st.em && is_block(item.kind) => {
+            choose_block_words(canvas, label, r, st)
+        }
+        _ => None,
+    };
+    let icon = block_words
+        .as_ref()
+        .is_none_or(|w| w.right + st.pad() <= icon_left(r, st));
     match item.kind {
         ItemKind::FolderTitled => {
             canvas.fill_rect(r, pal.border);
@@ -389,16 +405,19 @@ fn draw_item<C: Canvas>(canvas: &mut C, item: &Item, pal: &Palette, st: &SceneSt
         ItemKind::Reserved => {
             canvas.fill_rect(r, pal.border);
             canvas.fill_rect(inset(r, 1.0), pal.title[1]);
-            draw_lock(canvas, r, pal, st);
+            if icon {
+                draw_lock(canvas, r, pal, st);
+            }
         }
         ItemKind::RecycleBin => {
             canvas.fill_rect(r, pal.border);
             canvas.fill_rect(inset(r, 1.0), pal.title[2]);
-            draw_bin(canvas, r, pal, st);
+            if icon {
+                draw_bin(canvas, r, pal, st);
+            }
         }
     }
     if st.labels
-        && r.w >= 3.5 * st.em
         && r.h >= 1.6 * st.em
         && let Some(label) = &item.label
     {
@@ -407,14 +426,128 @@ fn draw_item<C: Canvas>(canvas: &mut C, item: &Item, pal: &Palette, st: &SceneSt
             scale: st.scale,
             color: label_color,
         };
-        draw_name(canvas, &label.name, style, r, st);
+        if is_block(item.kind) {
+            if let Some(words) = &block_words {
+                draw_name_at(canvas, &words.text, style, r, st, words.pad);
+            }
+        } else if r.w >= 3.5 * st.em {
+            draw_name(canvas, &label.name, style, r, st);
+        }
     }
     finish(canvas, item, r, pal, st);
 }
 
+/// The drive-level blocks (free space, unreadable, reserved, Recycle Bin).
+fn is_block(kind: ItemKind) -> bool {
+    matches!(
+        kind,
+        ItemKind::Free | ItemKind::Unreadable | ItemKind::Reserved | ItemKind::RecycleBin
+    )
+}
+
+/// A size with its decimals dropped: "14.1 GB" becomes "14 GB".
+fn whole_number(size: &str) -> Option<String> {
+    let (number, unit) = size.split_once(' ')?;
+    let (whole, fraction) = number.split_once('.')?;
+    (!whole.is_empty() && fraction.chars().all(|c| c.is_ascii_digit()))
+        .then(|| format!("{whole} {unit}"))
+}
+
+/// Where a block's icon starts (left edge), in its top-right corner.
+fn icon_left(r: Rect, st: &SceneStyle) -> f32 {
+    let u = (st.em * 0.5).round().max(2.0);
+    r.right() - u * 2.5
+}
+
+/// The words chosen for a block, and where they end.
+struct BlockWords {
+    text: String,
+    /// Left padding to draw them with.
+    pad: f32,
+    /// Right edge of the drawn text.
+    right: f32,
+}
+
+/// A block's words, by the measured width: the full wording; a short name
+/// with the size (and with the size as a whole number); the size alone; the
+/// size as a whole number. On the last two the padding may shrink. A block's
+/// bytes matter more than its name, and a name cut in the middle ("Trash...
+/// GB") hides them, so nothing is ever cut: where even the smallest form does
+/// not fit, nothing is drawn.
+///
+/// The label's `name` is the full wording. Its `size` is either the short
+/// wording ("Reserved · 18.0 GB") or just the size; with none, the size is the
+/// part of the name after its last " · ".
+fn choose_block_words<C: Canvas>(
+    canvas: &mut C,
+    label: &ItemLabel,
+    r: Rect,
+    st: &SceneStyle,
+) -> Option<BlockWords> {
+    let own: &str = &label.size;
+    let short: Option<&str> = own.contains(" \u{b7} ").then_some(own);
+    let size: Option<&str> = if own.is_empty() {
+        label.name.rsplit_once(" \u{b7} ").map(|(_, tail)| tail)
+    } else {
+        Some(own.rsplit_once(" \u{b7} ").map_or(own, |(_, tail)| tail))
+    };
+    let whole = size.and_then(whole_number);
+    // (words, may use the tight padding)
+    let mut words: Vec<(String, bool)> = vec![(label.name.to_string(), false)];
+    if let Some(short) = short {
+        words.push((short.to_string(), false));
+        if let (Some(size), Some(whole)) = (size, &whole) {
+            words.push((short.replace(size, whole), false));
+        }
+    }
+    if let Some(size) = size {
+        words.push((size.to_string(), true));
+    }
+    words.extend(whole.map(|w| (w, true)));
+    let pad = st.pad();
+    let tight = (2.0 * st.scale).round().max(1.0);
+    for use_tight in [false, true] {
+        let p = if use_tight { tight } else { pad };
+        for (text, may_tighten) in &words {
+            if use_tight && !may_tighten {
+                continue;
+            }
+            if let Some(w) = canvas.measure_text(text, st.font(), st.scale)
+                && w <= r.w - 2.0 * p
+            {
+                return Some(BlockWords {
+                    text: text.clone(),
+                    pad: p,
+                    right: r.x + p + w,
+                });
+            }
+        }
+    }
+    // A name with no size in it is drawn as it is, cut to the box.
+    if words.len() == 1 && r.w >= 3.5 * st.em {
+        return Some(BlockWords {
+            text: label.name.to_string(),
+            pad,
+            right: r.right(),
+        });
+    }
+    None
+}
+
 /// Draws a box's name near its top-left corner, clipped to the box.
 fn draw_name<C: Canvas>(canvas: &mut C, name: &str, style: TextStyle, r: Rect, st: &SceneStyle) {
-    let pad = st.pad();
+    draw_name_at(canvas, name, style, r, st, st.pad());
+}
+
+/// Like [`draw_name`], with the left padding given.
+fn draw_name_at<C: Canvas>(
+    canvas: &mut C,
+    name: &str,
+    style: TextStyle,
+    r: Rect,
+    st: &SceneStyle,
+    pad: f32,
+) {
     let ty = r.y
         + ((r.h.min(2.0 * st.em) - st.em * 1.25) / 2.0)
             .max(1.0)
@@ -761,6 +894,103 @@ mod tests {
         draw_items(&mut c, &[it], &pal, &style(false), None);
         let (_, last) = c.fills().last().expect("fill");
         assert_eq!(last.a, 191);
+    }
+
+    /// Draws one block of `kind` and `w` px wide (60 tall, em 13, 6.5 px per
+    /// character) and returns what was drawn.
+    fn block(kind: ItemKind, w: f32, name: &str, size: &str) -> (Vec<(String, f32)>, usize) {
+        let mut it = item(kind, Rect::new(0.0, 0.0, w, 60.0));
+        it.label = Some(Box::new(ItemLabel {
+            name: name.into(),
+            size: size.into(),
+        }));
+        let mut c = RecordingCanvas::new(500, 100);
+        draw_items(&mut c, &[it], &Palette::light(), &style(true), None);
+        let texts = c
+            .ops
+            .iter()
+            .filter_map(|o| match o {
+                Op::Text { text, x, .. } => Some((text.clone(), *x)),
+                _ => None,
+            })
+            .collect();
+        let strokes = c.ops.iter().filter(|o| matches!(o, Op::Stroke(..))).count();
+        (texts, strokes)
+    }
+
+    const BIN: (&str, &str) = ("Trash \u{b7} 14.1 GB", "Trash \u{b7} 14.1 GB");
+
+    #[test]
+    fn a_block_takes_the_fullest_words_that_fit_and_never_cuts_a_name() {
+        let long = "Couldn't read: 23.4 GB \u{2014} Grant access to see inside";
+        let short = "Couldn't read \u{b7} 23.4 GB";
+        let mut seen = std::collections::BTreeSet::new();
+        for w in [400.0, 165.0, 120.0, 80.0, 44.0, 20.0] {
+            let (drawn, _) = block(ItemKind::Unreadable, w, long, short);
+            assert!(drawn.len() <= 1, "{w}: {drawn:?}");
+            for (text, _) in &drawn {
+                assert!(!text.contains('\u{2026}'), "{w}: {text}");
+                assert!(text.contains("23"), "{w}: the bytes stay: {text}");
+                seen.insert(text.clone());
+            }
+        }
+        let want = [long, short, "23.4 GB", "23 GB"];
+        for w in want {
+            assert!(seen.contains(w), "{w} never chosen: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn the_short_name_comes_before_the_size_alone() {
+        // About 165 px: the full wording (51 characters) cannot fit, but
+        // "Couldn't read \u{b7} 23.4 GB" (23) can.
+        let long = "Couldn't read: 23.4 GB \u{2014} Grant access to see inside";
+        let (drawn, _) = block(
+            ItemKind::Unreadable,
+            165.0,
+            long,
+            "Couldn't read \u{b7} 23.4 GB",
+        );
+        assert_eq!(drawn[0].0, "Couldn't read \u{b7} 23.4 GB");
+        let (drawn, _) = block(
+            ItemKind::Reserved,
+            150.0,
+            "Reserved by filesystem \u{b7} 18.0 GB",
+            "Reserved \u{b7} 18.0 GB",
+        );
+        assert_eq!(drawn[0].0, "Reserved \u{b7} 18.0 GB");
+        // The short name with a whole number goes before the size alone.
+        let (drawn, _) = block(ItemKind::RecycleBin, 110.0, BIN.0, BIN.1);
+        assert_eq!(drawn[0].0, "Trash \u{b7} 14.1 GB");
+        let (drawn, _) = block(ItemKind::RecycleBin, 100.0, BIN.0, BIN.1);
+        assert_eq!(drawn[0].0, "Trash \u{b7} 14 GB", "{drawn:?}");
+    }
+
+    #[test]
+    fn a_block_as_narrow_as_a_bin_keeps_its_size_and_gives_up_its_icon() {
+        // About 45 px wide: the bin block of the drive view. "14 GB" fits
+        // (32.5 px) but not beside the icon in the corner, so the icon goes.
+        let (drawn, strokes) = block(ItemKind::RecycleBin, 45.0, BIN.0, BIN.1);
+        assert_eq!(drawn.len(), 1);
+        assert_eq!(drawn[0].0, "14 GB");
+        assert_eq!(strokes, 0, "no icon over the size");
+        // Wide enough for both: the icon stays, with the words before it.
+        let (drawn, strokes) = block(ItemKind::RecycleBin, 200.0, BIN.0, BIN.1);
+        assert_eq!(drawn[0].0, "Trash \u{b7} 14.1 GB");
+        assert_eq!(strokes, 1, "the bin icon");
+        // A little narrower still: the padding shrinks before the size goes.
+        let (drawn, _) = block(ItemKind::RecycleBin, 37.0, BIN.0, BIN.1);
+        assert_eq!(drawn[0].0, "14 GB", "{drawn:?}");
+        assert_eq!(drawn[0].1, 2.0);
+        // Too narrow for any size: nothing, never a cut piece.
+        let (drawn, _) = block(ItemKind::RecycleBin, 20.0, BIN.0, BIN.1);
+        assert!(drawn.is_empty(), "{drawn:?}");
+    }
+
+    #[test]
+    fn a_block_with_no_size_of_its_own_uses_the_end_of_its_name() {
+        let (drawn, _) = block(ItemKind::RecycleBin, 60.0, "Recycle Bin \u{b7} 14.1 GB", "");
+        assert_eq!(drawn[0].0, "14.1 GB");
     }
 
     #[test]

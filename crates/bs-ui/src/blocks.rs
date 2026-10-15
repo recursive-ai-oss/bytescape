@@ -119,27 +119,37 @@ impl DriveBlocks {
         }
     }
 
-    /// The words a block can wear, from the fullest to the shortest. A narrow
-    /// block takes the first that fits: the name is shortened or dropped
-    /// first, then the size loses its tenth, and the number itself is never
-    /// cut.
+    /// The shorter wording of a block: a short name and the size. The drawing
+    /// takes the full wording when it fits, this when it does not, then the
+    /// size alone, then the size as a whole number; it measures the real
+    /// text, so a name is never cut in the middle.
+    pub fn short_label(&self, special: Special) -> String {
+        let size = format_size(self.bytes(special));
+        let name = match special {
+            Special::Free => "Free",
+            Special::Unreadable if self.unreadable_as == UnreadableAs::Overhead => "Overhead",
+            Special::Unreadable => "Couldn't read",
+            Special::Reserved if self.quota => "Quota",
+            Special::Reserved => "Reserved",
+            Special::RecycleBin => match BinName::platform() {
+                BinName::RecycleBin => "Bin",
+                _ => "Trash",
+            },
+        };
+        format!("{name} \u{b7} {size}")
+    }
+
+    /// The words a block can wear, from the fullest to the shortest: the
+    /// full wording, a short name with the size (and with the size as a whole
+    /// number), the size, the size as a whole number. The number itself is
+    /// never cut.
     pub fn label_variants(&self, special: Special) -> Vec<String> {
         let size = format_size(self.bytes(special));
+        let short = self.short_label(special);
+        let mut out = vec![self.label(special), short.clone()];
         let whole = whole_size(&size);
-        let mut out = vec![self.label(special)];
-        match special {
-            Special::Free => {}
-            Special::Unreadable => {
-                let name = if self.unreadable_as == UnreadableAs::Overhead {
-                    "Filesystem overhead"
-                } else {
-                    "Couldn't read"
-                };
-                out.push(format!("{name}: {size}"));
-            }
-            Special::Reserved if self.quota => out.push(format!("Quota · {size}")),
-            Special::Reserved => out.push(format!("Reserved · {size}")),
-            Special::RecycleBin => {}
+        if whole != size {
+            out.push(short.replace(&size, &whole));
         }
         out.push(size);
         out.push(whole);
@@ -196,24 +206,10 @@ impl DriveBlocks {
         })
     }
 
-    /// The fullest wording of a block that fits `width` device pixels, judged
-    /// by a generous width per character (the real font is not at hand here).
-    /// When nothing fits, the shortest: the number alone.
-    fn fitted_label(&self, special: Special, width: f32, metrics: Metrics) -> String {
-        let room = width - 2.0 * (4.0 * metrics.scale).round();
-        let variants = self.label_variants(special);
-        variants
-            .iter()
-            .find(|v| v.chars().count() as f32 * metrics.em * 0.62 <= room)
-            .or(variants.last())
-            .cloned()
-            .unwrap_or_default()
-    }
-
     /// Splits `area` between the drive's folders (`folders_bytes` counted)
     /// and the blocks. Returns the part for the folders and the block boxes.
     /// With no blocks the folders keep the whole area.
-    pub fn place(&self, folders_bytes: u64, area: Rect, metrics: Metrics) -> (Rect, Vec<Item>) {
+    pub fn place(&self, folders_bytes: u64, area: Rect, _metrics: Metrics) -> (Rect, Vec<Item>) {
         let entries = self.entries();
         if entries.is_empty() {
             return (area, Vec::new());
@@ -236,8 +232,10 @@ impl DriveBlocks {
                 },
                 depth: 0,
                 label: Some(Box::new(ItemLabel {
-                    name: self.fitted_label(special, rects[k + 1].w, metrics).into(),
-                    size: "".into(),
+                    // The drawing chooses between these two and then the size
+                    // alone, by the width of the real text.
+                    name: self.label(special).into(),
+                    size: self.short_label(special).into(),
                 })),
                 id: Self::id(special),
                 category: 0,
@@ -415,16 +413,21 @@ mod tests {
             reserved: 18_000_000_000,
             ..DriveBlocks::default()
         };
-        // The fullest wording first, the number alone last.
+        // The fullest wording first, then a short name with the size, then
+        // the size, then its whole number.
         let bin = b.label_variants(Special::RecycleBin);
-        assert_eq!(bin.last().map(String::as_str), Some("14 GB"));
-        assert!(bin.contains(&"14.1 GB".to_string()), "{bin:?}");
+        let name = BinName::platform().as_str();
+        let short = if name == "Trash" { "Trash" } else { "Bin" };
+        assert_eq!(bin[0], format!("{name} \u{b7} 14.1 GB"));
+        assert!(bin.contains(&format!("{short} \u{b7} 14 GB")), "{bin:?}");
+        assert_eq!(&bin[bin.len() - 2..], ["14.1 GB", "14 GB"], "{bin:?}");
         let unreadable = b.label_variants(Special::Unreadable);
         assert!(unreadable[0].contains("Grant access"));
-        assert!(unreadable.contains(&"Couldn't read: 23.4 GB".to_string()));
+        assert_eq!(unreadable[1], "Couldn't read \u{b7} 23.4 GB");
         let reserved = b.label_variants(Special::Reserved);
-        assert!(reserved.contains(&"Reserved \u{b7} 18.0 GB".to_string()));
-        // Every wording of every block carries its number.
+        assert_eq!(reserved[1], "Reserved \u{b7} 18.0 GB");
+        // Every wording of every block carries its number, none is cut, and
+        // none uses the words the wording lint bans.
         for (special, number) in [
             (Special::Free, "112"),
             (Special::Unreadable, "23"),
@@ -433,36 +436,22 @@ mod tests {
         ] {
             for v in b.label_variants(special) {
                 assert!(v.contains(number), "{v}");
+                assert!(!v.contains('\u{2026}'), "{v}");
+                let lower = v.to_lowercase();
+                for banned in ["safe", "junk", "reclaim", "clean up", "freed"] {
+                    assert!(!lower.contains(banned), "{v}");
+                }
             }
         }
-        // A narrower and narrower bin block never shows "Trash\u{2026} GB".
-        let mut seen = std::collections::BTreeSet::new();
-        for w in [400.0, 160.0, 110.0, 90.0, 60.0] {
-            let text = b.fitted_label(Special::RecycleBin, w, METRICS);
-            assert!(text.contains("14"), "{w}: {text}");
-            assert!(!text.contains('\u{2026}'), "{w}: {text}");
-            seen.insert(text);
-        }
-        assert!(
-            seen.len() >= 3,
-            "the wording changes with the width: {seen:?}"
-        );
-        assert!(seen.contains("14 GB"), "{seen:?}");
-        // Placed in a real layout, the label is the fitted one.
+        // Placed in a real layout, a block carries the full wording and the
+        // short one; the drawing picks by the width of the real text.
         let (_, items) = b.place(380_000_000_000, Rect::new(0.0, 0.0, 600.0, 400.0), METRICS);
+        assert_eq!(items.len(), 4);
         for item in items {
-            let name = item
-                .label
-                .as_ref()
-                .map(|l| l.name.to_string())
-                .unwrap_or_default();
-            assert!(!name.is_empty());
-            assert!(
-                name.chars().count() as f32 * METRICS.em * 0.62 <= item.rect.w - 8.0
-                    || !name.contains(' '),
-                "{name} in {}",
-                item.rect.w
-            );
+            let label = item.label.as_ref().expect("a label");
+            let special = DriveBlocks::special_of(item.id).expect("a block");
+            assert_eq!(&*label.name, b.label(special));
+            assert_eq!(&*label.size, b.short_label(special));
         }
     }
 }

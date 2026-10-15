@@ -1256,3 +1256,49 @@ fn a_size_that_is_both_a_lower_bound_and_an_estimate_says_both() {
     let root = l.items()[0].label.as_ref().unwrap().size.to_string();
     assert!(root.starts_with("≥ ≈ "), "{root}");
 }
+
+/// root / d1 / d2 / file: `d2` is offered both by the root's layout (nested)
+/// and by `d1`'s own.
+fn nested_dirs() -> Spec {
+    let mut s = Spec::new();
+    let d1 = s.dir(0);
+    let d2 = s.dir(d1);
+    s.file(d2, 1 << 20);
+    s
+}
+
+#[test]
+fn a_view_offered_by_two_parents_survives_one_of_them_letting_it_go() {
+    let snap = build(&nested_dirs());
+    let m = m13(1.0);
+    let mut table = ViewTable::new();
+    let root = table.root(folder(0));
+    // The user enters d1; its layout offers d2 first.
+    let d1 = table.child(root, folder(1));
+    let inside = layout(&snap, &folder(1), BIG, m);
+    let from_d1 = table.register(d1, &inside);
+    let d2 = from_d1
+        .iter()
+        .find(|(_, v)| table.target(*v) == Some(&folder(2)))
+        .expect("d1 offers d2")
+        .1;
+    // Back at the top, the root's layout offers d2 too (nested), and that is
+    // the box the user can double-click.
+    let top = layout(&snap, &folder(0), BIG, m);
+    let from_root = table.register(root, &top);
+    let again = from_root
+        .iter()
+        .find(|(_, v)| table.target(*v) == Some(&folder(2)))
+        .expect("the root offers d2")
+        .1;
+    assert_eq!(again, d2, "one view per target");
+    // d1's layout changes and no longer offers d2 (a window too small).
+    let tiny = layout(&snap, &folder(1), Rect::new(0.0, 0.0, 10.0, 10.0), m);
+    assert!(tiny.enterable().is_empty());
+    table.register(d1, &tiny);
+    // The root still offers d2, so the box on screen still has a view, and
+    // going up from it leads to a parent that still offers it.
+    assert_eq!(table.target(d2), Some(&folder(2)), "the root's box is live");
+    assert_eq!(table.enter(d2), Some(folder(2)));
+    assert_eq!(table.parent(d2), Some(root));
+}
