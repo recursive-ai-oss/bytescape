@@ -33,3 +33,39 @@ pub(crate) fn read_dword(subkey: &str, value: &str) -> Option<u32> {
     };
     (status == ERROR_SUCCESS).then_some(data)
 }
+
+/// Writes a `REG_DWORD` under `HKEY_CURRENT_USER`.
+#[cfg(test)]
+pub(crate) fn write_dword(subkey: &str, value: &str, data: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::System::Registry::{REG_DWORD, RegSetKeyValueW};
+    let subkey = wide(subkey);
+    let value = wide(value);
+    // SAFETY: `subkey` and `value` are NUL-terminated UTF-16 strings that
+    // outlive the call, and the data is four readable bytes.
+    let status = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            REG_DWORD,
+            std::ptr::addr_of!(data).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(status as i32))
+    }
+}
+
+/// Removes a value under `HKEY_CURRENT_USER`; a value that is not there is
+/// not an error.
+#[cfg(test)]
+pub(crate) fn delete_value(subkey: &str, value: &str) {
+    use windows_sys::Win32::System::Registry::RegDeleteKeyValueW;
+    let subkey = wide(subkey);
+    let value = wide(value);
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, subkey.as_ptr(), value.as_ptr()) };
+}

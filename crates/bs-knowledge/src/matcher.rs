@@ -250,6 +250,23 @@ pub(crate) fn match_anchored(c: &Compiled, path: &[&[u8]], ignore_drive: bool) -
     Some(wanted)
 }
 
+/// Whether an anchored pattern names a place at or below the folder whose
+/// parts are `path`: the folder's parts are the pattern's first parts.
+/// `ignore_drive` is set for paths on an unnamed drive.
+pub(crate) fn lies_below(c: &Compiled, path: &[&[u8]], ignore_drive: bool) -> bool {
+    if c.floating || path.len() > c.parts.len() {
+        return false;
+    }
+    let fold = c.fold();
+    c.parts
+        .iter()
+        .zip(path)
+        .enumerate()
+        .all(|(index, (part, text))| {
+            (index == 0 && ignore_drive && c.starts_with_drive) || part_matches(part, text, fold)
+        })
+}
+
 /// Matches a floating pattern: its parts in a row, anywhere in the path (for
 /// an exact pattern, at the end). `complete` is false when `path` is only the
 /// start of a longer path, in which case an end cannot be matched.

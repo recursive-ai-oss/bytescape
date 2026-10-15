@@ -59,13 +59,13 @@ use std::thread;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 #[cfg(target_os = "linux")]
-mod walk;
+pub(crate) mod walk;
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 #[cfg(any(windows, test))]
-mod winpure;
+pub(crate) mod winpure;
 
 /// What the system calls its bin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

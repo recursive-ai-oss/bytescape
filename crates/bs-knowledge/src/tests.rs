@@ -2033,3 +2033,69 @@ proptest! {
         prop_assert_eq!(full().place_bytes(path.as_bytes()), expected, "{}", path);
     }
 }
+
+#[test]
+fn a_folder_that_holds_a_blocked_place_is_found() {
+    let k = linux_full();
+    let name = |path: &str| k.blocked_below(Path::new(path)).map(|e| e.pattern);
+    // The package database folders sit inside `/var` and `/var/lib`, which are
+    // only protected.
+    assert_eq!(name("/var"), Some("/var/lib/dpkg"));
+    assert_eq!(name("/var/lib"), Some("/var/lib/dpkg"));
+    // The blocked place itself counts.
+    assert_eq!(name("/var/lib/dpkg"), Some("/var/lib/dpkg"));
+    assert_eq!(name("/etc"), Some("/etc"));
+    // `/mnt` holds the Windows drives that WSL mounts.
+    assert!(name("/mnt").is_some());
+    // Ordinary folders hold nothing blocked.
+    for path in [
+        "/home/alice",
+        "/home/alice/projects",
+        "/var/log",
+        "/var/cache",
+        "/var/lib/docker",
+        "/opt",
+        "/opt/tool",
+        "/mnt/data",
+        "/tmp",
+    ] {
+        assert_eq!(name(path), None, "{path}");
+    }
+    // Same-looking names are not the same place.
+    assert_eq!(name("/var/lib/dpkgx"), None);
+    assert_eq!(name("/var/lib2"), None);
+    // Spellings of a path give the answer of the place they name.
+    assert_eq!(name("//var"), Some("/var/lib/dpkg"));
+    assert_eq!(name("/var/./lib"), Some("/var/lib/dpkg"));
+}
+
+#[test]
+fn a_windows_folder_that_holds_a_blocked_place_is_found() {
+    let k = full();
+    let name = |path: &str| k.blocked_below(Path::new(path)).map(|e| e.pattern);
+    // A drive root holds the Windows folder.
+    assert!(name(r"C:\").is_some());
+    assert!(name(r"c:/").is_some());
+    assert!(name(r"C:\Windows").is_some());
+    assert!(name(r"C:\Program Files").is_some());
+    // Ordinary folders on the same drive hold nothing blocked.
+    for path in [
+        r"C:\Users",
+        r"C:\Users\alice",
+        r"C:\Users\alice\Documents",
+        r"C:\ProgramData",
+        r"D:\Data",
+        r"C:\Windows.old",
+    ] {
+        assert_eq!(name(path), None, "{path}");
+    }
+}
+
+#[test]
+fn the_roots_of_other_drives_do_not_make_a_folder_blocked_below() {
+    let k = roots();
+    // `/mnt/data` is a listed drive root. A folder that holds it is not made
+    // blocked by that: a delete does not cross into another mount.
+    assert!(k.blocked_below(Path::new("/mnt/data")).is_none());
+    assert!(k.blocked_below(Path::new("/media/alice")).is_none());
+}

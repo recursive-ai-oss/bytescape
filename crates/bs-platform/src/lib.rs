@@ -5,6 +5,7 @@
 
 pub mod appearance;
 pub mod bins;
+pub mod delete;
 pub mod drives;
 
 #[cfg(windows)]

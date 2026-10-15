@@ -19,7 +19,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use windows_sys::Win32::UI::Shell::{SHQUERYRBINFO, SHQueryRecycleBinW};
 
 /// The text form of the current user's security identifier.
-fn user_sid() -> Option<&'static str> {
+pub(crate) fn user_sid() -> Option<&'static str> {
     static SID: OnceLock<Option<String>> = OnceLock::new();
     SID.get_or_init(read_user_sid).as_deref()
 }
@@ -111,7 +111,7 @@ pub(crate) fn locate_drive(drive: &Drive) -> Vec<BinLocation> {
 
 /// Asks the system for the size and item count of the bin on a drive. The
 /// error is the HRESULT.
-fn query(root: &Path) -> Result<(u64, u64), i32> {
+pub(crate) fn query(root: &Path) -> Result<(u64, u64), i32> {
     let root = wide(root.as_os_str());
     let mut info = SHQUERYRBINFO {
         cbSize: std::mem::size_of::<SHQUERYRBINFO>() as u32,
@@ -129,7 +129,7 @@ fn query(root: &Path) -> Result<(u64, u64), i32> {
     Ok(winpure::query_figures(size, items))
 }
 
-fn policy(drive: &Drive) -> super::BinPolicy {
+pub(crate) fn policy(drive: &Drive) -> super::BinPolicy {
     let Some(guid) = winpure::volume_guid(drive.id.as_str()) else {
         return super::BinPolicy::default();
     };

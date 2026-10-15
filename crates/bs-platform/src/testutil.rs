@@ -12,11 +12,18 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 /// directory and named like a fixture, so a bug here cannot reach real data.
 pub(crate) struct Fixture {
     root: PathBuf,
+    /// The folder the fixture was made in; removal is refused outside it.
+    base: PathBuf,
 }
 
 impl Fixture {
     pub fn new(label: &str) -> Self {
-        let base = std::env::temp_dir();
+        Self::new_in(&std::env::temp_dir(), label)
+    }
+
+    /// A fixture inside another folder, for tests that need a second
+    /// filesystem (such as `/dev/shm`).
+    pub fn new_in(base: &Path, label: &str) -> Self {
         let name = format!(
             "bs-platform-{label}-{}-{}",
             std::process::id(),
@@ -26,7 +33,8 @@ impl Fixture {
         fs::create_dir_all(&root).expect("create fixture root");
         // Work with the canonical path so comparisons against resolved paths hold.
         let root = fs::canonicalize(&root).expect("canonicalize fixture root");
-        Self { root }
+        let base = fs::canonicalize(base).expect("canonicalize fixture base");
+        Self { root, base }
     }
 
     pub fn path(&self) -> &Path {
@@ -63,14 +71,13 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let temp = std::env::temp_dir();
-        let temp = fs::canonicalize(&temp).unwrap_or(temp);
+        let temp = &self.base;
         let named_like_fixture = self
             .root
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("bs-platform-"));
-        if self.root.starts_with(&temp) && named_like_fixture {
+        if self.root.starts_with(temp) && named_like_fixture {
             let _ = fs::remove_dir_all(&self.root);
         }
     }

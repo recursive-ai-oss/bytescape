@@ -346,6 +346,10 @@ pub enum Reason {
     /// device, or has a `..` that the text cannot settle, so there is no way
     /// to say what it is.
     Unresolvable,
+    /// The path is not blocked itself, but a blocked place lies inside it, so
+    /// removing it would remove that place too. [`Verdict::entry`] is `None`:
+    /// the entry that matched describes the inner place, not this path.
+    HoldsBlocked,
 }
 
 /// The answer to "may this path be deleted".
@@ -799,6 +803,43 @@ impl Knowledge {
                 found.add_entry(entry, matched, reading);
             }
         }
+    }
+
+    /// A blocked place that is the folder itself or lies inside it, if there
+    /// is one.
+    ///
+    /// [`Knowledge::protection`] looks at a path and what contains it. A folder
+    /// that is only protected can still hold something that is blocked: `/var`
+    /// holds the package databases under `/var/lib`, and a drive root holds the
+    /// system folders. Deleting such a folder would delete the blocked place
+    /// with it, so code that deletes a whole folder asks this too and treats a
+    /// hit as blocked.
+    ///
+    /// The path is read like [`Knowledge::protection`] reads it, with the same
+    /// limits. The roots of other drives given to
+    /// [`Environment::with_drive_roots`] are not counted, because a delete
+    /// does not cross into another mount.
+    pub fn blocked_below(&self, path: &Path) -> Option<&'static ProtectedEntry> {
+        self.blocked_below_bytes(path.as_os_str().as_encoded_bytes())
+    }
+
+    /// [`Knowledge::blocked_below`] for a path held as bytes.
+    pub fn blocked_below_bytes(&self, path: &[u8]) -> Option<&'static ProtectedEntry> {
+        for reading in self.readings(path) {
+            let Ok(norm) = reading else { continue };
+            let parts: Vec<&[u8]> = norm.parts().collect();
+            let ignore_drive = norm.root == Root::AnyDrive;
+            for (compiled, entry) in &self.protected {
+                if entry.level == Level::Blocked
+                    && !std::ptr::eq(*entry, &DRIVE_ROOT)
+                    && compiled.flavor == norm.flavor
+                    && matcher::lies_below(compiled, &parts, ignore_drive)
+                {
+                    return Some(entry);
+                }
+            }
+        }
+        None
     }
 
     /// The strictest level among several paths, as for a multi-selection. An

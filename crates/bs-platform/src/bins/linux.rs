@@ -70,7 +70,7 @@ impl Located {
         }
     }
 
-    fn open(&self) -> io::Result<std::os::fd::OwnedFd> {
+    pub(crate) fn open(&self) -> io::Result<std::os::fd::OwnedFd> {
         let mut fd = open_dir(&self.top)?;
         for step in &self.steps {
             fd = open_dir_at(fd.as_raw_fd(), step)?;
@@ -223,7 +223,7 @@ pub(crate) fn plan(env: &Env, topdirs: &[PathBuf]) -> Plan {
 
 /// The mount points a drive's Trash can be at: every mount that is not just a
 /// second view of another.
-fn topdirs(drive: &Drive) -> Vec<PathBuf> {
+pub(crate) fn topdirs(drive: &Drive) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = drive
         .mounts
         .iter()
