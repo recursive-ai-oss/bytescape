@@ -22,7 +22,8 @@ use std::any::Any;
 
 use super::{Shell, ShellEffect};
 use crate::action::{Action, reason};
-use crate::card::Metrics;
+use crate::card::{self, Metrics};
+use crate::notice::{CrashNotice, RELEASES_URL};
 use crate::popup::{self, Button, DialogSpec, DialogState, MenuRow, ToastSpec};
 use crate::{Direction, InputEvent, Key, Target, ViewId, ViewSource};
 
@@ -244,6 +245,8 @@ pub struct BinDrive {
 /// A dialog or menu, for the accessibility tree.
 pub(super) struct PopupSummary {
     pub menu: bool,
+    /// What a screen reader calls the dialog.
+    pub name: String,
     pub text: String,
     pub rect: Rect,
     /// Label, reason or instruction, whether it works, whether it needs a
@@ -410,6 +413,21 @@ enum Confirm {
         targets: Vec<Target>,
     },
     Empty,
+    /// The About box.
+    About,
+    /// The crash report viewer.
+    Report(ReportView),
+}
+
+/// What the crash report viewer shows now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ReportView {
+    notice: CrashNotice,
+    show_paths: bool,
+    /// The first report line on screen.
+    offset: usize,
+    /// How many report lines fit.
+    rows: usize,
 }
 
 struct DialogUi {
@@ -453,6 +471,11 @@ pub(super) struct ActionsUi {
     menu_seq: u64,
     /// The toast's Undo button has keyboard focus.
     pub(super) toast_focus: bool,
+    /// The desktop can open software-center entries.
+    pub(super) software_center: bool,
+    /// The menu check that waits for the one running to finish: the newest
+    /// request replaces an older one that never started.
+    menu_waiting: Option<(Vec<DItem>, u64)>,
 }
 
 fn size_text(bytes: u64, lower: bool, estimated: bool) -> String {
@@ -485,6 +508,12 @@ impl<S: ViewSource> Shell<S> {
     /// Tells the menus what the system can do.
     pub fn set_capabilities(&mut self, caps: Capabilities) {
         self.acts.caps = caps;
+    }
+
+    /// Tells the cards whether the desktop has a software center, so the
+    /// button that opens one is offered or says why not.
+    pub fn set_software_center(&mut self, available: bool) {
+        self.acts.software_center = available;
     }
 
     /// Names the bin as the system does (tests pick either).
@@ -593,8 +622,13 @@ impl<S: ViewSource> Shell<S> {
                         _ => None,
                     })
                     .collect();
+                let name = match d.confirm {
+                    Confirm::About | Confirm::Report(_) => d.spec.title.clone(),
+                    _ => "Confirm".to_string(),
+                };
                 Some(PopupSummary {
                     menu: false,
+                    name,
                     text: self.dialog_text().unwrap_or_default(),
                     rect: d.built.popup.card.rect,
                     controls,
@@ -630,6 +664,7 @@ impl<S: ViewSource> Shell<S> {
                     .collect();
                 Some(PopupSummary {
                     menu: true,
+                    name: "Actions".to_string(),
                     text: String::new(),
                     rect: m.built.popup.card.rect,
                     controls,
@@ -731,6 +766,8 @@ impl<S: ViewSource> Shell<S> {
     }
 
     fn show_toast(&mut self, lines: Vec<(String, CardRole)>, undo: bool, now: Duration) {
+        // A new toast starts without the keyboard on its button.
+        self.acts.toast_focus = false;
         self.acts.toast = Some(ToastUi {
             spec: ToastSpec {
                 lines,
@@ -745,6 +782,8 @@ impl<S: ViewSource> Shell<S> {
     }
 
     fn close_toast(&mut self, now: Duration) {
+        // A toast on its way out has no button for the keyboard to be on.
+        self.acts.toast_focus = false;
         if self.reduced_motion {
             self.acts.toast = None;
         } else if let Some(t) = self.acts.toast.as_mut() {
@@ -1040,6 +1079,7 @@ impl<S: ViewSource> Shell<S> {
             title,
             lines,
             pinned,
+            rows: 0,
             buttons: vec![
                 Button {
                     label: confirm,
@@ -1146,14 +1186,29 @@ impl<S: ViewSource> Shell<S> {
                 if scene != self.acts.scene {
                     // The map was replaced while the question was open; the
                     // boxes it was about are no longer on screen.
-                    self.say("Delete: the view changed, so nothing was deleted", now);
+                    let label = if permanent {
+                        Action::DeletePermanently.label()
+                    } else {
+                        Action::Delete.label()
+                    };
+                    self.say(
+                        format!("{label}: the view changed, so nothing was deleted"),
+                        now,
+                    );
                     return Vec::new();
                 }
                 self.delete_checked(&plan, permanent, items, targets, now)
             }
             (Pending::Menu(seq), Done::CheckMenu(plans)) => {
                 self.menu_checked(seq, *plans);
-                Vec::new()
+                // Only one question about a menu runs at a time; the newest
+                // one that waited goes next, if its menu is still open.
+                match self.acts.menu_waiting.take() {
+                    Some((items, waiting)) if self.menu_is_open(waiting) => {
+                        self.start_menu_check(items, waiting)
+                    }
+                    _ => Vec::new(),
+                }
             }
             _ => Vec::new(),
         }
@@ -1440,6 +1495,7 @@ impl<S: ViewSource> Shell<S> {
                 CardRole::Secondary,
             )],
             pinned: Vec::new(),
+            rows: 0,
             buttons: vec![
                 Button {
                     label: action,
@@ -1539,6 +1595,11 @@ impl<S: ViewSource> Shell<S> {
     // ---- dialogs ----------------------------------------------------------------
 
     fn open_dialog(&mut self, confirm: Confirm, spec: DialogSpec) {
+        self.open_dialog_at(confirm, spec, 1);
+    }
+
+    /// Opens a dialog with the keyboard on button `focus`.
+    fn open_dialog_at(&mut self, confirm: Confirm, spec: DialogSpec, focus: usize) {
         self.hide_card();
         self.card.rest = None;
         let built = popup::dialog(
@@ -1546,14 +1607,14 @@ impl<S: ViewSource> Shell<S> {
             self.window_rect(),
             self.metrics(),
             DialogState {
-                focus: 1,
+                focus,
                 progress: 0.0,
             },
         );
         self.acts.modal = Some(Modal::Dialog(Box::new(DialogUi {
             confirm,
             spec,
-            focus: 1,
+            focus,
             hold_since: None,
             built,
         })));
@@ -1613,6 +1674,7 @@ impl<S: ViewSource> Shell<S> {
             return Vec::new();
         };
         match d.confirm {
+            Confirm::About | Confirm::Report(_) => Vec::new(),
             Confirm::Empty => {
                 let Some(drive) = self.acts.bin_drive.clone() else {
                     return Vec::new();
@@ -1661,6 +1723,11 @@ impl<S: ViewSource> Shell<S> {
             }
             InputEvent::Click { x, y } | InputEvent::ClickWith { x, y, .. } => {
                 self.modal_click(x, y, now)
+            }
+            InputEvent::Wheel { steps, .. } | InputEvent::Touchpad { steps, .. } => {
+                // The crash report scrolls; everything else ignores the wheel.
+                self.scroll_report(-(steps * 3.0).round() as i64);
+                Vec::new()
             }
             InputEvent::RightClick { .. } => {
                 // A second menu replaces the first; a dialog ignores it.
@@ -1742,6 +1809,11 @@ impl<S: ViewSource> Shell<S> {
         let Some(b) = d.spec.buttons.get(button) else {
             return Vec::new();
         };
+        match d.confirm {
+            Confirm::About => return self.about_press(button),
+            Confirm::Report(_) => return self.report_press(button),
+            _ => {}
+        }
         if b.hold {
             // Only holding confirms; a click or a press does not.
             return Vec::new();
@@ -1758,6 +1830,28 @@ impl<S: ViewSource> Shell<S> {
         match self.acts.modal.as_mut() {
             Some(Modal::Dialog(d)) => {
                 let n = d.spec.buttons.len().max(1);
+                if matches!(d.confirm, Confirm::Report(_)) {
+                    // Up and Down move through the report; Left, Right and
+                    // Tab move between the buttons.
+                    match key {
+                        Key::Arrow(Direction::Up) => {
+                            self.scroll_report(-1);
+                            return Vec::new();
+                        }
+                        Key::Arrow(Direction::Down) => {
+                            self.scroll_report(1);
+                            return Vec::new();
+                        }
+                        Key::Home => {
+                            self.scroll_report(i64::MIN / 2);
+                            return Vec::new();
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(Modal::Dialog(d)) = self.acts.modal.as_mut() else {
+                    return Vec::new();
+                };
                 match key {
                     Key::Escape => {
                         self.close_modal();
@@ -1909,6 +2003,8 @@ impl<S: ViewSource> Shell<S> {
                     | Action::ZoomInto
                     | Action::Rescan
                     | Action::Handoff(_)
+                    | Action::OpenInSoftware
+                    | Action::CopyRemovalCommand
             )
         {
             return Some(SELECT_ONE.to_string());
@@ -1928,9 +2024,11 @@ impl<S: ViewSource> Shell<S> {
         ids: &[u32],
         checked: Option<&(Plan, Plan)>,
     ) -> Vec<RowModel> {
-        let handoff = (ids.len() == 1)
-            .then(|| self.app.as_ref()?.source().card(view, ids[0])?.handoff)
-            .flatten();
+        let handoffs = (ids.len() == 1)
+            .then(|| self.card_data(view, ids[0], false))
+            .flatten()
+            .map(|d| card::handoff_actions(&d))
+            .unwrap_or_default();
         let mut spec: Vec<(Option<Action>, &str)> = vec![
             (Some(Action::Open), "Enter"),
             (Some(Action::ShowInFileManager), ""),
@@ -1943,9 +2041,11 @@ impl<S: ViewSource> Shell<S> {
         spec.push((None, ""));
         spec.push((Some(Action::ZoomInto), "Enter"));
         spec.push((Some(Action::Rescan), "Shift+F5"));
-        if let Some(h) = handoff {
+        if !handoffs.is_empty() {
             spec.push((None, ""));
-            spec.push((Some(Action::Handoff(h)), ""));
+            for h in handoffs {
+                spec.push((Some(h), ""));
+            }
         }
         spec.push((None, ""));
         spec.push((Some(Action::Delete), "Del"));
@@ -2020,6 +2120,27 @@ impl<S: ViewSource> Shell<S> {
             return Vec::new();
         };
         let items = self.items_for(&targets);
+        self.start_menu_check(items, seq)
+    }
+
+    /// Whether the menu with this number is the one open now.
+    fn menu_is_open(&self, seq: u64) -> bool {
+        matches!(&self.acts.modal, Some(Modal::Menu(m)) if m.seq == seq)
+    }
+
+    /// Asks the platform about the delete rows of menu `seq`. At most one such
+    /// question runs at a time, because on some systems each one walks the
+    /// folder; a newer one replaces any older one that is still waiting.
+    fn start_menu_check(&mut self, items: Vec<DItem>, seq: u64) -> Vec<ShellEffect> {
+        let running = self
+            .acts
+            .pending
+            .values()
+            .any(|s| matches!(s.what, Pending::Menu(_)));
+        if running {
+            self.acts.menu_waiting = Some((items, seq));
+            return Vec::new();
+        }
         self.dispatch(Work::CheckMenu { items }, Pending::Menu(seq))
     }
 
@@ -2051,19 +2172,62 @@ impl<S: ViewSource> Shell<S> {
             });
         match at {
             Some(at) => self.open_menu(at, now),
-            None => Vec::new(),
+            None => {
+                // Nothing is selected: the menu of the program itself.
+                let map = self.map_rect();
+                self.open_app_menu((map.x + 8.0 * self.scale, map.y + 8.0 * self.scale))
+            }
         }
     }
 
-    /// A right click on the map.
+    /// The menu of the program itself, for a click on nothing in particular:
+    /// the About box and the releases page.
+    pub(super) fn open_app_menu(&mut self, at: (f32, f32)) -> Vec<ShellEffect> {
+        self.hide_card();
+        self.card.rest = None;
+        let entries: [(Action, &str); 2] = [(Action::About, "F1"), (Action::CheckForUpdates, "")];
+        let rows: Vec<RowModel> = entries
+            .iter()
+            .map(|(a, hint)| RowModel {
+                row: MenuRow {
+                    label: a.label().to_string(),
+                    hint: (*hint).to_string(),
+                    enabled: true,
+                    separator: false,
+                },
+                action: Some(*a),
+            })
+            .collect();
+        let plain: Vec<MenuRow> = rows.iter().map(|r| r.row.clone()).collect();
+        let built = popup::menu(&plain, at, self.map_rect(), self.metrics(), Some(0));
+        self.acts.menu_seq += 1;
+        let seq = self.acts.menu_seq;
+        self.acts.modal = Some(Modal::Menu(MenuUi {
+            seq,
+            rows,
+            view: 0,
+            ids: Vec::new(),
+            at,
+            hot: Some(0),
+            built,
+        }));
+        Vec::new()
+    }
+
+    /// A right click on the map or the chrome.
     pub(super) fn right_click(&mut self, x: f32, y: f32, now: Duration) -> Vec<ShellEffect> {
         let over_map = !self.geometry().in_chrome(x, y);
-        let Some(id) = self.app.as_ref().and_then(|a| a.item_at(x, y)) else {
-            return Vec::new();
-        };
-        if !over_map || self.over_card(x, y) {
+        if self.over_card(x, y) {
             return Vec::new();
         }
+        let item = if over_map {
+            self.app.as_ref().and_then(|a| a.item_at(x, y))
+        } else {
+            None
+        };
+        let Some(id) = item else {
+            return self.open_app_menu((x, y));
+        };
         let mut fx = Vec::new();
         let selected = self
             .app
@@ -2104,6 +2268,213 @@ impl<S: ViewSource> Shell<S> {
         } else {
             Vec::new()
         }
+    }
+}
+
+// ---- About and the crash report ------------------------------------------------
+
+impl<S: ViewSource> Shell<S> {
+    /// Tells the About box what this build is.
+    pub fn set_about(&mut self, about: crate::notice::AboutInfo) {
+        self.about = about;
+    }
+
+    /// Replaces the clock the About box reads the date from (Unix seconds).
+    pub fn set_unix_clock(&mut self, clock: Box<dyn Fn() -> i64>) {
+        self.unix_clock = clock;
+    }
+
+    /// Opens the About box: the version and build date, how old the build is
+    /// when it is old, and the two links.
+    pub(super) fn open_about(&mut self) -> Vec<ShellEffect> {
+        let now = (self.unix_clock)();
+        let about = self.about.clone();
+        let mut lines: Vec<(String, CardRole)> = vec![(about.version_line(), CardRole::Normal)];
+        if !about.target.is_empty() {
+            lines.push((about.target.clone(), CardRole::Secondary));
+        }
+        if let Some(age) = about.age_line(now) {
+            lines.push((age, CardRole::Normal));
+        }
+        lines.push((
+            "Bytescape never connects to the internet. Links open in your browser.".into(),
+            CardRole::Secondary,
+        ));
+        lines.push((
+            "© Recursive AI, LLC · MIT OR Apache-2.0".into(),
+            CardRole::Secondary,
+        ));
+        let spec = DialogSpec {
+            lead: None,
+            title: "About Bytescape".into(),
+            lines,
+            pinned: Vec::new(),
+            rows: 0,
+            buttons: vec![
+                Button {
+                    label: crate::chrome::LINK_TEXT.into(),
+                    hold: false,
+                },
+                Button {
+                    label: Action::CheckForUpdates.label().into(),
+                    hold: false,
+                },
+                Button {
+                    label: "Close".into(),
+                    hold: false,
+                },
+            ],
+        };
+        self.open_dialog_at(Confirm::About, spec, 2);
+        Vec::new()
+    }
+
+    pub(super) fn about_press(&mut self, button: usize) -> Vec<ShellEffect> {
+        match button {
+            0 => vec![ShellEffect::OpenLink(crate::chrome::LINK_URL)],
+            1 => vec![ShellEffect::OpenLink(RELEASES_URL)],
+            _ => {
+                self.close_modal();
+                Vec::new()
+            }
+        }
+    }
+
+    /// Opens the crash report with paths hidden.
+    pub(super) fn open_report(&mut self) {
+        let Some(notice) = self.crash.as_ref().map(|c| c.notice.clone()) else {
+            return;
+        };
+        let line_h = (self.font_px * self.scale * 1.5).round().max(1.0);
+        let rows = ((self.height as f32 * 0.5) / line_h)
+            .floor()
+            .clamp(6.0, 40.0) as usize;
+        let view = ReportView {
+            notice,
+            show_paths: false,
+            offset: 0,
+            rows,
+        };
+        let spec = report_spec(&view);
+        self.open_dialog_at(Confirm::Report(view), spec, 2);
+    }
+
+    pub(super) fn report_press(&mut self, button: usize) -> Vec<ShellEffect> {
+        let Some(Modal::Dialog(d)) = self.acts.modal.as_mut() else {
+            return Vec::new();
+        };
+        let Confirm::Report(view) = &mut d.confirm else {
+            return Vec::new();
+        };
+        match button {
+            0 => {
+                view.show_paths = !view.show_paths;
+                view.offset = 0;
+                d.spec = report_spec(view);
+                Vec::new()
+            }
+            1 => vec![ShellEffect::OpenUrl(view.notice.issue_url().to_string())],
+            _ => {
+                self.close_modal();
+                Vec::new()
+            }
+        }
+    }
+
+    /// Moves the crash report up or down by `by` lines.
+    fn scroll_report(&mut self, by: i64) {
+        let Some(Modal::Dialog(d)) = self.acts.modal.as_mut() else {
+            return;
+        };
+        let Confirm::Report(view) = &mut d.confirm else {
+            return;
+        };
+        let total = view.notice.lines(view.show_paths).len();
+        let last = total.saturating_sub(view.rows) as i64;
+        let to = (view.offset as i64).saturating_add(by).clamp(0, last);
+        let to = to as usize;
+        if to != view.offset {
+            view.offset = to;
+            d.spec = report_spec(view);
+        }
+    }
+
+    /// The words of the open crash report viewer, as one text (for tests).
+    pub fn report_text(&self) -> Option<String> {
+        match self.acts.modal.as_ref()? {
+            Modal::Dialog(d) if matches!(d.confirm, Confirm::Report(_)) => self.dialog_text(),
+            _ => None,
+        }
+    }
+
+    /// What the About box and the app menu do that is not about a box.
+    pub(super) fn app_action(&mut self, action: Action) -> Option<Vec<ShellEffect>> {
+        match action {
+            Action::About => Some(self.open_about()),
+            Action::CheckForUpdates => Some(vec![ShellEffect::OpenLink(RELEASES_URL)]),
+            _ => None,
+        }
+    }
+}
+
+/// The crash report viewer as a dialog: a few lines of the report, where they
+/// are in it, and the buttons.
+fn report_spec(view: &ReportView) -> DialogSpec {
+    let all = view.notice.lines(view.show_paths);
+    let first = view.offset.min(all.len());
+    let shown: Vec<&String> = all.iter().skip(first).take(view.rows).collect();
+    let mut lines: Vec<(String, CardRole)> = Vec::new();
+    lines.push((
+        if view.show_paths {
+            "Paths are shown. Hide them before you share this report.".to_string()
+        } else {
+            "This report is kept on this computer. Paths are hidden. Nothing was sent anywhere."
+                .to_string()
+        },
+        CardRole::Secondary,
+    ));
+    for l in &shown {
+        lines.push(((*l).clone(), CardRole::Normal));
+    }
+    let to = first + shown.len();
+    lines.push((
+        if all.is_empty() {
+            "The report is empty.".to_string()
+        } else {
+            format!(
+                "Lines {}–{} of {} · scroll with the wheel or the arrow keys",
+                first + 1,
+                to,
+                all.len()
+            )
+        },
+        CardRole::Secondary,
+    ));
+    let pinned = vec![0, lines.len() - 1];
+    DialogSpec {
+        lead: None,
+        title: "Crash report".into(),
+        lines,
+        pinned,
+        rows: view.rows + 3,
+        buttons: vec![
+            Button {
+                label: if view.show_paths {
+                    "Hide paths".into()
+                } else {
+                    "Show paths".into()
+                },
+                hold: false,
+            },
+            Button {
+                label: "Report on GitHub".into(),
+                hold: false,
+            },
+            Button {
+                label: "Close".into(),
+                hold: false,
+            },
+        ],
     }
 }
 

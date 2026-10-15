@@ -15,6 +15,8 @@ use bs_render::Item;
 pub mod access;
 #[path = "actions.rs"]
 pub mod actions;
+#[path = "banner.rs"]
+mod banner;
 
 pub use actions::{
     ActOutcome, BinDrive, BinStyle, Capabilities, Disposer, Job, JobResult, Token, TreeChange,
@@ -26,6 +28,7 @@ use crate::capacity::{Breakdown, CapacityModel};
 use crate::card::{self, CardData, CardHit, CardState};
 use crate::chrome::{self, CrumbPart, Geometry, Hit, LegendMode, TextMeasure};
 use crate::info::{self, InfoLine};
+use crate::notice::{AboutInfo, CRASH_WORDS, CrashNotice};
 use crate::picker::{PickTarget, Picker};
 use crate::{App, Direction, Effect, InputEvent, Key, ViewId, ViewSource};
 
@@ -69,6 +72,16 @@ pub enum ShellEffect {
     Tree(Vec<TreeChange>),
     /// What the bin holds changed: measure it again.
     BinChanged,
+    /// Open this address in the user's browser. Like [`ShellEffect::OpenLink`],
+    /// for an address made at run time (the crash report's issue link).
+    OpenUrl(String),
+    /// The crash report was dealt with: record that it was seen, so it is not
+    /// offered again.
+    CrashSeen,
+    /// The rectangle the map fills changed (a banner appeared or went), so
+    /// whatever sits in it other than the map, such as the drive picker, must
+    /// be laid out again.
+    MapMoved,
 }
 
 /// What a running scan reads out in the progress overlay.
@@ -112,6 +125,22 @@ fn rate_text(per_sec: f64) -> String {
 
 /// Words of the banner shown after a scan was stopped.
 pub const STOPPED_BANNER: &str = "Scan stopped — results incomplete";
+
+/// The buttons of the crash banner, in order.
+pub const CRASH_BUTTONS: [&str; 3] = ["View report", "Report on GitHub", "Dismiss"];
+
+/// The crash banner and what the pointer or keyboard is on.
+struct CrashUi {
+    notice: CrashNotice,
+    hot: Option<usize>,
+}
+
+/// Where the parts of the crash banner are, in window coordinates.
+struct CrashStrip {
+    panel: Rect,
+    text: Rect,
+    buttons: [Rect; 3],
+}
 
 /// Which part of the overlay or banner the pointer is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,6 +269,19 @@ pub struct Shell<S: ViewSource> {
     acts: actions::ActionsUi,
     /// Effects produced while time passed, for the host to collect.
     pending_fx: Vec<ShellEffect>,
+    /// The note about a crash last time, until it is dismissed.
+    crash: Option<CrashUi>,
+    /// The banner button the keyboard is on.
+    crash_focus: Option<usize>,
+    about: AboutInfo,
+    unix_clock: Box<dyn Fn() -> i64>,
+}
+
+/// Seconds since 1970 from the system clock; 0 if the clock is before it.
+fn system_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 fn measure_for(text: &TextEngine, font_px: f32, scale: f32) -> Box<dyn TextMeasure> {
@@ -290,6 +332,10 @@ impl<S: ViewSource> Shell<S> {
             overlay_hot: None,
             acts: actions::ActionsUi::default(),
             pending_fx: Vec::new(),
+            crash: None,
+            crash_focus: None,
+            about: AboutInfo::new(env!("CARGO_PKG_VERSION"), "unknown", ""),
+            unix_clock: Box::new(system_unix_seconds),
         }
     }
 
@@ -342,7 +388,7 @@ impl<S: ViewSource> Shell<S> {
     /// shows, it takes a strip off the top, so nothing is covered.
     pub fn map_rect(&self) -> Rect {
         let full = chrome::map_rect(self.width as f32, self.height as f32, self.scale);
-        let strip = self.banner_height().min(full.h);
+        let strip = (self.banner_height() + self.crash_height()).min(full.h);
         Rect::new(full.x, full.y + strip, full.w, full.h - strip)
     }
 
@@ -472,7 +518,7 @@ impl<S: ViewSource> Shell<S> {
             // A strip across the top of the map, with the button after the
             // words.
             let h = self.banner_height();
-            let panel = Rect::new(full.x, full.y, full.w, h);
+            let panel = Rect::new(full.x, full.y + self.crash_height(), full.w, h);
             let text_w = m(&words);
             let text = Rect::new(panel.x + pad, panel.y, text_w + 2.0, h);
             let button = Rect::new(
@@ -800,10 +846,10 @@ impl<S: ViewSource> Shell<S> {
             return;
         };
         let view = app.current_view();
-        let Some(data) = app.source().card(view, id) else {
+        let generation = app.generation();
+        let Some(data) = self.card_data(view, id, true) else {
             return;
         };
-        let generation = app.generation();
         self.card.shown = Some(Shown {
             view,
             id,
@@ -878,8 +924,9 @@ impl<S: ViewSource> Shell<S> {
         }
         shown.generation = generation;
         let (id, view) = (shown.id, shown.view);
-        match app.source().card(view, id) {
-            Some(data) if app.item(id).is_some() => {
+        let exists = app.item(id).is_some();
+        match self.card_data(view, id, true) {
+            Some(data) if exists => {
                 if let Some(s) = self.card.shown.as_mut() {
                     s.data = data;
                 }
@@ -1064,7 +1111,7 @@ impl<S: ViewSource> Shell<S> {
             return Some(reason::NOT_ON_DISK);
         }
         items.iter().find_map(|&id| {
-            let data = app.source().card(view, id)?;
+            let data = self.card_data(view, id, false)?;
             card::why_not(&data, action).or(match action {
                 Action::ZoomInto | Action::Rescan if !data.is_folder => Some(reason::NOT_A_FOLDER),
                 Action::Rescan if !data.complete => Some(reason::SCANNING),
@@ -1083,6 +1130,10 @@ impl<S: ViewSource> Shell<S> {
         // Undo is about the last delete, not about what is selected now.
         if action == Action::Undo {
             return self.undo_last(now);
+        }
+        // The About box and the releases page are not about any box.
+        if let Some(fx) = self.app_action(action) {
+            return fx;
         }
         if let Some(why) = self.refusal(action, view, &items) {
             self.say(format!("{}: {why}", action.label()), now);
@@ -1115,6 +1166,22 @@ impl<S: ViewSource> Shell<S> {
                 }
                 return Vec::new();
             }
+            Action::CopyRemovalCommand => {
+                let command =
+                    items
+                        .first()
+                        .and_then(|&id| match self.card_data(view, id, false)?.owner {
+                            crate::owners::Ownership::Package(p) => p.removal_command,
+                            _ => None,
+                        });
+                return match command {
+                    Some(text) => {
+                        self.say("Copied the removal command", now);
+                        vec![ShellEffect::CopyText(text)]
+                    }
+                    None => Vec::new(),
+                };
+            }
             Action::Delete => return self.request_delete(false, view, items, now),
             Action::DeletePermanently => return self.request_delete(true, view, items, now),
             Action::Undo => return self.undo_last(now),
@@ -1132,9 +1199,13 @@ impl<S: ViewSource> Shell<S> {
         if self.modal_open() {
             return self.modal_input(InputEvent::Key(key), now);
         }
+        if let Some(fx) = self.crash_key(key, now) {
+            return fx;
+        }
         if self.picker.is_some() && self.app.is_none() {
             return match key {
                 Key::Escape => Vec::new(),
+                Key::About => self.open_about(),
                 other => self.picker_key(other),
             };
         }
@@ -1143,6 +1214,10 @@ impl<S: ViewSource> Shell<S> {
         if matches!(key, Key::Tab | Key::BackTab) && self.toast_has_button() {
             self.acts.toast_focus = !self.acts.toast_focus;
             return Vec::new();
+        }
+        // The keyboard can only be on a button that is on screen.
+        if self.acts.toast_focus && !self.toast_has_button() {
+            self.acts.toast_focus = false;
         }
         if self.acts.toast_focus {
             self.acts.toast_focus = false;
@@ -1167,6 +1242,7 @@ impl<S: ViewSource> Shell<S> {
             Key::Undo => Action::Undo,
             Key::Rescan => Action::Rescan,
             Key::ContextMenu => Action::ContextMenu,
+            Key::About => Action::About,
             other => {
                 self.hide_card();
                 self.card.rest = None;
@@ -1246,6 +1322,12 @@ impl<S: ViewSource> Shell<S> {
             }
             return self.map_event(event, now);
         };
+        if let Some(hit) = self.crash_at(x, y) {
+            return self.crash_event(event, hit, now);
+        }
+        if let Some(c) = self.crash.as_mut() {
+            c.hot = None;
+        }
         if let Some(hit) = self.overlay_at(x, y) {
             return self.overlay_event(event, hit);
         }
@@ -1629,6 +1711,7 @@ impl<S: ViewSource> Shell<S> {
                 widgets.push(w);
             }
         }
+        widgets.extend(self.crash_widgets());
         if let Some(o) = self.overlay() {
             widgets.push(Widget::Panel { rect: o.panel });
             widgets.push(Widget::Text {

@@ -24,6 +24,8 @@ pub struct DialogSpec {
     /// Positions in `lines` that are drawn whatever else the dialog holds
     /// (the warning, how to confirm); the rest share the room that is left.
     pub pinned: Vec<usize>,
+    /// Most lines drawn besides the pinned ones; 0 means the usual limit.
+    pub rows: usize,
     pub buttons: Vec<Button>,
 }
 
@@ -56,6 +58,8 @@ pub struct DialogState {
 
 /// Lines in the dialog are limited so a hostile text cannot fill the window.
 const MAX_LINES: usize = 14;
+/// The most a dialog may ask for, whatever the caller wants.
+const MOST_LINES: usize = 60;
 
 /// Builds a dialog centered in `window`.
 pub fn dialog(spec: &DialogSpec, window: Rect, m: Metrics<'_>, state: DialogState) -> Built {
@@ -86,7 +90,11 @@ pub fn dialog(spec: &DialogSpec, window: Rect, m: Metrics<'_>, state: DialogStat
         .filter_map(|&i| spec.lines.get(i))
         .map(|(t, _)| wrap(t, inner, 4, m.measure, em).len())
         .sum();
-    let limit = MAX_LINES.saturating_sub(reserved).max(1);
+    let wanted = match spec.rows {
+        0 => MAX_LINES,
+        n => n.min(MOST_LINES),
+    };
+    let limit = wanted.saturating_sub(reserved).max(1);
     let mut push_lines =
         |parts: &mut Vec<CardPart>, y: &mut f32, text: &str, role, h: f32, pinned: bool| {
             for l in wrap(text, inner, 4, m.measure, em) {
@@ -122,36 +130,61 @@ pub fn dialog(spec: &DialogSpec, window: Rect, m: Metrics<'_>, state: DialogStat
     }
     y += gap;
 
-    // Buttons side by side, the first one widest first, right-aligned.
+    // Buttons side by side, right-aligned. When they do not fit in one row
+    // they continue on the next one, so a long label never leaves the dialog.
     let btn_pad = (em * 1.2).round();
     let widths: Vec<f32> = spec
         .buttons
         .iter()
         .map(|b| (text_w(&b.label).ceil() + 2.0 * btn_pad).min(inner))
         .collect();
-    let total: f32 = widths.iter().sum::<f32>() + gap * widths.len().saturating_sub(1) as f32;
-    let mut x = pad + (inner - total).max(0.0);
-    let mut hits = Vec::new();
-    for (i, (b, w)) in spec.buttons.iter().zip(&widths).enumerate() {
-        let r = Rect::new(x, y, *w, button_h);
-        let focused = state.focus == i;
-        parts.push(if b.hold {
-            CardPart::Hold {
-                rect: r,
-                label: b.label.clone().into(),
-                progress: if focused { state.progress } else { 0.0 },
-                hot: focused,
-            }
+    let mut lines_of_buttons: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut row_w = 0.0f32;
+    for (i, w) in widths.iter().enumerate() {
+        let add = if row_w == 0.0 { *w } else { gap + *w };
+        if row_w > 0.0 && row_w + add > inner {
+            lines_of_buttons.push(Vec::new());
+            row_w = *w;
         } else {
-            CardPart::Button {
-                rect: r,
-                label: b.label.clone().into(),
-                enabled: true,
-                hot: focused,
-            }
-        });
-        hits.push((r, i));
-        x += w + gap;
+            row_w += add;
+        }
+        if let Some(last) = lines_of_buttons.last_mut() {
+            last.push(i);
+        }
+    }
+    let mut hits = Vec::new();
+    let last_row = lines_of_buttons.len().saturating_sub(1);
+    for (n, row) in lines_of_buttons.iter().enumerate() {
+        let total: f32 = row.iter().filter_map(|&i| widths.get(i)).sum::<f32>()
+            + gap * row.len().saturating_sub(1) as f32;
+        let mut x = pad + (inner - total).max(0.0);
+        for &i in row {
+            let (Some(b), Some(w)) = (spec.buttons.get(i), widths.get(i)) else {
+                continue;
+            };
+            let r = Rect::new(x, y, *w, button_h);
+            let focused = state.focus == i;
+            parts.push(if b.hold {
+                CardPart::Hold {
+                    rect: r,
+                    label: b.label.clone().into(),
+                    progress: if focused { state.progress } else { 0.0 },
+                    hot: focused,
+                }
+            } else {
+                CardPart::Button {
+                    rect: r,
+                    label: b.label.clone().into(),
+                    enabled: true,
+                    hot: focused,
+                }
+            });
+            hits.push((r, i));
+            x += w + gap;
+        }
+        if n < last_row {
+            y += button_h + gap;
+        }
     }
     y += button_h + pad;
 
@@ -399,6 +432,7 @@ mod tests {
             title: "Permanently delete 3 items (12.3 GB)?".into(),
             lines: vec![("This can't be undone.".into(), CardRole::Secondary)],
             pinned: Vec::new(),
+            rows: 0,
             buttons: vec![
                 Button {
                     label: "Delete permanently".into(),
@@ -421,6 +455,67 @@ mod tests {
     }
 
     #[test]
+    fn buttons_that_do_not_fit_in_a_row_continue_on_the_next_one() {
+        let window = Rect::new(0.0, 0.0, 600.0, 400.0);
+        let spec = DialogSpec {
+            lead: None,
+            title: "About".into(),
+            lines: Vec::new(),
+            pinned: Vec::new(),
+            rows: 0,
+            buttons: [
+                "Find more free software at RecursiveAI.org",
+                "Check for updates",
+                "Close",
+            ]
+            .iter()
+            .map(|l| Button {
+                label: (*l).into(),
+                hold: false,
+            })
+            .collect(),
+        };
+        let b = dialog(&spec, window, metrics(), DialogState::default());
+        let card = b.popup.card.rect;
+        assert_eq!(b.hits.len(), 3);
+        for (r, _) in &b.hits {
+            assert!(
+                r.x >= card.x && r.right() <= card.right() && r.bottom() <= card.bottom(),
+                "{r:?} outside {card:?}"
+            );
+        }
+        // The long one sits alone on the first row; the other two share the
+        // second, right-aligned and in order.
+        let rect = |i: usize| {
+            b.hits
+                .iter()
+                .find(|(_, n)| *n == i)
+                .map(|(r, _)| *r)
+                .unwrap()
+        };
+        assert!(rect(1).y > rect(0).y);
+        assert_eq!(rect(1).y, rect(2).y);
+        assert!(rect(1).right() < rect(2).x);
+        assert!((rect(2).right() - (card.right() - 13.0)).abs() < 1.5);
+        // Two short buttons still share one row, as before.
+        let short = DialogSpec {
+            buttons: vec![
+                Button {
+                    label: "OK".into(),
+                    hold: false,
+                },
+                Button {
+                    label: "Cancel".into(),
+                    hold: false,
+                },
+            ],
+            ..spec
+        };
+        let b = dialog(&short, window, metrics(), DialogState::default());
+        assert_eq!(b.hits[0].0.y, b.hits[1].0.y);
+    }
+
+    #[test]
     fn a_long_hostile_line_cannot_make_the_dialog_taller_than_the_window() {
         let window = Rect::new(0.0, 0.0, 600.0, 400.0);
         let spec = DialogSpec {
@@ -435,6 +530,7 @@ mod tests {
                 })
                 .collect(),
             pinned: Vec::new(),
+            rows: 0,
             buttons: vec![Button {
                 label: "OK".into(),
                 hold: false,

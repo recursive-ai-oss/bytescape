@@ -17,7 +17,8 @@ use bs_render::{Flags, Item, ItemKind, ItemLabel, Rect};
 use bs_tree::{DeleteState, NodeId, NodeKind, Progress, Snapshot};
 
 use crate::blocks::{DriveBlocks, Special};
-use crate::card::{CardData, DeleteMark};
+use crate::card::{CardData, DeleteMark, Sharing};
+use crate::owners::{Owners, Ownership};
 use crate::{ItemInfo, Layout, Prepared, RelayoutJob, ViewSource};
 
 /// How many recent layouts are kept so the info bar can describe their boxes.
@@ -47,6 +48,9 @@ pub struct TreeSource {
     /// The drive-level blocks shown beside the top view, when the scan covers
     /// a whole drive.
     blocks: Option<DriveBlocks>,
+    /// Which program or package owns a big folder, once the platform has
+    /// worked it out.
+    owners: Option<Arc<dyn Owners>>,
 }
 
 /// A layout made on a worker thread, waiting to be adopted.
@@ -71,7 +75,15 @@ impl TreeSource {
             laid: Vec::new(),
             knowledge: OnceLock::new(),
             blocks: None,
+            owners: None,
         })
+    }
+
+    /// Gives the source the lookup that says which program or package owns a
+    /// folder. Cards show its answers; without it they say nothing about
+    /// owners.
+    pub fn set_owners(&mut self, owners: Option<Arc<dyn Owners>>) {
+        self.owners = owners;
     }
 
     /// Replaces the data. Views keep their ids; call the app's
@@ -178,7 +190,7 @@ impl TreeSource {
 /// The real path from the bytes the scan recorded. Where paths are text
 /// (Windows), a name that is not valid text gives no path, so nothing is ever
 /// acted on by a guess.
-fn path_from_bytes(raw: Vec<u8>) -> Option<std::path::PathBuf> {
+pub(crate) fn path_from_bytes(raw: Vec<u8>) -> Option<std::path::PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
@@ -210,6 +222,7 @@ impl ViewSource for TreeSource {
         // next layout of it.
         let folders = self.table.register(view, &laid);
         let mut items: Vec<Item> = laid.items().iter().map(to_item).collect();
+        settle_empty_group(&target, &mut items);
         if self.snapshot.scan_stopped() {
             end_scanning_labels(&mut items);
         }
@@ -281,6 +294,11 @@ impl ViewSource for TreeSource {
             return None;
         };
         let node = self.snapshot.node(node_id)?;
+        // A folder the scan made up has no real path: nothing may be done to
+        // it, or to what is below it, by name.
+        if node.is_under_synthetic() {
+            return None;
+        }
         let raw = self.node_path(node_id)?;
         Some(crate::Target {
             path: path_from_bytes(raw)?,
@@ -325,6 +343,10 @@ impl ViewSource for TreeSource {
                 delete_state: DeleteMark::None,
                 complete: node.is_complete(),
                 blocked: false,
+                unreal: node.is_under_synthetic(),
+                owner: Ownership::Unknown,
+                sharing: None,
+                software_center: false,
             });
         }
         let is_folder = node.kind() == NodeKind::Dir;
@@ -332,6 +354,12 @@ impl ViewSource for TreeSource {
         let entry = knowledge.recognize_bytes(&raw);
         let category = bs_knowledge::Category::from_number(node.category().0)
             .map(bs_knowledge::Category::label);
+        let owner = match (&self.owners, is_folder) {
+            (Some(owners), true) => {
+                path_from_bytes(raw.clone()).map_or(Ownership::Unknown, |p| owners.lookup(&p))
+            }
+            _ => Ownership::Unknown,
+        };
         Some(CardData {
             name: bs_layout::display_name(node.name()).into_string(),
             path,
@@ -364,6 +392,26 @@ impl ViewSource for TreeSource {
             },
             complete: node.is_complete(),
             blocked: knowledge.protection_bytes(&raw).level == Level::Blocked,
+            unreal: node.is_under_synthetic(),
+            owner,
+            sharing: None,
+            software_center: false,
+        })
+    }
+
+    fn sharing(&self, view: ViewId, id: u32) -> Option<Sharing> {
+        let laid = &self.laid.iter().find(|(v, _)| *v == view)?.1;
+        let ItemRef::Node(node_id) = laid.item_ref(id)? else {
+            return None;
+        };
+        let node = self.snapshot.node(node_id)?;
+        let estimate = self.snapshot.delete_would_free(node_id)?;
+        if estimate.is_exact() {
+            return None;
+        }
+        Some(Sharing {
+            own: node.is_shared(),
+            frees: estimate.at_least,
         })
     }
 
@@ -425,6 +473,7 @@ impl ViewSource for TreeSource {
             let (area, extra) = split_for_blocks(blocks.as_ref(), &snapshot, map);
             let laid = bs_layout::layout(&snapshot, &target, area, metrics);
             let mut items: Vec<Item> = laid.items().iter().map(to_item).collect();
+            settle_empty_group(&target, &mut items);
             if snapshot.scan_stopped() {
                 end_scanning_labels(&mut items);
             }
@@ -452,6 +501,18 @@ impl ViewSource for TreeSource {
             items: Arc::new(items),
             folders,
         })
+    }
+}
+
+/// A group view whose members are all too small to draw is left with just its
+/// frame: a title bar over nothing. Drawn as a labeled block instead, it
+/// still says what the group is and how much it holds.
+fn settle_empty_group(target: &ViewTarget, items: &mut [Item]) {
+    if matches!(target, ViewTarget::Group(_))
+        && let [only] = items
+        && only.kind == ItemKind::FolderTitled
+    {
+        only.kind = ItemKind::FolderBlock;
     }
 }
 
@@ -615,6 +676,27 @@ mod tests {
         assert_eq!(&*it.label.expect("label").size, "≥ 1.2 GB");
         let it = to_item(&draw(LayoutKind::FolderTitled, StateFlags::NONE));
         assert_eq!(&*it.label.expect("label").size, "≥ 1.2 GB");
+    }
+
+    #[test]
+    fn a_lone_group_frame_becomes_a_labeled_block() {
+        let group = ViewTarget::Group(Arc::new(bs_layout::GroupSpec {
+            folder: NodeId::from_index(0),
+            members: Vec::new(),
+        }));
+        let frame = || vec![to_item(&draw(LayoutKind::FolderTitled, StateFlags::NONE))];
+        let mut items = frame();
+        settle_empty_group(&group, &mut items);
+        assert_eq!(items[0].kind, ItemKind::FolderBlock);
+        assert!(items[0].label.is_some());
+        // A folder's own view, or a group with something drawn in it, is left.
+        let mut items = frame();
+        settle_empty_group(&ViewTarget::Folder(NodeId::from_index(0)), &mut items);
+        assert_eq!(items[0].kind, ItemKind::FolderTitled);
+        let mut items = frame();
+        items.push(to_item(&draw(LayoutKind::FileTile, StateFlags::NONE)));
+        settle_empty_group(&group, &mut items);
+        assert_eq!(items[0].kind, ItemKind::FolderTitled);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use bs_platform::delete::{
     Reason, RefuseReason, RestoreOutcome,
 };
 use bs_platform::launch;
+use bs_platform::software::{Lookup, Matcher, Owner};
 use bs_ui::action::Action;
 use bs_ui::shell::{ActOutcome, Disposer, Token};
 
@@ -134,13 +135,47 @@ pub fn probe_properties(tx: Sender<bool>) {
         });
 }
 
+/// Asks the desktop once, off the window's thread, whether it has a program
+/// that opens software-center entries.
+pub fn probe_software_center(tx: Sender<bool>) {
+    let _ = std::thread::Builder::new()
+        .name("capabilities".into())
+        .spawn(move || {
+            let _ = tx.send(launch::software_center_available());
+        });
+}
+
 /// Does `action` to `path` on a worker thread. A failure becomes a message.
-pub fn run_action(action: Action, path: PathBuf, is_folder: bool, notices: Sender<String>) {
+/// `owners` knows which program or package a folder belongs to.
+pub fn run_action(
+    action: Action,
+    path: PathBuf,
+    is_folder: bool,
+    owners: Arc<Matcher>,
+    notices: Sender<String>,
+) {
     let _ = std::thread::Builder::new()
         .name("action".into())
         .spawn(move || {
             let label = action.label();
             let outcome = match action {
+                Action::Handoff(bs_knowledge::Handoff::Uninstall) => match owners.lookup(&path) {
+                    Lookup::Found(Owner::Program(p)) => match &p.uninstall {
+                        Some(command) => launch::uninstall(command),
+                        None => Err(launch::LaunchError::BadInput(
+                            "the program registered no uninstaller",
+                        )),
+                    },
+                    _ => Err(launch::LaunchError::BadInput(
+                        "no installed program lists this folder",
+                    )),
+                },
+                Action::OpenInSoftware => match owners.lookup(&path) {
+                    Lookup::Found(Owner::Package(p)) => launch::open_in_software_center(&p),
+                    _ => Err(launch::LaunchError::BadInput(
+                        "no package lists this folder",
+                    )),
+                },
                 Action::Open => launch::open(&path),
                 Action::ShowInFileManager => launch::reveal(&path),
                 Action::Properties => launch::properties(&path),
@@ -183,11 +218,11 @@ pub fn copy_text(text: String, notices: Sender<String>) {
 }
 
 /// Opens a web address in the browser on a worker thread.
-pub fn open_url(url: &'static str, notices: Sender<String>) {
+pub fn open_url(url: String, notices: Sender<String>) {
     let _ = std::thread::Builder::new()
         .name("browser".into())
         .spawn(move || {
-            if let Err(e) = launch::open_url(url) {
+            if let Err(e) = launch::open_url(&url) {
                 let _ = notices.send(format!("Couldn't open the browser: {e}"));
             }
         });
@@ -237,9 +272,43 @@ mod tests {
     #[test]
     fn other_actions_say_so_instead_of_pretending() {
         let (tx, rx) = std::sync::mpsc::channel();
-        run_action(Action::CopyPath, PathBuf::from("/a"), false, tx);
+        run_action(
+            Action::CopyPath,
+            PathBuf::from("/a"),
+            false,
+            Arc::new(Matcher::new()),
+            tx,
+        );
         let msg = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(msg.starts_with("Copy path:"), "{msg}");
+    }
+
+    #[test]
+    fn a_hand_off_for_a_folder_nobody_owns_says_so() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The matcher was never asked about this folder.
+        run_action(
+            Action::Handoff(bs_knowledge::Handoff::Uninstall),
+            PathBuf::from("/no/such/program"),
+            true,
+            Arc::new(Matcher::new()),
+            tx.clone(),
+        );
+        let msg = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(msg.starts_with("Uninstall…:"), "{msg}");
+        assert!(
+            msg.contains("no installed program lists this folder"),
+            "{msg}"
+        );
+        run_action(
+            Action::OpenInSoftware,
+            PathBuf::from("/no/such/package"),
+            true,
+            Arc::new(Matcher::new()),
+            tx,
+        );
+        let msg = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(msg.starts_with("Open in Software:"), "{msg}");
     }
 
     #[cfg(target_os = "linux")]

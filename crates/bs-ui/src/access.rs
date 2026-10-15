@@ -45,7 +45,12 @@ const NOTICE: NodeId = NodeId(19);
 const POPUP: NodeId = NodeId(20);
 const TOAST: NodeId = NodeId(21);
 const TOAST_UNDO: NodeId = NodeId(22);
+const CRASH: NodeId = NodeId(23);
+const CRASH_TEXT: NodeId = NodeId(24);
+const CRASH_BUTTON_BASE: u64 = 25;
+const HOVER_CARD: NodeId = NodeId(30);
 const POPUP_BASE: u64 = 2_000;
+const HOVER_BASE: u64 = 3_000;
 const CRUMB_BASE: u64 = 100;
 const CRUMB_LIMIT: usize = 64;
 const SWATCH_BASE: u64 = 200;
@@ -93,6 +98,10 @@ pub enum AccessTarget {
     Popup(usize),
     /// The Undo button of the toast.
     ToastUndo,
+    /// A button of the crash note, by position.
+    Crash(usize),
+    /// The path or a button of the hover card, by position among its parts.
+    CardPart(usize),
 }
 
 fn ak_rect(r: Rect) -> AkRect {
@@ -755,6 +764,62 @@ impl<S: ViewSource> Shell<S> {
         out.push((STATUS, status));
         root_children.push(STATUS);
 
+        // The note about a crash last time.
+        if let Some(strip) = self.crash_strip() {
+            let mut kids = vec![CRASH_TEXT];
+            out.push((
+                CRASH_TEXT,
+                text_node(crate::notice::CRASH_WORDS, strip.text),
+            ));
+            for (i, rect) in strip.buttons.iter().enumerate() {
+                let id = NodeId(CRASH_BUTTON_BASE + i as u64);
+                let mut b = button(super::CRASH_BUTTONS[i], *rect, true, "");
+                if i == 1 {
+                    b.set_description(
+                        "Opens GitHub in your browser with this report, paths hidden",
+                    );
+                }
+                out.push((id, b));
+                targets.insert(id, AccessTarget::Crash(i));
+                kids.push(id);
+            }
+            let mut group = node(Role::Group, Some("Crash report"), strip.panel);
+            group.set_children(kids);
+            out.push((CRASH, group));
+            root_children.push(CRASH);
+        }
+
+        // The hover card.
+        if let Some((rect, name, parts)) = self.card_summary() {
+            let mut kids = Vec::new();
+            for (i, part) in parts.iter().enumerate() {
+                let id = NodeId(HOVER_BASE + i as u64);
+                let n = match part {
+                    super::banner::CardNode::Text(t, r) => text_node(&clean_name(t), *r),
+                    super::banner::CardNode::Path(t, r) => {
+                        targets.insert(id, AccessTarget::CardPart(i));
+                        let mut b = node(Role::Button, Some("Copy path"), *r);
+                        b.set_value(clean_name(t));
+                        b.add_action(Action::Click);
+                        b
+                    }
+                    super::banner::CardNode::Button(label, enabled, why, r) => {
+                        if *enabled {
+                            targets.insert(id, AccessTarget::CardPart(i));
+                        }
+                        button(label, *r, *enabled, why)
+                    }
+                };
+                out.push((id, n));
+                kids.push(id);
+            }
+            let mut card = node(Role::Group, Some(&clean_name(&name)), rect);
+            card.set_description("Details");
+            card.set_children(kids);
+            out.push((HOVER_CARD, card));
+            root_children.push(HOVER_CARD);
+        }
+
         // The toast and the open dialog or menu sit over everything.
         if let Some((text, rect, undo)) = self.toast_summary(self.clock) {
             let mut toast = Node::new(Role::Status);
@@ -792,9 +857,9 @@ impl<S: ViewSource> Shell<S> {
                 kids.push(id);
             }
             let mut group = if p.menu {
-                node(Role::Menu, Some("Actions"), p.rect)
+                node(Role::Menu, Some(&p.name), p.rect)
             } else {
-                let mut d = node(Role::Dialog, Some("Confirm"), p.rect);
+                let mut d = node(Role::Dialog, Some(&clean_name(&p.name)), p.rect);
                 d.set_description(p.text.as_str());
                 d.set_modal();
                 d

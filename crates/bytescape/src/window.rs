@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use bs_layout::Metrics;
 use bs_platform::appearance::{Appearance, ColorScheme};
 use bs_platform::bins::BinControl;
+use bs_platform::crash::Report;
 use bs_platform::drives::{Capacity, Drive};
+use bs_platform::software::Matcher;
 use bs_render::present::Presenter;
 use bs_render::{
     Chrome, Flags, Item, ItemKind, ItemLabel, Painted, Palette, Rect, Renderer, TextEngine,
@@ -20,6 +22,7 @@ use bs_tree::Snapshot;
 use bs_ui::action::Action;
 use bs_ui::blocks::DriveBlocks;
 use bs_ui::capacity::Breakdown;
+use bs_ui::notice::CrashNotice;
 use bs_ui::picker::{CardScan, Picker, StartPlan, plan_start};
 use bs_ui::shell::{BinDrive, Capabilities, JobResult, Look, ScanReadout, Shell, ShellEffect};
 use bs_ui::tree::{TreeSource, scan_status};
@@ -570,6 +573,17 @@ struct Live {
     next_card_update: Instant,
     /// What the map being scanned shows, to scan it again.
     scan_root: Option<PathBuf>,
+    /// Which program or package owns a big folder, worked out after a scan.
+    owners: Arc<Matcher>,
+    /// The big folders of a finished scan are being handed to the matcher.
+    owners_queue: Option<Receiver<()>>,
+    /// Matching is under way and the card on screen may need to change.
+    owners_pending: bool,
+    /// The report left by an earlier crash, while the note about it shows.
+    crash_report: Option<Report>,
+    crash_rx: Option<Receiver<Option<Report>>>,
+    /// Whether the desktop has a software center, once asked.
+    software_rx: Option<Receiver<bool>>,
 }
 
 /// A background scan of one drive while the picker shows.
@@ -776,7 +790,34 @@ fn apply_shell(live: &mut Live, fx: Vec<ShellEffect>, now: Duration) -> Vec<Shel
                 apply(&mut live.renderer, vec![e], now);
             }
             ShellEffect::Dim(category) => live.renderer.set_dim(category),
-            ShellEffect::OpenLink(url) => system::open_url(url, live.notices_tx.clone()),
+            ShellEffect::OpenLink(url) => {
+                system::open_url(url.to_string(), live.notices_tx.clone());
+            }
+            ShellEffect::OpenUrl(url) => system::open_url(url, live.notices_tx.clone()),
+            ShellEffect::CrashSeen => {
+                if let Some(report) = live.crash_report.take() {
+                    let _ =
+                        std::thread::Builder::new()
+                            .name("crash-seen".into())
+                            .spawn(move || {
+                                let _ = bs_platform::crash::acknowledge(&report);
+                            });
+                }
+            }
+            ShellEffect::MapMoved => {
+                // The picker's cards and the placeholder fill the map, so they
+                // are made again for the new rectangle.
+                if live.shell.app().is_none() {
+                    let map = live.shell.map_rect();
+                    match live.shell.picker_items() {
+                        Some(items) => live.renderer.set_items(items),
+                        None if live.scan.is_some() => live
+                            .renderer
+                            .set_items(Arc::new(vec![scan_placeholder(map)])),
+                        None => {}
+                    }
+                }
+            }
             ShellEffect::CopyText(text) => system::copy_text(text, live.notices_tx.clone()),
             ShellEffect::CancelScan => {
                 if let Some(scan) = &live.scan {
@@ -820,9 +861,13 @@ fn apply_shell(live: &mut Live, fx: Vec<ShellEffect>, now: Duration) -> Vec<Shel
                         .and_then(|app| bs_ui::ViewSource::target(app.source(), view, id))
                 });
                 match target {
-                    Some(t) => {
-                        system::run_action(action, t.path, t.is_folder, live.notices_tx.clone())
-                    }
+                    Some(t) => system::run_action(
+                        action,
+                        t.path,
+                        t.is_folder,
+                        live.owners.clone(),
+                        live.notices_tx.clone(),
+                    ),
                     None => live.shell.notify("That isn't a file or folder", now),
                 }
             }
@@ -1462,6 +1507,7 @@ impl WinApp {
             Look { dark, accent: None },
         );
         shell.set_reduced_motion(reduced_motion_override());
+        shell.set_about(crate::about());
         shell.set_crumb(crumb);
         shell.set_status(status, self.scan_path.is_some());
         let map = shell.map_rect();
@@ -1512,6 +1558,12 @@ impl WinApp {
             next_readout: Instant::now(),
             next_card_update: Instant::now(),
             scan_root: None,
+            owners: Arc::new(Matcher::new()),
+            owners_queue: None,
+            owners_pending: false,
+            crash_report: None,
+            crash_rx: None,
+            software_rx: None,
         });
         window.request_redraw();
         Ok(())
@@ -1586,6 +1638,18 @@ impl WinApp {
                 let (tx, rx) = mpsc::channel();
                 live.caps_rx = Some(rx);
                 system::probe_properties(tx);
+                let (tx, rx) = mpsc::channel();
+                live.software_rx = Some(rx);
+                system::probe_software_center(tx);
+                // A report left by a crash last time is looked for on another
+                // thread, now that the first frame is out.
+                let (tx, rx) = mpsc::channel();
+                live.crash_rx = Some(rx);
+                let _ = std::thread::Builder::new()
+                    .name("crash-report".into())
+                    .spawn(move || {
+                        let _ = tx.send(bs_platform::crash::pending_report());
+                    });
             }
             if let Some(path) = &self.scan_path {
                 live.scan = Some(ScanDriver::start(path.clone()));
@@ -1839,6 +1903,15 @@ impl WinApp {
         update_capacity(live, now);
         if done {
             self.stats.scan_done_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+            // Which program or package owns the big folders is worked out in
+            // the background, after the scan, and never delays it.
+            if matches!(self.mode, Mode::Interactive { .. }) && !snapshot.scan_stopped() {
+                bs_platform::crash::record_action("scan finished");
+                live.owners_queue = Some(bs_ui::owners::request_in_background(
+                    live.owners.clone(),
+                    Arc::clone(&snapshot),
+                ));
+            }
         }
         match live.shell.app_mut() {
             Some(app) => {
@@ -1858,6 +1931,7 @@ impl WinApp {
             None => {
                 if let Some(mut source) = TreeSource::new(Arc::clone(&snapshot), metrics) {
                     source.set_drive_blocks(drive_blocks(live));
+                    source.set_owners(Some(live.owners.clone()));
                     let map = live.shell.map_rect();
                     let app = App::new(source, map);
                     let stats = app.source().last_layout();
@@ -1991,6 +2065,50 @@ impl WinApp {
         {
             live.caps_rx = None;
             live.shell.set_capabilities(Capabilities { properties });
+        }
+        if let Some(rx) = live.software_rx.as_ref()
+            && let Ok(available) = rx.try_recv()
+        {
+            live.software_rx = None;
+            live.shell.set_software_center(available);
+        }
+        if let Some(rx) = live.crash_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(report) => {
+                    live.crash_rx = None;
+                    if let Some(report) = report {
+                        let notice = CrashNotice::from_report(&report);
+                        live.crash_report = Some(report);
+                        let fx = live.shell.set_crash_notice(Some(notice), now);
+                        apply_shell(live, fx, now);
+                        refresh_chrome(live, now);
+                        redraw = true;
+                    }
+                }
+                Err(TryRecvError::Disconnected) => live.crash_rx = None,
+                Err(TryRecvError::Empty) => soonest(Duration::from_millis(50)),
+            }
+        }
+        if let Some(rx) = live.owners_queue.as_ref() {
+            match rx.try_recv() {
+                Ok(()) => {
+                    live.owners_queue = None;
+                    live.owners_pending = true;
+                }
+                Err(TryRecvError::Disconnected) => live.owners_queue = None,
+                Err(TryRecvError::Empty) => soonest(Duration::from_millis(100)),
+            }
+        }
+        if live.owners_pending {
+            // The card on screen is built again when the answers are in.
+            if live.owners.is_idle() {
+                live.owners_pending = false;
+                live.shell.owners_changed();
+                refresh_chrome(live, now);
+                redraw = true;
+            } else {
+                soonest(Duration::from_millis(150));
+            }
         }
         if let Some(d) = live.shell.next_deadline(now) {
             soonest(d.max(Duration::from_millis(1)));
@@ -2146,6 +2264,7 @@ fn translate_key(key: &WKey, mods: ModifiersState) -> Option<Key> {
         WKey::Named(NamedKey::Escape) => Key::Escape,
         WKey::Named(NamedKey::F5) if shift => Key::Rescan,
         WKey::Named(NamedKey::F5) => Key::Refresh,
+        WKey::Named(NamedKey::F1) => Key::About,
         WKey::Named(NamedKey::F10) if shift => Key::ContextMenu,
         WKey::Named(NamedKey::ContextMenu) => Key::ContextMenu,
         WKey::Named(NamedKey::Delete) if shift => Key::DeletePermanently,

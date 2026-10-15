@@ -8,6 +8,19 @@ use bs_render::{Card, CardPart, CardRole, Rect};
 use crate::action::{Action, reason};
 use crate::chrome::TextMeasure;
 use crate::info::percent;
+use crate::owners::Ownership;
+
+/// What deleting a box would and would not free, when the box shares data
+/// with something else. The tree gives the figures for one box at a time, so
+/// this is only asked for the box a card describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sharing {
+    /// The box itself shares data (reflinks, snapshots). When false, files
+    /// below it do.
+    pub own: bool,
+    /// Bytes certainly freed by deleting the box.
+    pub frees: u64,
+}
 
 /// What the card is built from. A [`crate::ViewSource`] fills it in.
 #[derive(Clone, Debug, PartialEq)]
@@ -49,6 +62,16 @@ pub struct CardData {
     pub complete: bool,
     /// Part of the operating system: never offered for deletion.
     pub blocked: bool,
+    /// Under a folder the scan made up to hold files no folder lists: no
+    /// path through it is real, so nothing may be done to it by name.
+    pub unreal: bool,
+    /// Which program or package owns the folder, as far as it is known.
+    pub owner: Ownership,
+    /// Data shared with other files, when the box shares any. Filled in for
+    /// the card only, never for every box of a layout.
+    pub sharing: Option<Sharing>,
+    /// The desktop has a program that opens software-center entries.
+    pub software_center: bool,
 }
 
 /// Whether a box is already gone.
@@ -177,6 +200,17 @@ pub fn why_not(data: &CardData, action: Action) -> Option<&'static str> {
         DeleteMark::Deleted => Some(reason::DELETED),
         DeleteMark::None => None,
     };
+    let acts_on_disk = !matches!(
+        action,
+        Action::ZoomInto
+            | Action::Undo
+            | Action::ContextMenu
+            | Action::About
+            | Action::CheckForUpdates
+    );
+    if data.unreal && acts_on_disk {
+        return Some(reason::NOT_A_REAL_FOLDER);
+    }
     match action {
         Action::Delete | Action::DeletePermanently => {
             if data.blocked {
@@ -191,20 +225,117 @@ pub fn why_not(data: &CardData, action: Action) -> Option<&'static str> {
                 gone
             }
         }
-        // Uninstall and the package lookup are not wired up yet; a button
-        // that could only fail says so instead.
-        Action::Handoff(Handoff::Uninstall | Handoff::Package) => Some(reason::NOT_YET),
+        Action::Handoff(Handoff::Uninstall) => gone.or(uninstall_reason(data)),
+        Action::OpenInSoftware => gone.or(match &data.owner {
+            Ownership::Package(p) if !p.software_entry => Some(reason::NO_SOFTWARE_ENTRY),
+            Ownership::Package(_) if !data.software_center => Some(reason::NO_SOFTWARE_CENTER),
+            Ownership::Package(_) => None,
+            _ => Some(reason::NO_SOFTWARE_ENTRY),
+        }),
+        Action::CopyRemovalCommand => match &data.owner {
+            Ownership::Package(p) if p.removal_command.is_some() => None,
+            _ => Some(reason::NO_REMOVAL_COMMAND),
+        },
         _ => gone,
     }
+}
+
+/// Why the program that owns the folder cannot be uninstalled from here.
+fn uninstall_reason(data: &CardData) -> Option<&'static str> {
+    match &data.owner {
+        Ownership::Program(p) if p.can_uninstall => None,
+        Ownership::Program(_) => Some(reason::NO_UNINSTALLER),
+        Ownership::Checking => Some(reason::LOOKING_UP_PROGRAM),
+        Ownership::Nobody | Ownership::Package(_) => Some(reason::NO_PROGRAM),
+        Ownership::Unknown if !data.complete => Some(reason::SCANNING),
+        Ownership::Unknown => Some(reason::NOT_MATCHED),
+    }
+}
+
+/// The hand-off actions the box offers: the tool its place is known to belong
+/// to, and whatever the background lookup found owns it.
+pub fn handoff_actions(data: &CardData) -> Vec<Action> {
+    let mut acts = Vec::new();
+    if data.unreal {
+        return acts;
+    }
+    match data.handoff {
+        Some(Handoff::DiskCleanup) => acts.push(Action::Handoff(Handoff::DiskCleanup)),
+        Some(Handoff::Uninstall) => acts.push(Action::Handoff(Handoff::Uninstall)),
+        _ => {}
+    }
+    match &data.owner {
+        Ownership::Program(_) if !acts.contains(&Action::Handoff(Handoff::Uninstall)) => {
+            acts.push(Action::Handoff(Handoff::Uninstall));
+        }
+        Ownership::Package(p) => {
+            if p.software_entry {
+                acts.push(Action::OpenInSoftware);
+            }
+            if p.removal_command.is_some() {
+                acts.push(Action::CopyRemovalCommand);
+            }
+        }
+        _ => {}
+    }
+    acts
 }
 
 /// The buttons on a card, with the reason each disabled one gives.
 pub fn buttons(data: &CardData) -> Vec<(Action, Option<&'static str>)> {
     let mut acts = vec![Action::Delete, Action::ShowInFileManager, Action::Open];
-    if let Some(h) = data.handoff {
-        acts.push(Action::Handoff(h));
-    }
+    acts.extend(handoff_actions(data));
     acts.into_iter().map(|a| (a, why_not(data, a))).collect()
+}
+
+/// What the card says about who owns the folder, as sentences.
+fn owner_notes(data: &CardData) -> Vec<(String, CardRole)> {
+    match &data.owner {
+        Ownership::Program(p) => {
+            let by = p
+                .publisher
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| format!(" by {s}"))
+                .unwrap_or_default();
+            let text = if p.whole_folder {
+                format!("Installed program: {}{by}.", p.name)
+            } else {
+                format!(
+                    "Part of the installed program {}{by}. Uninstalling removes the whole program, not just this folder.",
+                    p.name
+                )
+            };
+            vec![(text, CardRole::Normal)]
+        }
+        Ownership::Package(p) => {
+            let mut text = format!("Installed by package {}", p.name);
+            match p.other_packages {
+                0 => {}
+                1 => text.push_str(" · 1 other package also puts files here"),
+                n => text.push_str(&format!(" · {n} other packages also put files here")),
+            }
+            vec![(text, CardRole::Normal)]
+        }
+        Ownership::Checking => vec![(
+            "Checking which program or package this belongs to…".into(),
+            CardRole::Secondary,
+        )],
+        Ownership::Unknown | Ownership::Nobody => Vec::new(),
+    }
+}
+
+/// What the card says about data the box shares with other files.
+fn sharing_note(data: &CardData) -> Option<String> {
+    let s = data.sharing?;
+    let frees = bs_layout::format_size(s.frees);
+    Some(if s.own {
+        format!("Shares data with other files or snapshots · deleting frees about {frees}")
+    } else {
+        format!(
+            "Some files below share data with other files, names or snapshots · deleting frees at least {frees}"
+        )
+    })
 }
 
 /// Where a card of `size` goes: beside the box when it fits there (right
@@ -407,9 +538,17 @@ pub fn build(
     }
 
     let mut notes: Vec<(String, CardRole)> = Vec::new();
+    if data.unreal {
+        notes.push((
+            "Not a real folder: it gathers files that no folder lists, so nothing can be done to it by name."
+                .into(),
+            CardRole::Normal,
+        ));
+    }
     if let Some(n) = data.note {
         notes.push((n.to_string(), CardRole::Normal));
     }
+    notes.extend(owner_notes(data));
     if data.in_progress {
         notes.push((
             "Still scanning: the size is what has been counted so far.".into(),
@@ -428,6 +567,11 @@ pub fn build(
                 .into(),
             CardRole::Secondary,
         ));
+    }
+    if !data.hard_link
+        && let Some(n) = sharing_note(data)
+    {
+        notes.push((n, CardRole::Secondary));
     }
     for (note, role) in notes {
         y += (section / 2.0).round();
@@ -560,6 +704,10 @@ mod tests {
             delete_state: DeleteMark::None,
             complete: true,
             blocked: false,
+            unreal: false,
+            owner: Ownership::Unknown,
+            sharing: None,
+            software_center: true,
         }
     }
 
@@ -643,25 +791,206 @@ mod tests {
         ));
     }
 
+    fn owned(owner: Ownership) -> CardData {
+        let mut d = data();
+        d.owner = owner;
+        d
+    }
+
+    fn program(can_uninstall: bool) -> Ownership {
+        Ownership::Program(crate::owners::ProgramInfo {
+            name: "Acme".into(),
+            publisher: None,
+            whole_folder: true,
+            can_uninstall,
+        })
+    }
+
+    fn package(software_entry: bool, command: Option<&str>) -> Ownership {
+        Ownership::Package(crate::owners::PackageInfo {
+            name: "foo".into(),
+            manager: "dpkg",
+            other_packages: 0,
+            removal_command: command.map(str::to_string),
+            software_entry,
+        })
+    }
+
     #[test]
-    fn handoffs_that_are_not_wired_up_say_so_instead_of_failing() {
-        let d = data();
-        for h in [Handoff::Uninstall, Handoff::Package] {
-            assert_eq!(
-                why_not(&d, Action::Handoff(h)),
-                Some("Not available in this version"),
-                "{h:?}"
-            );
-        }
-        assert_eq!(why_not(&d, Action::Handoff(Handoff::DiskCleanup)), None);
-        let mut with = data();
-        with.handoff = Some(Handoff::Uninstall);
-        let b = buttons(&with);
+    fn uninstall_says_why_not_until_a_program_is_found() {
+        let uninstall = Action::Handoff(Handoff::Uninstall);
+        let why = |d: &CardData| why_not(d, uninstall);
+        assert_eq!(why(&owned(program(true))), None);
+        assert_eq!(
+            why(&owned(program(false))),
+            Some("This program registered no uninstaller")
+        );
+        assert_eq!(
+            why(&owned(Ownership::Checking)),
+            Some("Still looking up the program")
+        );
+        assert_eq!(
+            why(&owned(Ownership::Nobody)),
+            Some("No installed program lists this folder")
+        );
+        assert_eq!(
+            why(&owned(package(true, None))),
+            Some("No installed program lists this folder")
+        );
+        assert_eq!(
+            why(&owned(Ownership::Unknown)),
+            Some("Programs are matched for folders of 100 MB or more")
+        );
+        let mut counting = owned(Ownership::Unknown);
+        counting.complete = false;
+        assert_eq!(why(&counting), Some("Still scanning"));
+        // A folder already in the bin has nothing to uninstall.
+        let mut gone = owned(program(true));
+        gone.delete_state = DeleteMark::InBin;
+        assert_eq!(why(&gone), Some("Already moved"));
+    }
+
+    #[test]
+    fn a_table_hand_off_shows_a_disabled_uninstall_while_the_lookup_has_no_answer() {
+        let mut d = owned(Ownership::Checking);
+        d.handoff = Some(Handoff::Uninstall);
+        let b = buttons(&d);
         let (_, reason) = b
             .iter()
-            .find(|(a, _)| matches!(a, Action::Handoff(_)))
+            .find(|(a, _)| *a == Action::Handoff(Handoff::Uninstall))
             .expect("the button is listed");
-        assert_eq!(*reason, Some("Not available in this version"));
+        assert_eq!(*reason, Some("Still looking up the program"));
+        // The answer lifts the reason.
+        d.owner = program(true);
+        let b = buttons(&d);
+        let (_, reason) = b
+            .iter()
+            .find(|(a, _)| *a == Action::Handoff(Handoff::Uninstall))
+            .unwrap();
+        assert_eq!(*reason, None);
+        // And it is listed once, not twice.
+        assert_eq!(
+            handoff_actions(&d)
+                .iter()
+                .filter(|a| **a == Action::Handoff(Handoff::Uninstall))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn package_actions_are_offered_only_for_what_the_package_has() {
+        assert_eq!(handoff_actions(&owned(Ownership::Nobody)), []);
+        assert_eq!(handoff_actions(&owned(Ownership::Checking)), []);
+        assert_eq!(
+            handoff_actions(&owned(package(true, Some("sudo apt remove foo")))),
+            [Action::OpenInSoftware, Action::CopyRemovalCommand]
+        );
+        assert_eq!(
+            handoff_actions(&owned(package(false, Some("sudo apt remove foo")))),
+            [Action::CopyRemovalCommand]
+        );
+        assert_eq!(
+            handoff_actions(&owned(package(true, None))),
+            [Action::OpenInSoftware]
+        );
+        // Without a software center the button is there and says so.
+        let mut d = owned(package(true, None));
+        d.software_center = false;
+        assert_eq!(
+            why_not(&d, Action::OpenInSoftware),
+            Some("No software center found")
+        );
+        d.software_center = true;
+        assert_eq!(why_not(&d, Action::OpenInSoftware), None);
+        assert_eq!(
+            why_not(&owned(package(false, None)), Action::OpenInSoftware),
+            Some("The package has no entry in Software")
+        );
+        assert_eq!(
+            why_not(&owned(package(true, None)), Action::CopyRemovalCommand),
+            Some("No removal command for this package")
+        );
+    }
+
+    #[test]
+    fn a_made_up_folder_refuses_everything_that_acts_on_disk_but_not_looking() {
+        let mut d = data();
+        d.unreal = true;
+        for action in [
+            Action::Open,
+            Action::ShowInFileManager,
+            Action::OpenTerminal,
+            Action::CopyPath,
+            Action::Properties,
+            Action::Rescan,
+            Action::Delete,
+            Action::DeletePermanently,
+            Action::Handoff(Handoff::Uninstall),
+            Action::Handoff(Handoff::DiskCleanup),
+            Action::OpenInSoftware,
+            Action::CopyRemovalCommand,
+        ] {
+            assert_eq!(
+                why_not(&d, action),
+                Some("Not a real folder (files no folder lists)"),
+                "{action:?}"
+            );
+        }
+        // Looking inside, undoing and the menus are not about that folder.
+        for action in [
+            Action::ZoomInto,
+            Action::Undo,
+            Action::ContextMenu,
+            Action::About,
+            Action::CheckForUpdates,
+        ] {
+            assert_eq!(why_not(&d, action), None, "{action:?}");
+        }
+        d.handoff = Some(Handoff::DiskCleanup);
+        assert!(handoff_actions(&d).is_empty());
+    }
+
+    #[test]
+    fn sharing_caveats_use_the_figures_and_the_right_words() {
+        let mut d = data();
+        d.sharing = Some(Sharing {
+            own: true,
+            frees: 1_000_000,
+        });
+        let t = texts(&build_at(
+            &d,
+            Rect::new(10.0, 100.0, 100.0, 100.0),
+            (50.0, 150.0),
+        ));
+        let all = t.join(" ");
+        assert!(
+            all.contains("Shares data with other files or snapshots · deleting frees about 1.0 MB"),
+            "{all}"
+        );
+        d.sharing = Some(Sharing {
+            own: false,
+            frees: 3_000_000_000,
+        });
+        let t = texts(&build_at(
+            &d,
+            Rect::new(10.0, 100.0, 100.0, 100.0),
+            (50.0, 150.0),
+        ));
+        assert!(
+            t.join(" ").contains(
+                "Some files below share data with other files, names or snapshots · deleting frees at least 3.0 GB"
+            )
+        );
+        // A hard-linked file already has its own sentence.
+        d.hard_link = true;
+        d.is_folder = false;
+        let t = texts(&build_at(
+            &d,
+            Rect::new(10.0, 100.0, 100.0, 100.0),
+            (50.0, 150.0),
+        ));
+        assert!(!t.join(" ").contains("deleting frees"));
     }
 
     #[test]

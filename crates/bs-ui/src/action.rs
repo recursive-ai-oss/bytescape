@@ -23,6 +23,10 @@ pub enum Action {
     Rescan,
     /// The tool that owns a recognized folder.
     Handoff(Handoff),
+    /// Show the package that installed the folder in the software center.
+    OpenInSoftware,
+    /// Copy the command that removes the package that installed the folder.
+    CopyRemovalCommand,
     /// Move to the Recycle Bin or Trash.
     Delete,
     /// Delete for good, after a confirmation.
@@ -31,6 +35,10 @@ pub enum Action {
     Undo,
     /// Open the context menu on the selection.
     ContextMenu,
+    /// The About box. Not about any box of the map.
+    About,
+    /// Open the releases page in the browser. Not about any box of the map.
+    CheckForUpdates,
 }
 
 impl Action {
@@ -58,11 +66,15 @@ impl Action {
                     "Open storage settings"
                 }
             }
-            Action::Handoff(_) => "Installed by a package",
+            Action::Handoff(_) => "Open the tool that owns this",
+            Action::OpenInSoftware => "Open in Software",
+            Action::CopyRemovalCommand => "Copy removal command",
             Action::Delete => "Delete",
             Action::DeletePermanently => "Delete permanently",
             Action::Undo => "Undo",
             Action::ContextMenu => "Menu",
+            Action::About => "About Bytescape",
+            Action::CheckForUpdates => "Check for updates",
         }
     }
 
@@ -70,7 +82,14 @@ impl Action {
     /// handled by the layers that own them (files, the system, deletion) and
     /// are only announced here.
     pub fn is_handled_here(self) -> bool {
-        matches!(self, Action::CopyPath | Action::ZoomInto)
+        matches!(
+            self,
+            Action::CopyPath
+                | Action::ZoomInto
+                | Action::CopyRemovalCommand
+                | Action::About
+                | Action::CheckForUpdates
+        )
     }
 }
 
@@ -93,6 +112,20 @@ pub mod reason {
     /// A block that stands for free space or the like, not for a file or
     /// folder.
     pub const NOT_ON_DISK: &str = "Not a file or folder";
-    /// A handoff that is not wired up in this version.
-    pub const NOT_YET: &str = "Not available in this version";
+    /// Under a folder the scan made up to hold files no folder lists.
+    pub const NOT_A_REAL_FOLDER: &str = "Not a real folder (files no folder lists)";
+    /// The program is installed but registered no way to remove it.
+    pub const NO_UNINSTALLER: &str = "This program registered no uninstaller";
+    /// Which program owns the folder is still being worked out.
+    pub const LOOKING_UP_PROGRAM: &str = "Still looking up the program";
+    /// No installed program lists the folder.
+    pub const NO_PROGRAM: &str = "No installed program lists this folder";
+    /// Programs and packages are matched only for big folders, after a scan.
+    pub const NOT_MATCHED: &str = "Programs are matched for folders of 100 MB or more";
+    /// The package has no entry in a software center.
+    pub const NO_SOFTWARE_ENTRY: &str = "The package has no entry in Software";
+    /// The desktop has no program that opens such entries.
+    pub const NO_SOFTWARE_CENTER: &str = "No software center found";
+    /// The package gave no command plain enough to paste into a terminal.
+    pub const NO_REMOVAL_COMMAND: &str = "No removal command for this package";
 }

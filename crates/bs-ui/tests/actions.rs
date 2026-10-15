@@ -2482,3 +2482,153 @@ fn a_long_list_of_notes_is_capped_and_the_warning_and_hold_stay() {
         "{lines:?}"
     );
 }
+
+// ---- the keyboard on a toast button that is gone ----------------------------------
+
+#[test]
+fn a_toast_whose_button_is_gone_does_not_catch_enter() {
+    let mut r = rig(BinStyle::Trash);
+    delete_first_folder(&mut r, 20); // folder1 to the bin
+    select(&mut r.shell, &[1]);
+    let fx = key(&mut r.shell, Key::Delete, 100);
+    run_job(&mut r.shell, fx, 110); // folder2 to the bin, toast with Undo
+    key(&mut r.shell, Key::Tab, 200); // the keyboard is on Undo
+    // The pointer presses the same Undo.
+    let p = toast_button_center(&r.shell, 300);
+    r.shell
+        .update(InputEvent::PointerMoved { x: p.0, y: p.1 }, t(300));
+    let fx = click(&mut r.shell, p, 310);
+    assert!(has_job(&fx));
+    run_job(&mut r.shell, fx, 320);
+    assert!(!r.shell.toast_text().unwrap_or_default().contains("Undo"));
+    let calls_before = r.fake.calls().len();
+    // Enter is meant for the map now: no Undo is on screen to press.
+    let fx = key(&mut r.shell, Key::Enter, 400);
+    if has_job(&fx) {
+        run_job(&mut r.shell, fx, 410);
+    }
+    assert_eq!(
+        r.fake.calls().len(),
+        calls_before,
+        "Enter restored something with no Undo button on screen"
+    );
+}
+
+#[test]
+fn a_toast_that_goes_at_once_takes_the_keyboard_off_its_button() {
+    let mut r = rig(BinStyle::Trash);
+    r.shell.set_reduced_motion(true);
+    delete_first_folder(&mut r, 20);
+    key(&mut r.shell, Key::Tab, 100);
+    // The toast ends and, with reduced motion, vanishes in the same tick.
+    r.shell.tick(t(20_000));
+    assert!(r.shell.toast_text().is_none());
+    // A new toast must not start with the keyboard already on its button.
+    select(&mut r.shell, &[1]);
+    let fx = key(&mut r.shell, Key::Delete, 21_000);
+    run_job(&mut r.shell, fx, 21_010);
+    assert!(r.shell.toast_text().unwrap_or_default().contains("Undo"));
+    let calls_before = r.fake.calls().len();
+    let fx = key(&mut r.shell, Key::Enter, 21_100);
+    if has_job(&fx) {
+        run_job(&mut r.shell, fx, 21_110);
+    }
+    assert_eq!(
+        r.fake.calls().len(),
+        calls_before,
+        "Enter pressed Undo unseen"
+    );
+}
+
+// ---- one question about the menu at a time ----------------------------------------
+
+fn checks(fx: &[ShellEffect]) -> usize {
+    fx.iter()
+        .filter(|e| matches!(e, ShellEffect::Run(j) if j.is_check()))
+        .count()
+}
+
+#[test]
+fn only_one_menu_question_runs_at_a_time_and_the_newest_waiting_one_goes_next() {
+    let mut r = rig(BinStyle::Trash);
+    select(&mut r.shell, &[0]);
+    let first = r.shell.update(InputEvent::Key(Key::ContextMenu), t(20));
+    assert_eq!(checks(&first), 1);
+    // Open and close the menu again and again while the first question is out.
+    let mut later = Vec::new();
+    for n in 0..4 {
+        r.shell.update(InputEvent::Key(Key::Escape), t(30 + n * 10));
+        let fx = r
+            .shell
+            .update(InputEvent::Key(Key::ContextMenu), t(35 + n * 10));
+        assert_eq!(checks(&fx), 0, "a second question started at once");
+        later.extend(fx);
+    }
+    assert!(r.shell.modal_open());
+    // The first question finishes: only the newest menu's question follows.
+    let job = first
+        .into_iter()
+        .find_map(|e| match e {
+            ShellEffect::Run(j) => Some(j),
+            _ => None,
+        })
+        .unwrap();
+    let next = r.shell.job_done(job.run(), t(100));
+    assert_eq!(checks(&next), 1);
+    let del = |s: &Shell<TreeSource>| {
+        s.menu_items()
+            .into_iter()
+            .find(|r| r.0 == "Delete")
+            .unwrap()
+    };
+    assert_eq!(del(&r.shell).1, "Checking…", "the open menu still waits");
+    settle(&mut r.shell, next, 110);
+    assert_eq!((del(&r.shell).1.as_str(), del(&r.shell).2), ("Del", true));
+}
+
+#[test]
+fn a_waiting_menu_question_is_dropped_when_its_menu_was_closed() {
+    let mut r = rig(BinStyle::Trash);
+    select(&mut r.shell, &[0]);
+    let first = r.shell.update(InputEvent::Key(Key::ContextMenu), t(20));
+    r.shell.update(InputEvent::Key(Key::Escape), t(30));
+    let waiting = r.shell.update(InputEvent::Key(Key::ContextMenu), t(40));
+    assert_eq!(checks(&waiting), 0);
+    r.shell.update(InputEvent::Key(Key::Escape), t(50));
+    let job = first
+        .into_iter()
+        .find_map(|e| match e {
+            ShellEffect::Run(j) => Some(j),
+            _ => None,
+        })
+        .unwrap();
+    let next = r.shell.job_done(job.run(), t(100));
+    assert_eq!(checks(&next), 0, "nobody is waiting for that answer");
+}
+
+// ---- the label of a delete whose view changed -------------------------------------
+
+#[test]
+fn a_shift_delete_whose_view_changed_says_so_with_its_own_label() {
+    let mut r = rig(BinStyle::Trash);
+    select(&mut r.shell, &[0]);
+    let fx = r
+        .shell
+        .update(InputEvent::Key(Key::DeletePermanently), t(20));
+    open_other_map(&mut r, "other");
+    settle(&mut r.shell, fx, 100);
+    assert_eq!(
+        info(&r.shell),
+        "Delete permanently: the view changed, so nothing was deleted"
+    );
+    // The plain Delete keeps its own label.
+    let mut r = rig(BinStyle::Trash);
+    select(&mut r.shell, &[0]);
+    let fx = r.shell.update(InputEvent::Key(Key::Delete), t(20));
+    open_other_map(&mut r, "other");
+    settle(&mut r.shell, fx, 100);
+    assert_eq!(
+        info(&r.shell),
+        "Delete: the view changed, so nothing was deleted"
+    );
+}

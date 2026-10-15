@@ -12,6 +12,8 @@ pub mod capacity;
 pub mod card;
 pub mod chrome;
 pub mod info;
+pub mod notice;
+pub mod owners;
 pub mod picker;
 pub mod popup;
 pub mod shell;
@@ -124,6 +126,12 @@ pub trait ViewSource {
     fn card(&self, _view: ViewId, _id: u32) -> Option<CardData> {
         None
     }
+    /// What deleting box `id` of `view` would free when it shares data with
+    /// other files. This can cost a look at every shared file of the tree, so
+    /// it is asked for the box a card describes, never for every box.
+    fn sharing(&self, _view: ViewId, _id: u32) -> Option<card::Sharing> {
+        None
+    }
     /// Which drive-level block box `id` of `view` is, if it is one.
     fn special(&self, _view: ViewId, _id: u32) -> Option<blocks::Special> {
         None
@@ -180,6 +188,8 @@ pub enum Key {
     Rescan,
     /// Shift+F10 or the menu key.
     ContextMenu,
+    /// F1: the About box.
+    About,
     /// Tab and Shift+Tab move between the buttons of a dialog.
     Tab,
     BackTab,
@@ -590,6 +600,7 @@ impl<S: ViewSource> App<S> {
                 | Key::CopyPath
                 | Key::Rescan
                 | Key::ContextMenu
+                | Key::About
                 | Key::Tab
                 | Key::BackTab
                 | Key::Space,

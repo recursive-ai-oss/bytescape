@@ -27,9 +27,63 @@ pub fn font_px() -> f32 {
     FONT_PX.get().copied().unwrap_or(DEFAULT_FONT_PX)
 }
 
+/// The lines `--help` prints.
+const USAGE: &str = "\
+Usage: bytescape [FOLDER]
+
+Shows where the space on a drive or in a folder is used.
+With no folder, Bytescape lists your drives and scans them.
+
+Options:
+  -h, --help       Print this text and exit
+  -V, --version    Print the version, build date and target, and exit
+
+Bytescape never connects to the internet.
+";
+
+/// The lines `--version` prints: the version, when the program was built, and
+/// what it was built for.
+fn version_text() -> String {
+    format!(
+        "Bytescape {}\nBuilt: {}\nTarget: {}\n",
+        env!("BYTESCAPE_VERSION"),
+        env!("BYTESCAPE_BUILD_DATE"),
+        env!("BYTESCAPE_TARGET")
+    )
+}
+
+/// The folder named on the command line, as the program should scan it.
+///
+/// The Explorer verb that scans a drive or folder passes the path with a
+/// trailing `\.`: a drive's own trailing backslash would otherwise swallow
+/// the closing quote of the command. `C:\.` means `C:\`, so the dot is
+/// dropped and the separator put back. `windows` says whether `\` separates
+/// parts (on other systems it is an ordinary character in a name).
+fn clean_path_argument(arg: &str, windows: bool) -> PathBuf {
+    let dotted = [Some(("/.", '/')), windows.then_some(("\\.", '\\'))];
+    for (suffix, separator) in dotted.into_iter().flatten() {
+        if let Some(base) = arg.strip_suffix(suffix) {
+            // Only a whole dot counts, and a dot alone stays the current folder.
+            if base.is_empty() {
+                return PathBuf::from(separator.to_string());
+            }
+            let mut path = base.to_string();
+            if !path.ends_with(['/', '\\']) || path.ends_with(':') {
+                path.push(separator);
+            }
+            return PathBuf::from(path);
+        }
+    }
+    PathBuf::from(arg)
+}
+
 /// What this run of the program does.
 #[derive(Clone, Debug)]
 pub enum Mode {
+    /// Print the version and exit.
+    Version,
+    /// Print the usage and exit.
+    Help,
     /// The normal window, scanning `path` (the home folder when absent).
     Interactive { path: Option<PathBuf> },
     /// Open a window, present one frame, report the timeline and exit. With a
@@ -118,6 +172,8 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
                 .ok_or_else(|| format!("{name} needs a value"))
         };
         match a.as_str() {
+            "--version" | "-V" => kind = "version",
+            "--help" | "-h" => kind = "help",
             "--bench-first-frame" => kind = "first-frame",
             "--bench-font-init" => kind = "font-init",
             "--bench-zoom" => kind = "zoom",
@@ -171,7 +227,7 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
             "--dark" => zoom.dark = true,
             "--state" => shot.states.push(value("--state")?),
             other if !other.starts_with('-') && path.is_none() => {
-                path = Some(PathBuf::from(other));
+                path = Some(clean_path_argument(other, cfg!(windows)));
             }
             other => return Err(format!("unknown argument {other}")),
         }
@@ -179,6 +235,8 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
     zoom.path = path.clone();
     shot.path = path.clone();
     Ok(match kind {
+        "version" => Mode::Version,
+        "help" => Mode::Help,
         "first-frame" => Mode::FirstFrame { path },
         "font-init" => Mode::FontInit,
         "zoom" => Mode::Zoom(zoom),
@@ -189,6 +247,15 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
         },
         _ => Mode::Interactive { path },
     })
+}
+
+/// What the About box says about this build.
+pub(crate) fn about() -> bs_ui::notice::AboutInfo {
+    bs_ui::notice::AboutInfo::new(
+        env!("BYTESCAPE_VERSION"),
+        env!("BYTESCAPE_BUILD_DATE"),
+        env!("BYTESCAPE_TARGET"),
+    )
 }
 
 fn main() -> ExitCode {
@@ -204,6 +271,17 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    match mode {
+        Mode::Version => {
+            print!("{}", version_text());
+            return ExitCode::SUCCESS;
+        }
+        Mode::Help => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
     // Still the only thread: the screen-reader setup changes the environment.
     access::prepare(
         no_access
@@ -212,6 +290,14 @@ fn main() -> ExitCode {
                 Mode::Interactive { .. } | Mode::FirstFrame { .. } | Mode::Live { .. }
             ),
     );
+    // A crash from here on leaves a report on this computer, shown on the next
+    // start. Nothing is sent anywhere.
+    bs_platform::crash::install(bs_platform::crash::AppInfo::new(
+        "bytescape",
+        env!("BYTESCAPE_VERSION"),
+        about().build_epoch().unwrap_or(0),
+        env!("BYTESCAPE_TARGET"),
+    ));
     match window::run(mode, t0) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -265,6 +351,65 @@ mod tests {
         };
         assert!(!z.windowed && z.dark);
         assert_eq!((z.cycles, z.size), (5, (800, 600)));
+    }
+
+    #[test]
+    fn version_and_help_are_modes_of_their_own() {
+        for flag in ["--version", "-V"] {
+            assert!(matches!(parse_args(&args(&[flag])), Ok(Mode::Version)));
+        }
+        for flag in ["--help", "-h"] {
+            assert!(matches!(parse_args(&args(&[flag])), Ok(Mode::Help)));
+        }
+    }
+
+    #[test]
+    fn the_version_text_names_the_version_the_date_and_the_target() {
+        let text = version_text();
+        assert!(text.starts_with(&format!("Bytescape {}\n", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains(&format!("Built: {}\n", env!("BYTESCAPE_BUILD_DATE"))));
+        assert!(text.contains(&format!("Target: {}\n", env!("BYTESCAPE_TARGET"))));
+        assert_eq!(text.lines().count(), 3);
+    }
+
+    #[test]
+    fn the_usage_lines_describe_the_folder_and_the_options() {
+        assert!(USAGE.starts_with("Usage: bytescape [FOLDER]"));
+        for needle in ["--help", "--version", "never connects to the internet"] {
+            assert!(USAGE.contains(needle), "{needle}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_dot_from_the_explorer_verb_is_dropped() {
+        let p = |s: &str, windows| clean_path_argument(s, windows);
+        assert_eq!(p("C:\\.", true), PathBuf::from("C:\\"));
+        assert_eq!(p("D:\\Games\\.", true), PathBuf::from("D:\\Games\\"));
+        assert_eq!(p("C:/.", true), PathBuf::from("C:/"));
+        assert_eq!(
+            p("\\\\server\\share\\.", true),
+            PathBuf::from("\\\\server\\share\\")
+        );
+        // Other paths are left alone.
+        assert_eq!(p("C:\\", true), PathBuf::from("C:\\"));
+        assert_eq!(p("C:\\Users", true), PathBuf::from("C:\\Users"));
+        assert_eq!(p(".", true), PathBuf::from("."));
+        assert_eq!(p("..", true), PathBuf::from(".."));
+        assert_eq!(p("C:\\..", true), PathBuf::from("C:\\.."));
+        assert_eq!(p("C:\\.hidden", true), PathBuf::from("C:\\.hidden"));
+        assert_eq!(p("C:\\a.b", true), PathBuf::from("C:\\a.b"));
+        // On other systems only the slash separates, so a backslash is a name.
+        assert_eq!(p("/data/.", false), PathBuf::from("/data/"));
+        assert_eq!(p("/.", false), PathBuf::from("/"));
+        assert_eq!(p("odd\\.", false), PathBuf::from("odd\\."));
+    }
+
+    #[test]
+    fn a_dotted_drive_argument_opens_the_drive() {
+        let Ok(Mode::Interactive { path }) = parse_args(&args(&["/data/."])) else {
+            panic!("expected the normal window");
+        };
+        assert_eq!(path, Some(PathBuf::from("/data/")));
     }
 
     #[test]
