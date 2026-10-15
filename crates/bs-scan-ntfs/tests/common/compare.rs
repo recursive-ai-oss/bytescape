@@ -4,7 +4,7 @@
 
 use super::testkit::{Info, flatten};
 use bs_scan::ScanResult;
-use bs_tree::{NodeFlags, NodeId, Snapshot};
+use bs_tree::{NodeFlags, NodeId, NodeKind, Snapshot};
 use std::collections::BTreeMap;
 
 /// A difference between two trees at one path.
@@ -23,6 +23,51 @@ pub struct Exception {
     pub reason: &'static str,
     /// Whether the exception covers this path.
     pub covers: fn(&str, &Info) -> bool,
+}
+
+/// The folder Windows keeps at the root of every volume for restore points,
+/// indexing and tracking data.
+pub const SYSTEM_FOLDER: &str = "System Volume Information";
+
+pub const R_SYSTEM_FOLDER_TIME: &str = "Windows writes into the System Volume Information folder at the root of a volume while the volume is mounted and in use, so the modification time of that one folder moves while a volume is being read. The listing and the reader look at different moments; the reader's time must be the later one, and no later than the system's own answer afterwards.";
+
+/// The one allowed difference between a reader and a walker on a mounted
+/// Windows volume that is not about the reader at all: the modification time
+/// of the system's own folder at the volume root. It covers that field of that
+/// folder and nothing else: not its size, not its presence, not the time of
+/// any other folder, and not a file or folder of that name anywhere else.
+pub const SYSTEM_FOLDER_TIME: Exception = Exception {
+    field: "mtime",
+    reason: R_SYSTEM_FOLDER_TIME,
+    covers: |path, info| path == SYSTEM_FOLDER && info.kind == NodeKind::Dir,
+};
+
+/// Checks the claim behind [`SYSTEM_FOLDER_TIME`] for one difference: the
+/// reader, which reads after the walker has finished, reports a strictly later
+/// time than the walker, and that time is not later than `restat`, what the
+/// system itself reports for the folder afterwards (when it can be asked).
+pub fn check_system_folder_time(d: &Diff, restat: Option<i64>) -> Result<(), String> {
+    if d.field != "mtime" || d.path != SYSTEM_FOLDER {
+        return Err(format!("{d:?}: not the time of {SYSTEM_FOLDER:?}"));
+    }
+    let number = |s: &str| {
+        s.parse::<i64>()
+            .map_err(|_| format!("{d:?}: {s:?} is not a time"))
+    };
+    let (reader, walker) = (number(&d.reader)?, number(&d.other)?);
+    if reader <= walker {
+        return Err(format!(
+            "{d:?}: the reader's time is not later than the walker's, so no write explains it"
+        ));
+    }
+    if let Some(now) = restat
+        && reader > now
+    {
+        return Err(format!(
+            "{d:?}: the reader reports a time later than the system's own answer ({now})"
+        ));
+    }
+    Ok(())
 }
 
 pub fn lossy(p: &[u8]) -> String {

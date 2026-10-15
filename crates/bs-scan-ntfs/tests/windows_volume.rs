@@ -13,7 +13,8 @@
 //! not explain. `BYTESCAPE_NTFS_LIVE=report` prints the differences and does
 //! not fail on them (for finding out what a new class of difference is); any
 //! other value is the strict default. Every phase of both tests runs under a
-//! time bound that names the phase.
+//! time bound that names the phase; the walk of the system drive, which is slow
+//! when cold, is bounded by lack of progress instead, and prints its count.
 mod common;
 
 use bs_scan::{ScanOptions, ScanResult, Walker, start};
@@ -63,6 +64,7 @@ const EXCEPTIONS: &[Exception] = &[
             info.kind == NodeKind::File && info.flags.contains(NodeFlags::SPARSE_OR_COMPRESSED)
         },
     },
+    SYSTEM_FOLDER_TIME,
 ];
 
 /// What the system itself says about files, read by opening them (which is
@@ -116,6 +118,21 @@ fn verify_exceptions(root: &Path, allowed: &[(Diff, &'static str)]) {
                 held,
                 "{d:?}: the clusters the file holds"
             );
+        } else if *reason == R_SYSTEM_FOLDER_TIME {
+            // Ask the system what it says now, by opening the folder the way
+            // an ordinary program does. If it will not say, the direction of
+            // the difference is all there is to check, and that is printed.
+            let restat = std::fs::metadata(root.join(&d.path))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|t| t.as_secs() as i64);
+            if restat.is_none() {
+                println!("the system would not give the time of {:?} again", d.path);
+            }
+            if let Err(why) = check_system_folder_time(d, restat) {
+                panic!("{why}");
+            }
         } else {
             assert_eq!(*reason, R_SYSTEM, "an exception without a check");
             assert_eq!(d.reader, "present");
@@ -388,10 +405,17 @@ fn the_system_drive_matches_the_walker_up_to_live_changes() {
     phase("flush the system drive", FLUSH_LIMIT, move || {
         flush_volume(letter)
     });
-    let walked = canon.clone();
-    let walker = phase("walk the system drive", WALK_LIMIT, move || {
-        Walker::scan_blocking(&walked, ScanOptions::default())
+    // The walk is watched for lack of progress rather than for total time:
+    // the first pass over a large cold drive is slow, and a progress line
+    // every minute shows how slow, and whether it is moving at all.
+    let handle = start(Arc::new(Walker), canon.clone(), ScanOptions::default());
+    watch("walk the system drive", LIVE_WALK, || {
+        (!handle.is_done()).then(|| {
+            let p = handle.progress();
+            p.files + p.dirs
+        })
     });
+    let walker = handle.wait();
     assert_sound(&walker);
     let raw = PathBuf::from(format!(r"\\.\{drive}"));
     let read_root = canon.clone();

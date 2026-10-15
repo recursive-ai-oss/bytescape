@@ -4,6 +4,15 @@
 //! needed; the tools (`mkfs.btrfs`) are, and the tests fail loudly without
 //! them.
 //!
+//! Two of the options the fixture uses are newer than some distributions'
+//! btrfs-progs: `--subvol` (6.12, for the nested subvolume) and `--compress`
+//! (6.13). Each is probed by running `mkfs.btrfs` with it once. Where an
+//! option is missing the tests build the image without it and print
+//! `NOT RUN` for what needed it, or skip a test whose whole point it is.
+//! Setting `BYTESCAPE_REQUIRE_BTRFS_SUBVOL` or `BYTESCAPE_REQUIRE_BTRFS_COMPRESS`
+//! turns the matching `NOT RUN` into a failure, so a runner that is meant to
+//! cover them cannot lose that coverage without anyone noticing.
+//!
 //! What a real image proves that the in-memory tests cannot: that the item
 //! layouts the reader decodes are the ones btrfs writes, and that a tree
 //! `mkfs` built reads back with the sizes, times, names and links of the
@@ -29,6 +38,7 @@ use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 /// A scratch directory below `TMPDIR`, removed at the end.
 struct Scratch(PathBuf);
@@ -113,23 +123,119 @@ fn build_tree(root: &Path) {
     fs::write(root.join("nested-subvol/top.txt"), "nested ".repeat(5000)).unwrap();
 }
 
-fn make_image(scratch: &Scratch, compress: Option<&str>) -> (PathBuf, PathBuf) {
+/// The `mkfs.btrfs` options the fixture uses that older btrfs-progs lack.
+struct Caps {
+    subvol: bool,
+    compress: bool,
+}
+
+/// Whether `mkfs.btrfs` takes `option`, found by making a small image with
+/// it. Asking the tool (rather than reading its help text or its version)
+/// is what a wrapper or a backport cannot fool. Any failure other than an
+/// unrecognised option is a broken tool and stops the test.
+fn mkfs_takes(option: &[&str]) -> bool {
+    let scratch = Scratch::new(&format!("probe{}", option[0].trim_start_matches('-')));
+    let src = scratch.0.join("src");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::write(src.join("sub/file"), b"probe\n").unwrap();
+    let img = scratch.0.join("fs.img");
+    let f = fs::File::create(&img).unwrap();
+    f.set_len(160 << 20).unwrap();
+    drop(f);
+    let out = Command::new("mkfs.btrfs")
+        .args(["-q", "-f", "--rootdir"])
+        .arg(&src)
+        .args(option)
+        .arg(&img)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run mkfs.btrfs: {e}"));
+    if out.status.success() {
+        return true;
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("unrecognized option") || err.contains("invalid option"),
+        "mkfs.btrfs failed for a reason other than a missing option ({option:?}): {err}{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    false
+}
+
+fn caps() -> &'static Caps {
+    static CAPS: OnceLock<Caps> = OnceLock::new();
+    CAPS.get_or_init(|| Caps {
+        subvol: mkfs_takes(&["--subvol", "sub"]),
+        compress: mkfs_takes(&["--compress", "zlib"]),
+    })
+}
+
+/// Whether the capability is there. When it is not, says `NOT RUN` for what
+/// needs it, or fails if the runner was declared to have it.
+fn available(have: bool, option: &str, minimum: &str, require_var: &str, needed_for: &str) -> bool {
+    if have {
+        return true;
+    }
+    assert!(
+        std::env::var_os(require_var).is_none(),
+        "{require_var} is set but mkfs.btrfs lacks {option} (need btrfs-progs ≥ {minimum})"
+    );
+    println!("NOT RUN: mkfs.btrfs lacks {option} (need btrfs-progs ≥ {minimum}): {needed_for}");
+    false
+}
+
+fn subvol_available(needed_for: &str) -> bool {
+    available(
+        caps().subvol,
+        "--subvol",
+        "6.12",
+        "BYTESCAPE_REQUIRE_BTRFS_SUBVOL",
+        needed_for,
+    )
+}
+
+fn compress_available(needed_for: &str) -> bool {
+    available(
+        caps().compress,
+        "--compress",
+        "6.13",
+        "BYTESCAPE_REQUIRE_BTRFS_COMPRESS",
+        needed_for,
+    )
+}
+
+/// An image made from the fixture tree.
+struct Made {
+    src: PathBuf,
+    img: PathBuf,
+    /// Whether `nested-subvol` is a subvolume of its own (else a directory).
+    nested_subvol: bool,
+}
+
+/// Builds the image. `compress` must only be asked for when
+/// `compress_available` said yes.
+fn make_image(scratch: &Scratch, compress: Option<&str>) -> Made {
     let src = scratch.0.join("src");
     build_tree(&src);
     let img = scratch.0.join("fs.img");
     let f = fs::File::create(&img).unwrap();
     f.set_len(160 << 20).unwrap();
     drop(f);
+    let nested_subvol = subvol_available("the nested subvolume is built as a directory");
     let mut cmd = Command::new("mkfs.btrfs");
-    cmd.args(["-q", "-f", "--rootdir"])
-        .arg(&src)
-        .args(["--subvol", "nested-subvol"]);
+    cmd.args(["-q", "-f", "--rootdir"]).arg(&src);
+    if nested_subvol {
+        cmd.args(["--subvol", "nested-subvol"]);
+    }
     if let Some(c) = compress {
         cmd.args(["--compress", c]);
     }
     cmd.arg(&img);
     run(&mut cmd);
-    (src, img)
+    Made {
+        src,
+        img,
+        nested_subvol,
+    }
 }
 
 /// What the directory the image was made from says about each path.
@@ -189,25 +295,51 @@ fn oracle(root: &Path) -> Oracle {
     o
 }
 
-/// The sum of `nbytes` of every inode of every tree, which is what the
-/// kernel's `st_blocks` is made from.
-fn nbytes_of_all_inodes(src: &ImageSource) -> u64 {
-    let mut total = 0;
-    for tree in [5u64, 256] {
+/// The sum of `nbytes` of every inode that is not a directory, in every tree,
+/// which is what the kernel's `st_blocks` is made from. The nested subvolume,
+/// when there is one, is tree 256.
+///
+/// The reader counts a directory as nothing, and a directory's `nbytes` is
+/// nothing too, with one exception: the top directory that older `mkfs`
+/// releases make, which they give one tree node (16 KiB by default). That is
+/// the only directory allowed to hold bytes here; any other is a finding.
+/// Returns the sum and the `nbytes` of the top directory.
+fn nbytes_of_all_inodes(src: &ImageSource, nested_subvol: bool) -> (u64, u64) {
+    const DIR: u32 = 0o040_000;
+    const TYPE_MASK: u32 = 0o170_000;
+    let trees: &[u64] = if nested_subvol { &[5, 256] } else { &[5] };
+    let (mut total, mut top) = (0, 0);
+    for &tree in trees {
         src.search(tree, Key::MIN, Key::MAX, &mut |item| {
             if item.key.ty == 1 && item.key.objectid >= 256 && item.data.len() >= 160 {
-                total += u64::from_le_bytes(item.data[24..32].try_into().unwrap());
+                let nbytes = u64::from_le_bytes(item.data[24..32].try_into().unwrap());
+                let mode = u32::from_le_bytes(item.data[52..56].try_into().unwrap());
+                if mode & TYPE_MASK != DIR {
+                    total += nbytes;
+                } else if tree == 5 && item.key.objectid == 256 {
+                    top = nbytes;
+                } else {
+                    assert_eq!(
+                        nbytes, 0,
+                        "directory {} of tree {tree} holds bytes",
+                        item.key.objectid
+                    );
+                }
             }
             bs_scan_btrfs::Flow::Continue
         })
         .unwrap();
     }
-    total
+    (total, top)
 }
 
 fn check(compress: Option<&str>, name: &str) {
+    if compress.is_some() && !compress_available("the compressed image is the point of this test") {
+        return;
+    }
     let scratch = Scratch::new(name);
-    let (srcdir, img) = make_image(&scratch, compress);
+    let made = make_image(&scratch, compress);
+    let (srcdir, img) = (made.src.clone(), made.img.clone());
     let source = ImageSource::open(&img);
     let run = try_read(&source, START, &BtrfsOptions::default()).expect("the image is read");
     assert_eq!(run.applied_rejected, 0);
@@ -219,7 +351,14 @@ fn check(compress: Option<&str>, name: &str) {
         "{:?}",
         run.report.diagnostics
     );
-    assert_eq!(run.report.trees, 2, "the nested subvolume was entered");
+    if made.nested_subvol {
+        assert_eq!(run.report.trees, 2, "the nested subvolume was entered");
+    } else {
+        assert_eq!(
+            run.report.trees, 1,
+            "without --subvol the nested folder is an ordinary directory"
+        );
+    }
     let m = run.flat();
     let o = oracle(&srcdir);
 
@@ -275,7 +414,12 @@ fn check(compress: Option<&str>, name: &str) {
     assert_eq!(run.report.sharing.files, 0);
     let root = run.snapshot.root().unwrap();
     if compress.is_none() {
-        assert_eq!(root.allocated(), nbytes_of_all_inodes(&source));
+        let (files, top) = nbytes_of_all_inodes(&source, made.nested_subvol);
+        assert!(
+            top == 0 || top == 16384,
+            "the top directory holds {top} bytes, not nothing or one node"
+        );
+        assert_eq!(root.allocated(), files);
     }
     assert!(m.values().all(|i| !i.flags.contains(NodeFlags::SHARED)));
 
@@ -322,7 +466,11 @@ fn an_image_with_zstd_compression_reports_logical_and_on_disk_sizes() {
 #[test]
 fn reading_an_image_twice_gives_the_same_tree() {
     let scratch = Scratch::new("twice");
-    let (_, img) = make_image(&scratch, Some("zlib"));
+    // Compression makes the tree richer, but reading twice is the point; an
+    // uncompressed image still tests that.
+    let compress =
+        compress_available("reading an uncompressed image twice instead").then_some("zlib");
+    let img = make_image(&scratch, compress).img;
     let source = ImageSource::open(&img);
     let a = try_read(&source, START, &BtrfsOptions::default())
         .unwrap()
