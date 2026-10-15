@@ -78,7 +78,7 @@ jobs:
     # The job limit is the sum of its step limits plus 15 minutes for checkout,
     # toolchain and cache, so a step's own limit is always what ends a hang.
     # Linux: 5 + 20 + 15 (ext4) + 15 (btrfs) + 15 (mounts) + 20 = 90, limit
-    # 105. Windows: 10 + 20 = 30, limit 45.
+    # 105. Windows: 10 + 5 + 20 = 35, limit 50.
     timeout-minutes: ${{ matrix.limit }}
     strategy:
       fail-fast: false
@@ -87,7 +87,7 @@ jobs:
           - os: ubuntu-24.04
             limit: 105
           - os: windows-2025
-            limit: 45
+            limit: 50
     env:
       # These runners are throwaway machines, so tests that change operating
       # system state (Recycle Bin, Trash, deletes) may run here. Never set
@@ -126,7 +126,14 @@ jobs:
       - name: Helper and file operation tests (Windows)
         if: ${{ runner.os == 'Windows' }}
         timeout-minutes: 10
-        run: cargo test --locked -p bs-fsops -p bs-ipc -p bs-platform -p bytescape-helper -- --nocapture --test-threads=1
+        run: cargo test --locked -p bs-fsops -p bs-ipc -p bs-platform -p bytescape-helper -- --nocapture --test-threads=1 2>&1 | tee helper-tests.log
+      # A test that cannot do its job prints NOT RUN and still passes, so a
+      # green run alone does not show that the launch, pipe, elevation and
+      # delete tests for Windows ran. This step reads the log for them.
+      - name: Check that the Windows helper tests ran
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        timeout-minutes: 5
+        run: bash packaging/ci/check-windows-helper-tests.sh helper-tests.log
       # The four packages above ran one test at a time. They are left out here:
       # run in parallel they fight over the Recycle Bin, which is what the
       # one-at-a-time step avoids. It runs even when the step above failed, so
@@ -172,6 +179,60 @@ jobs:
         env:
           BYTESCAPE_DISPOSABLE_HOST: "1"
         run: bash packaging/ci/linux-privileged-tests.sh
+
+  # The finished Windows helper, read as a file: it imports nothing that starts
+  # another program, it is linked to look for DLLs in the system folder only,
+  # and a DLL planted beside it (a bcryptprimitives.dll whose DllMain writes a
+  # file) is not loaded when it starts. The release build is the one that
+  # counts, so this builds it. The runner is an elevated account, which the
+  # helper's manifest needs for the last check.
+  windows-helper-binary:
+    name: windows helper binary
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the helper
+        timeout-minutes: 25
+        run: cargo build --release --locked -p bytescape-helper
+      - name: Imports, DLL search and the DLL canary
+        timeout-minutes: 10
+        run: python packaging/windows/check-helper.py all target/release/bytescape-helper.exe
+
+  # The Debian package and polkit: both actions are known, and pkexec starts the
+  # helper as root without the desktop's DISPLAY and XAUTHORITY. It builds the
+  # package (a release build, slow), so it runs on request and weekly.
+  polkit-pkexec:
+    name: polkit and pkexec
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - name: Install the packaging tools
+        timeout-minutes: 15
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config dpkg-dev
+          cargo install --locked cargo-deb@3.8.0
+      - name: Build the .deb
+        timeout-minutes: 30
+        run: packaging/linux/build-deb.sh --out dist
+      - name: Install it in a clean container and run pkexec
+        timeout-minutes: 10
+        run: |
+          deb="$(ls dist/*.deb)"
+          docker run --rm --memory=4g -v "$PWD:/repo:ro" -v "$PWD/dist:/pkg:ro" ubuntu:24.04 \
+            bash /repo/packaging/ci/polkit-pkexec-test.sh "/pkg/$(basename "$deb")"
 
   deny:
     name: cargo-deny
@@ -293,7 +354,14 @@ jobs:
       - name: Helper and file operation tests (Windows)
         if: ${{ runner.os == 'Windows' && !cancelled() }}
         timeout-minutes: 10
-        run: cargo test --locked -p bs-fsops -p bs-ipc -p bs-platform -p bytescape-helper -- --nocapture --test-threads=1
+        run: cargo test --locked -p bs-fsops -p bs-ipc -p bs-platform -p bytescape-helper -- --nocapture --test-threads=1 2>&1 | tee helper-tests.log
+      # A test that cannot do its job prints NOT RUN and still passes, so a
+      # green run alone does not show that the launch, pipe, elevation and
+      # delete tests for Windows ran. This step reads the log for them.
+      - name: Check that the Windows helper tests ran
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        timeout-minutes: 5
+        run: bash packaging/ci/check-windows-helper-tests.sh helper-tests.log
       - name: Tests (Windows)
         if: ${{ runner.os == 'Windows' && !cancelled() }}
         timeout-minutes: 20

@@ -4,7 +4,9 @@
 //! dependencies of the helper and of every crate in its normal closure, and
 //! everything those depend on: code that runs while the helper is compiled and
 //! ships nothing but what it writes) must be a subset of the pinned list in
-//! `xtask/helper-build-deps.allow`.
+//! `xtask/helper-build-deps.allow`. The helper's feature tree must not switch
+//! on `bs-scan`'s `iouring-bench` feature, which adds the io_uring system
+//! calls the helper's documented list of calls does not include.
 
 use crate::util::{
     Finding, TARGETS, cargo_metadata, normalize_crate_name, package_names, parse_allow_lines,
@@ -13,6 +15,7 @@ use crate::util::{
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::process::Command;
 
 /// The package whose closure is checked.
 pub const HELPER: &str = "bytescape-helper";
@@ -180,6 +183,66 @@ pub fn check_build_dependencies(
         .collect()
 }
 
+/// The `bs-scan` feature that adds the io_uring system calls (setup, enter,
+/// register). It exists for a benchmark; the helper must never get it.
+pub const IOURING_FEATURE: &str = "iouring-bench";
+
+/// Whether `cargo tree -p bytescape-helper -e features --prefix none` output
+/// shows `bs-scan` with the io_uring benchmark feature switched on.
+pub fn tree_enables_iouring(tree: &str) -> bool {
+    let wanted = format!("bs-scan feature \"{IOURING_FEATURE}\"");
+    tree.lines()
+        .map(|line| line.trim_start_matches(|c: char| !c.is_alphanumeric()))
+        .any(|line| line.starts_with(&wanted))
+}
+
+/// Runs `cargo tree` for the helper alone, on one target, with all of the
+/// helper's own features switched on, and returns its feature edges. Only the
+/// helper's selection counts: a feature that another workspace member turns
+/// on for its own build is not the helper's.
+fn helper_tree_features(root: &Path, target: &str) -> Result<String, String> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
+    let output = Command::new(cargo)
+        .current_dir(root)
+        .args([
+            "tree",
+            "--locked",
+            "-p",
+            HELPER,
+            "--all-features",
+            "-e",
+            "features",
+            "--prefix",
+            "none",
+            "--target",
+            target,
+        ])
+        .output()
+        .map_err(|error| format!("could not run cargo tree: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo tree failed for {target}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// A finding when the helper's feature tree enables the io_uring feature.
+pub fn check_iouring(tree: &str, target: &str) -> Vec<Finding> {
+    if tree_enables_iouring(tree) {
+        vec![Finding::new(
+            format!("bs-scan/{IOURING_FEATURE}"),
+            None,
+            format!(
+                "is enabled in the feature tree of {HELPER} on {target}; the helper must not contain the io_uring system calls"
+            ),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Compares one target's closure with the allowlist.
 pub fn check_metadata(metadata: &Value, target: &str, allow: &BTreeSet<String>) -> Vec<Finding> {
     let Some(closure) = helper_closure(metadata) else {
@@ -216,6 +279,7 @@ pub fn run(root: &Path) -> Result<Vec<Finding>, String> {
         let metadata = cargo_metadata(root, target)?;
         findings.extend(check_metadata(&metadata, target, &allow));
         findings.extend(check_build_dependencies(&metadata, target, &build_allow));
+        findings.extend(check_iouring(&helper_tree_features(root, target)?, target));
     }
     Ok(findings)
 }

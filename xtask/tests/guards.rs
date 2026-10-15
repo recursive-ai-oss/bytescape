@@ -1089,6 +1089,26 @@ fn helper_build_closure_fails_when_the_helper_is_missing() {
 }
 
 #[test]
+fn helper_deps_fails_when_the_helper_gets_the_iouring_feature() {
+    // What `cargo tree -p bytescape-helper -e features --prefix none` prints
+    // for a helper whose bs-scan dependency enables the benchmark feature.
+    let planted = "bytescape-helper v0.1.0 (/w)\nbs-scan v0.1.0 (/w)\nbs-scan feature \"default\"\nbs-scan feature \"iouring-bench\"\n";
+    let findings = helper_deps::check_iouring(planted, "x86_64-unknown-linux-gnu");
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].subject, "bs-scan/iouring-bench");
+    // The same line inside a drawn tree, with branch characters in front.
+    let drawn =
+        "bytescape-helper v0.1.0\n\u{2514}\u{2500}\u{2500} bs-scan feature \"iouring-bench\"\n";
+    assert_eq!(helper_deps::check_iouring(drawn, "t").len(), 1);
+}
+
+#[test]
+fn helper_deps_passes_a_helper_without_the_iouring_feature() {
+    let clean = "bytescape-helper v0.1.0 (/w)\nbs-scan v0.1.0 (/w)\nbs-scan feature \"default\"\nsome-crate feature \"iouring-bench\"\nbs-scan feature \"iouring-bench-extra\"\n";
+    assert!(helper_deps::check_iouring(clean, "t").is_empty());
+}
+
+#[test]
 fn helper_deps_allow_file_ignores_comments() {
     let parsed = helper_deps::parse_allow("# note\nbs_tree  # why\n\nbs-ipc\n");
     assert_eq!(parsed, allow(&["bs-tree", "bs-ipc"]));

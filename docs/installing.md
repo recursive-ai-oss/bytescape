@@ -16,7 +16,7 @@ Every release file is named `bytescape-<version>-<os>-<arch>.<ext>`, with `x64` 
 
 **Why the installer goes into Program Files.** Bytescape has two programs. The interface runs as you. The helper, `bytescape-helper.exe`, runs with administrator rights, and only when you ask for a full scan or a delete that needs them. Windows only lets administrators write to Program Files, so another program running as you cannot swap the helper for a different one.
 
-**The portable zip.** Keep both `.exe` files in one folder. If you unzip it into a folder your own account can write to, the helper sits where any program running as you could replace it before you approve the administrator prompt. For full scans, use the installer, or unzip into a folder that only administrators can write to.
+**The portable zip.** Keep both `.exe` files in one folder. If you unzip it into a folder your own account can write to, the helper sits where any program running as you could replace it before you approve the administrator prompt. For full scans, use the installer, or unzip into a folder that only administrators can write to. The helper loads Windows' own libraries from the system folder only, so a DLL placed beside it is not picked up, but that does not protect the helper file itself: a program running as you can still replace it in a folder you can write to.
 
 **Windows 11 and the right-click entry.** Windows 11 shows classic entries under "Show more options".
 

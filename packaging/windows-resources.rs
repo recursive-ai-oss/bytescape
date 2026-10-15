@@ -72,3 +72,34 @@ pub fn embed_windows_resources(bin: &str, description: &str, with_icon: bool) {
         std::process::exit(1);
     }
 }
+
+/// Links the program so that Windows looks for its DLLs only in the system
+/// folder (DependentLoadFlag 0x800, LOAD_LIBRARY_SEARCH_SYSTEM32), not in the
+/// folder the program sits in. The elevated helper uses this: a DLL planted
+/// next to a genuine, signed helper in a folder the user can write to (an
+/// unzipped portable build, say) would otherwise be loaded into a process
+/// that runs with administrator rights. It is a load-config field in the
+/// finished file, so it needs no code in the program.
+///
+/// MSVC links it with `/DEPENDENTLOADFLAG`; the llvm-mingw linker (the
+/// `gnullvm` targets, used here for lint and wine checks) takes the same
+/// setting as `--dependent-load-flag`. The GNU linker has no such option, so
+/// there the build says so and goes on: no release file is built for it.
+// Only the helper calls this; the interface's build script includes the file too.
+#[allow(dead_code)]
+pub fn restrict_dependent_dll_search() {
+    println!("cargo:rerun-if-changed=build.rs");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.ends_with("-msvc") {
+        println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+    } else if target.ends_with("-gnullvm") {
+        println!("cargo:rustc-link-arg-bins=-Wl,--dependent-load-flag=0x800");
+    } else {
+        println!(
+            "cargo:warning=no restricted DLL search for {target}: this linker has no dependent-load-flag option"
+        );
+    }
+}

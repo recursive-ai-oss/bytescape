@@ -29,11 +29,11 @@ Each optional step is skipped, with a warning, when its variable is not `true`, 
 | `windows sign programs` | `windows-2025`, `release` environment | Signs the two programs. Only when switched on. |
 | `windows package` | `windows-2025` | The portable zip and the installer, made from the (signed) programs. |
 | `windows sign installer` | `windows-2025`, `release` environment | Signs the installer. Only when switched on. |
-| `windows check` | `windows-2025` | The x64 installer is installed, checked (files, permissions, version, right-click entries) and uninstalled. |
+| `windows check` | `windows-2025` | The x64 installer is installed, checked (files, permissions, version, right-click entries) and uninstalled. The helper inside each portable zip is read as a file (no import starts a program; DLL search restricted to the system folder), and on x64 a DLL planted beside it is checked not to be loaded. |
 | `windows arm64 install check` | `windows-11-arm` | The same check for the ARM64 installer, when `ARM64_CI` is `true`. |
 | `linux build` | `ubuntu-22.04`, and `ubuntu-22.04-arm` with `ARM64_CI` | The `.deb` and the AppImage, with no credential. |
-| `linux sign` | the same, `release` environment | A signature file for each `.deb`, and the AppImage packed again with its embedded signature. Compiles nothing. Only when switched on. |
-| `linux check` | the same | The final `.deb` is installed in clean Ubuntu 22.04 and 24.04 containers; the final AppImage is run on 22.04. |
+| `linux sign` | `ubuntu-24.04`, `release` environment | A detached signature file (`.asc`) for each `.deb` and each AppImage. It holds the key, so it runs no repository code and runs nothing it downloaded: it only calls `gpg`. Only when switched on. |
+| `linux check` | the same | The final `.deb` is installed in clean Ubuntu 22.04 and 24.04 containers; the final AppImage is run on 22.04; and in a 24.04 container pkexec is checked to start the helper as root without `DISPLAY` or `XAUTHORITY`. |
 | `arm64-compile-check` | `ubuntu-22.04` | Without a native ARM64 runner, checks that the ARM64 Linux code compiles. |
 | `snap` | `ubuntu-24.04`, and the ARM64 runner with `ARM64_CI` | The strict snap and the classic-ready snap. The strict one is installed from the file and its plugs are checked. |
 | `snap upload` | `ubuntu-24.04`, `release` environment | Uploads the strict snap to `edge`. Tag builds only, and only when switched on. Moving it to another channel is manual. |
@@ -50,7 +50,7 @@ Names only; the values are never in the repository. All are environment secrets 
 |---|---|
 | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | Signing in to Azure by OpenID Connect (no stored client secret). The federated credential must name the subject `repo:recursive-ai-oss@<owner id>/bytescape@<repository id>:environment:release`: this repository uses GitHub's immutable subject form, which carries the numeric owner and repository ids. Run the `oidc subject check` job to see the exact text. |
 | `AZURE_SIGNING_ENDPOINT`, `AZURE_SIGNING_ACCOUNT`, `AZURE_SIGNING_PROFILE` | Which signing account and certificate profile to use. Windows signing needs all six Azure secrets. |
-| `LINUX_GPG_PRIVATE_KEY`, `LINUX_GPG_KEY_ID` | A detached signature next to each `.deb`, and the AppImage's embedded signature. |
+| `LINUX_GPG_PRIVATE_KEY`, `LINUX_GPG_KEY_ID` | A detached signature (`.asc`) next to each `.deb` and each AppImage. |
 | `SNAPCRAFT_STORE_CREDENTIALS` | Uploading the strict snap to the `edge` channel. |
 
 ## Building a file by hand

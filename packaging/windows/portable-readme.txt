@@ -15,5 +15,13 @@ write to, any program running as you could replace the helper before you
 approve the prompt. If you want full scans, the installer is the better choice:
 it puts both programs under Program Files.
 
+The same goes for other files in that folder. The helper is built to load
+Windows' own libraries (DLLs) from the system folder only, so a DLL that lands
+next to it is not picked up by the helper. That protects the helper's libraries,
+not the helper file itself, and not the rest of the folder: a program running as
+you can still replace bytescape-helper.exe. Do not unzip into a folder you share
+with programs you do not trust, such as Downloads, if you plan to approve the
+administrator prompt; put the folder somewhere only administrators can write.
+
 Bytescape never connects to the internet.
 https://github.com/recursive-ai-oss/bytescape
