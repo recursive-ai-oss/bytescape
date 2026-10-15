@@ -17,6 +17,7 @@ tiny-skia = { workspace = true }
 softbuffer = { workspace = true }
 raw-window-handle = { workspace = true }
 cosmic-text = { workspace = true }
+wgpu = { workspace = true }
 
 # System font discovery through fontconfig on Linux; Windows reads its font
 # directory directly.

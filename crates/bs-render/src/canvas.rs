@@ -1,26 +1,27 @@
 //! The narrow drawing interface the user interface draws through.
 //!
-//! # Implementing another backend
+//! # Backends
 //!
 //! Views, widgets and the item painter are generic over [`Canvas`] and never
-//! name a pixel format or a rasterizer. A GPU backend implements the same
-//! small set of methods:
+//! name a pixel format or a rasterizer. Two backends implement it:
 //!
-//! * `fill_rect`, `stroke_rect` and `fill_pattern` become instanced
-//!   rectangles; the hatch is a repeating texture tile, as the software
-//!   backend uses a repeating pattern shader.
-//! * `draw_text` and `measure_text` map to a glyph atlas keyed the same way
-//!   the software backend's label cache is keyed.
-//! * `push_clip` and `pop_clip` map to scissor rectangles.
+//! * [`crate::skia::SkiaCanvas`] draws on the CPU with `tiny-skia`.
+//! * [`crate::gpu::GpuCanvas`] records rectangles for one GPU pipeline: fills,
+//!   strokes and hatches become instanced rectangles (the hatch is computed in
+//!   the shader), and `draw_text` and `measure_text` use the same label cache
+//!   as the software backend, with the label images packed into atlas textures.
+//!   Clips are applied on the CPU by cropping each rectangle, so both backends
+//!   round and clip alike.
 //!
-//! `Canvas` covers drawing only. What happens around it is the software
-//! backend's own: the retained picture, dirty regions, the zoom that scales
-//! and crossfades two cached images, tiled repaints, and presenting through
-//! `softbuffer` all live in [`crate::Renderer`] and [`crate::present`]. A GPU
-//! backend supplies its own renderer and presenter behind the same calls the
-//! UI crate makes today (`set_items`, `set_hover`, `set_selected`,
-//! `begin_zoom`, `paint`, `resize`) and keeps the zoom textures on the GPU, so
-//! nothing in `bs-ui` changes.
+//! `Canvas` covers drawing only. What happens around it belongs to each
+//! backend's renderer: the retained picture, dirty regions, the zoom that
+//! scales and blends two cached images, and presenting. The software versions
+//! are [`crate::Renderer`] and [`crate::present`]; the GPU versions are
+//! [`crate::gpu::GpuRenderer`] and [`crate::gpu::GpuPresenter`], which take the
+//! same calls (`set_items`, `set_hover`, `set_selected`, `begin_zoom` and so
+//! on) and keep the zoom textures on the GPU, so nothing in `bs-ui` changes.
+//! Only the last step differs: the software renderer fills a pixel buffer in
+//! `paint`, and the GPU renderer draws into a texture in `paint_to`.
 //!
 //! All coordinates are device pixels. Callers snap rectangles to whole pixels
 //! when they want crisp edges; backends do not re-snap.
@@ -100,6 +101,44 @@ pub trait Canvas {
     fn push_clip(&mut self, rect: Rect);
 
     fn pop_clip(&mut self);
+}
+
+/// Draws an outline as thin filled rectangles, solid or dashed. Backends that
+/// fill rectangles on whole pixels share it, so strokes look the same on each.
+pub(crate) fn stroke_with_fills<C: Canvas + ?Sized>(c: &mut C, rect: Rect, stroke: Stroke) {
+    let w = stroke.width.round().max(1.0);
+    if rect.w < 1.0 || rect.h < 1.0 {
+        return;
+    }
+    let color = stroke.color;
+    match stroke.dash {
+        None => {
+            let h = w.min(rect.h);
+            let v = w.min(rect.w);
+            c.fill_rect(Rect::new(rect.x, rect.y, rect.w, h), color);
+            c.fill_rect(Rect::new(rect.x, rect.bottom() - h, rect.w, h), color);
+            let inner = (rect.h - 2.0 * h).max(0.0);
+            c.fill_rect(Rect::new(rect.x, rect.y + h, v, inner), color);
+            c.fill_rect(Rect::new(rect.right() - v, rect.y + h, v, inner), color);
+        }
+        Some((dash, gap)) => {
+            let (dash, gap) = (dash.max(1.0), gap.max(1.0));
+            let mut x = rect.x;
+            while x < rect.right() {
+                let len = dash.min(rect.right() - x);
+                c.fill_rect(Rect::new(x, rect.y, len, w), color);
+                c.fill_rect(Rect::new(x, rect.bottom() - w, len, w), color);
+                x += dash + gap;
+            }
+            let mut y = rect.y;
+            while y < rect.bottom() {
+                let len = dash.min(rect.bottom() - y);
+                c.fill_rect(Rect::new(rect.x, y, w, len), color);
+                c.fill_rect(Rect::new(rect.right() - w, y, w, len), color);
+                y += dash + gap;
+            }
+        }
+    }
 }
 
 /// One recorded drawing operation.

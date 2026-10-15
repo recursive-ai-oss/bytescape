@@ -10,11 +10,14 @@
 //! * [`renderer`]: the retained picture, dirty regions, tiled repaints and the
 //!   cached-image zoom.
 //! * [`present`]: presenting a frame through `softbuffer`.
+//! * [`gpu`]: the same interface and renderer on the GPU, with a fallback to
+//!   the software path.
 
 pub mod canvas;
 pub mod card;
 pub mod chrome;
 pub mod geom;
+pub mod gpu;
 pub mod pixel;
 pub mod present;
 pub mod renderer;

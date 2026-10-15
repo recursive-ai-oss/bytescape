@@ -593,6 +593,9 @@ struct Verdict {
     pass: bool,
     strict: bool,
     detail: String,
+    /// The numbers came from a software adapter standing in for a GPU, so
+    /// they say nothing about a graphics card.
+    software_adapter: bool,
 }
 
 fn verdict_first_frame(kv: &Kv, prefix: &str, series: &str) -> Verdict {
@@ -603,6 +606,7 @@ fn verdict_first_frame(kv: &Kv, prefix: &str, series: &str) -> Verdict {
     Verdict {
         pass: p95 < FIRST_FRAME_LIMIT_MS,
         strict: max < FIRST_FRAME_LIMIT_MS,
+        software_adapter: false,
         detail: format!(
             "median {med:.1} ms, p95 {p95:.1} ms, max {max:.1} ms against {FIRST_FRAME_LIMIT_MS} ms. Pass: p95 under the limit. Strict: no launch at or over the limit"
         ),
@@ -621,6 +625,9 @@ fn verdict_zoom(kv: &Kv, layer: &str, series: &str) -> Verdict {
     Verdict {
         pass: p99 <= FRAME_BUDGET_MS && over <= allowed && over_hard == 0.0,
         strict: over == 0.0,
+        software_adapter: kv
+            .get(&format!("{layer}.software_adapter"))
+            .is_some_and(|v| v == "true"),
         detail: format!(
             "p99 {p99:.2} ms, max {max:.2} ms, {over} of {n} frames over {FRAME_BUDGET_MS} ms, {over_hard} over {FRAME_HARD_LIMIT_MS} ms. Pass: p99 within {FRAME_BUDGET_MS} ms, at most 1% of frames over it and none over {FRAME_HARD_LIMIT_MS} ms. Strict: no frame over {FRAME_BUDGET_MS} ms"
         ),
@@ -655,7 +662,9 @@ fn verdicts_for(kv: &Kv) -> Vec<(String, Verdict)> {
 /// Every zoom layer the harness can measure: the synthetic scene, then the
 /// real scan at the normal font and at the dense stress font. A layer that
 /// was not measured has no keys and is skipped.
-const ZOOM_LAYERS: [(&str, &str); 8] = [
+const ZOOM_LAYERS: [(&str, &str); 10] = [
+    ("wgpu_zoom_windowed", "wgpu_windowed"),
+    ("wgpu_zoom_offscreen", "wgpu_offscreen"),
     ("zoom_windowed", "windowed"),
     ("zoom_offscreen", "offscreen"),
     ("zoom_offscreen_unpaced", "offscreen_unpaced"),
@@ -731,7 +740,15 @@ fn first_frame_table(md: &mut String, kv: &Kv, prefix: &str, what: &str, with_fo
 }
 
 /// The zoom layers of the synthetic scene, with their descriptions.
-const ZOOM_TABLES: [(&str, &str); 3] = [
+const ZOOM_TABLES: [(&str, &str); 5] = [
+    (
+        "wgpu_windowed",
+        "GPU backend, synthetic scene: render + present into a 4K window, paced in real time",
+    ),
+    (
+        "wgpu_offscreen",
+        "GPU backend, synthetic scene: render into a 3840x2160 texture and wait for the GPU, paced in real time",
+    ),
     (
         "windowed",
         "synthetic scene: render + present into a 4K window (X11 shared memory), paced in real time",
@@ -754,6 +771,22 @@ fn zoom_table(md: &mut String, kv: &Kv, layer: &str, title: &str) {
     }
     let get = |k: &str| kv.get(k).map_or("?", |v| v).to_string();
     let _ = writeln!(md, "### Zoom, {title}\n");
+    if let Some(adapter) = kv.get(&format!("{layer}.adapter")) {
+        let get = |k: &str| {
+            kv.get(&format!("{layer}.{k}"))
+                .map_or("?", |v| v)
+                .to_string()
+        };
+        let _ = writeln!(
+            md,
+            "Adapter: {adapter} ({}, {}), present mode {}.{}\n",
+            get("adapter_type"),
+            get("adapter_backend"),
+            get("present_mode"),
+            kv.get(&format!("{layer}.note"))
+                .map_or(String::new(), |n| format!(" **{n}.**"))
+        );
+    }
     md.push_str("Milliseconds per frame (CPU time of the render call, plus the present call for the windowed layer). A windowed frame is this frame's render plus the display server's processing of the previous frame's image, because the present call only queues the image: each zoom's last image is charged to the next zoom's first frame. In the cold series the first frame also carries the layout time of the new view. The cold return series is the zoom-out after each cold zoom-in; it is reported but not part of a verdict.\n\n");
     md.push_str("| series | frames | n | p50 | p95 | p99 | max | over 16.7 ms | over 33.3 ms |\n|---|---|---|---|---|---|---|---|---|\n");
     for series in ["warm", "cold", "cold_return"] {
@@ -927,9 +960,10 @@ fn merge(args: &[String]) -> Result<(), String> {
     for label in &labels {
         for (name, v) in verdicts_for(&runs[*label]) {
             lines.push(format!(
-                "    \"{label}.{name}\": {{ \"pass\": {}, \"strict_pass\": {}, \"detail\": \"{}\" }}",
+                "    \"{label}.{name}\": {{ \"pass\": {}, \"strict_pass\": {}, \"software_adapter\": {}, \"detail\": \"{}\" }}",
                 v.pass,
                 v.strict,
+                v.software_adapter,
                 json_escape(&v.detail)
             ));
         }
@@ -938,7 +972,15 @@ fn merge(args: &[String]) -> Result<(), String> {
     json.push_str("\n  }\n}\n");
     std::fs::write(out.join("results.json"), json).map_err(|e| e.to_string())?;
 
-    let word = |b: bool| if b { "pass" } else { "FAIL" };
+    let word = |v: &Verdict, b: bool| {
+        if v.software_adapter {
+            "not a GPU verdict (software adapter)"
+        } else if b {
+            "pass"
+        } else {
+            "FAIL"
+        }
+    };
     let mut md = String::from(
         "# Gate results\n\n## Verdicts\n\n| run | measure | pass rule | strict (no slow frame) |\n|---|---|---|---|\n",
     );
@@ -947,8 +989,8 @@ fn merge(args: &[String]) -> Result<(), String> {
             let _ = writeln!(
                 md,
                 "| {label} | {name} | {} | {} |",
-                word(v.pass),
-                word(v.strict)
+                word(&v, v.pass),
+                word(&v, v.strict)
             );
         }
     }
@@ -988,14 +1030,14 @@ fn merge(args: &[String]) -> Result<(), String> {
             let _ = writeln!(
                 md,
                 "- {name}: pass rule **{}**, strict **{}**. {}.",
-                word(v.pass),
-                word(v.strict),
+                word(&v, v.pass),
+                word(&v, v.strict),
                 v.detail
             );
         }
         md.push('\n');
     }
-    md.push_str("Notes: Xvfb measures X11 shared-memory presentation, not a compositor and not a GPU. The animation clock is virtual (frames are stepped 1/60 s apart) and the paced runs also wait each frame slot out in real time; the unpaced run does not, so background label shaping gets less wall-clock time than it would live. Layout time is excluded from frame times except in the first frame of the cold series. Page-cache eviction for the cold first-frame series is best effort and needs no root. A pass here is a pass on this host and on the pinned-core proxy only; target hardware and Windows are confirmed by a person.\n");
+    md.push_str("Notes: Xvfb measures X11 shared-memory presentation, not a compositor and not a GPU. The animation clock is virtual (frames are stepped 1/60 s apart) and the paced runs also wait each frame slot out in real time; the unpaced run does not, so background label shaping gets less wall-clock time than it would live. Layout time is excluded from frame times except in the first frame of the cold series. Page-cache eviction for the cold first-frame series is best effort and needs no root. Zoom layers named wgpu draw on the GPU backend; a software adapter (llvmpipe) does that drawing on the CPU, so its numbers are marked and are not a GPU verdict. A pass here is a pass on this host and on the pinned-core proxy only; target hardware and Windows are confirmed by a person.\n");
     std::fs::write(out.join("summary.md"), md).map_err(|e| e.to_string())?;
     println!("wrote {}/results.json and summary.md", out.display());
     Ok(())

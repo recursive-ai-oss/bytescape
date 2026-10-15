@@ -9,7 +9,7 @@ use tiny_skia::{
     SpreadMode, Stroke as SkStroke, Transform,
 };
 
-use crate::canvas::{Canvas, Hatch, HatchAngle, Stroke, TextStyle};
+use crate::canvas::{Canvas, Hatch, HatchAngle, Stroke, TextStyle, stroke_with_fills};
 use crate::geom::{Color, Rect};
 use crate::pixel;
 use crate::text::TextEngine;
@@ -206,39 +206,7 @@ impl Canvas for SkiaCanvas<'_> {
     }
 
     fn stroke_rect(&mut self, rect: Rect, stroke: Stroke) {
-        let w = stroke.width.round().max(1.0);
-        if rect.w < 1.0 || rect.h < 1.0 {
-            return;
-        }
-        let c = stroke.color;
-        match stroke.dash {
-            None => {
-                let h = w.min(rect.h);
-                let v = w.min(rect.w);
-                self.fill_rect(Rect::new(rect.x, rect.y, rect.w, h), c);
-                self.fill_rect(Rect::new(rect.x, rect.bottom() - h, rect.w, h), c);
-                let inner = (rect.h - 2.0 * h).max(0.0);
-                self.fill_rect(Rect::new(rect.x, rect.y + h, v, inner), c);
-                self.fill_rect(Rect::new(rect.right() - v, rect.y + h, v, inner), c);
-            }
-            Some((dash, gap)) => {
-                let (dash, gap) = (dash.max(1.0), gap.max(1.0));
-                let mut x = rect.x;
-                while x < rect.right() {
-                    let len = dash.min(rect.right() - x);
-                    self.fill_rect(Rect::new(x, rect.y, len, w), c);
-                    self.fill_rect(Rect::new(x, rect.bottom() - w, len, w), c);
-                    x += dash + gap;
-                }
-                let mut y = rect.y;
-                while y < rect.bottom() {
-                    let len = dash.min(rect.bottom() - y);
-                    self.fill_rect(Rect::new(rect.x, y, w, len), c);
-                    self.fill_rect(Rect::new(rect.right() - w, y, w, len), c);
-                    y += dash + gap;
-                }
-            }
-        }
+        stroke_with_fills(self, rect, stroke);
     }
 
     fn fill_pattern(&mut self, rect: Rect, hatch: Hatch) {

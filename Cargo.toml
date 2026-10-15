@@ -46,3 +46,6 @@ accesskit_consumer = "0.39"
 # Compiles the Windows resources (icon, version information, manifest) into the
 # two programs. Used by their build scripts only.
 embed-resource = "3"
+
+# GPU drawing for bs-render. Vulkan on Linux, Direct3D 12 and Vulkan on Windows.
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "dx12"] }
