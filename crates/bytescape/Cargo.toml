@@ -32,7 +32,7 @@ accesskit_winit = { workspace = true, features = ["accesskit_unix", "async-io"] 
 # write to, next to the policy that lets pkexec ask for the right password.
 [package.metadata.deb]
 name = "bytescape"
-maintainer = "\"Recursive AI, LLC\" <kurtis+security@recursiveai.net>"
+maintainer = "\"Recursive AI, LLC\" <security@recursiveai.org>"
 copyright = "2026, Recursive AI, LLC"
 changelog = "../../packaging/linux/changelog"
 section = "utils"
