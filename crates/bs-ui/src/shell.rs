@@ -11,6 +11,9 @@ use bs_render::{Bar, Card, Chrome, Color, Glyph, Palette, Rect, TextEngine, Text
 
 use bs_render::Item;
 
+#[path = "access.rs"]
+pub mod access;
+
 use crate::action::{Action, reason};
 use crate::blocks::Special;
 use crate::capacity::{Breakdown, CapacityModel};

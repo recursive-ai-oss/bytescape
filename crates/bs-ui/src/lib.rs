@@ -14,6 +14,7 @@ pub mod chrome;
 pub mod info;
 pub mod picker;
 pub mod shell;
+pub use shell::access;
 pub mod spatial;
 mod squarify;
 pub mod tree;

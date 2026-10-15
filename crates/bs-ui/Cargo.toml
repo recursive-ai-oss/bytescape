@@ -18,3 +18,7 @@ bs-knowledge = { path = "../bs-knowledge" }
 bs-layout = { path = "../bs-layout" }
 bs-platform = { path = "../bs-platform" }
 bs-tree = { path = "../bs-tree" }
+accesskit = { workspace = true }
+
+[dev-dependencies]
+accesskit_consumer = { workspace = true }

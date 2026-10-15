@@ -2,6 +2,7 @@
 //! the normal user and never with elevated rights. Work that needs
 //! administrator rights goes to the separate bytescape-helper program.
 
+mod access;
 mod bench;
 mod clipboard;
 mod folder;

@@ -20,3 +20,4 @@ bs-scan = { path = "../bs-scan" }
 bs-tree = { path = "../bs-tree" }
 bs-ui = { path = "../bs-ui" }
 winit = { workspace = true }
+accesskit_winit = { workspace = true }

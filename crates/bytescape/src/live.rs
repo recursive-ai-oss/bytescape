@@ -155,8 +155,14 @@ impl ScanDriver {
                 .map(|e| format!("Couldn't scan: {e}"));
             let snapshot = result.snapshot;
             self.finished = Some((result.aggregator, result.stats));
+            self.last_epoch = snapshot.epoch();
             self.outcome = Some((Arc::clone(&snapshot), problem.clone()));
             return Tick::Finished(snapshot, problem);
+        }
+        // The final picture was handed over with `Finished`; the tree has
+        // nothing newer, so laying it out once more would only repeat work.
+        if self.outcome.is_some() {
+            return Tick::Idle;
         }
         let due = self.last_laid_out.is_none_or(|t| {
             now.saturating_duration_since(t)

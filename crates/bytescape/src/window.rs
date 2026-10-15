@@ -28,10 +28,11 @@ use bs_ui::{
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Theme, Window, WindowId};
 
+use crate::access::{self, Access, UserEvent};
 use crate::bench::{self, FrameSink, Offscreen, Script};
 use crate::clipboard;
 use crate::folder;
@@ -525,6 +526,8 @@ fn screenshots(opts: &ShotOptions) -> Result<(), String> {
 
 struct Live {
     window: Arc<Window>,
+    /// The screen-reader interface, where this build has one.
+    access: Option<Access>,
     presenter: Gfx,
     renderer: Renderer,
     /// Chrome, info bar, legend and the map once the first snapshot has
@@ -620,6 +623,7 @@ struct LiveStats {
 }
 
 struct WinApp {
+    proxy: EventLoopProxy<UserEvent>,
     mode: Mode,
     t0: Instant,
     text: TextEngine,
@@ -679,9 +683,12 @@ fn run_window(mode: Mode, t0: Instant) -> Result<(), String> {
         _ => None,
     };
     let loop_started = t0.elapsed().as_secs_f64() * 1000.0;
-    let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .map_err(|e| e.to_string())?;
     let loop_built = t0.elapsed().as_secs_f64() * 1000.0;
     let mut app = WinApp {
+        proxy: event_loop.create_proxy(),
         mode,
         t0,
         text,
@@ -1288,7 +1295,12 @@ impl WinApp {
     fn create(&mut self, el: &ActiveEventLoop) -> Result<(), String> {
         let at = self.ms();
         self.timeline.push(("event_loop_running", at));
-        let mut attrs = Window::default_attributes().with_title("Bytescape");
+        // A screen-reader adapter has to be made before the window is first
+        // shown, so the window starts hidden where one is used.
+        let with_access = access::AVAILABLE && !matches!(self.mode, Mode::Zoom(_));
+        let mut attrs = Window::default_attributes()
+            .with_title("Bytescape")
+            .with_visible(!with_access);
         let fixed = match &self.mode {
             Mode::Zoom(z) => Some(z.size),
             Mode::Live { size, .. } => Some(*size),
@@ -1301,6 +1313,10 @@ impl WinApp {
             None => attrs.with_inner_size(LogicalSize::new(1280.0, 800.0)),
         };
         let window = Arc::new(el.create_window(attrs).map_err(|e| e.to_string())?);
+        let access = with_access.then(|| Access::new(el, &window, self.proxy.clone()));
+        if with_access {
+            window.set_visible(true);
+        }
         let at = self.ms();
         self.timeline.push(("window_created", at));
         let size = window.inner_size();
@@ -1356,6 +1372,7 @@ impl WinApp {
         }
         self.live = Some(Live {
             window: window.clone(),
+            access,
             presenter,
             renderer,
             shell,
@@ -1827,6 +1844,17 @@ impl WinApp {
     }
 
     fn feed(&mut self, event: InputEvent) {
+        self.feed_with(Some(event), |live, now| live.shell.update(event, now));
+    }
+
+    /// Runs `step` against the live window and applies what it asks for, as
+    /// for any input. `event` is the pointer or key event it stands for, if
+    /// any.
+    fn feed_with(
+        &mut self,
+        event: Option<InputEvent>,
+        step: impl FnOnce(&mut Live, Duration) -> Vec<ShellEffect>,
+    ) {
         let now = self.t0.elapsed();
         let Some(live) = self.live.as_mut() else {
             return;
@@ -1834,11 +1862,11 @@ impl WinApp {
         if let Some(app) = live.shell.app_mut() {
             app.set_animating(live.renderer.is_animating());
         }
-        let fx = live.shell.update(event, now);
+        let fx = step(live, now);
         let changed = !fx.is_empty();
         let left = apply_shell(live, fx, now);
         let chrome_changed = refresh_chrome(live, now);
-        if matches!(event, InputEvent::PointerMoved { .. }) {
+        if matches!(event, Some(InputEvent::PointerMoved { .. })) {
             live.window
                 .set_cursor(if live.shell.wants_pointer_cursor() {
                     CursorIcon::Pointer
@@ -1972,7 +2000,7 @@ fn translate_key(key: &WKey, mods: ModifiersState) -> Option<Key> {
     })
 }
 
-impl ApplicationHandler for WinApp {
+impl ApplicationHandler<UserEvent> for WinApp {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.live.is_none()
             && let Err(e) = self.create(el)
@@ -1982,7 +2010,33 @@ impl ApplicationHandler for WinApp {
         }
     }
 
+    fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
+        let UserEvent::Access(event) = event;
+        match event.window_event {
+            accesskit_winit::WindowEvent::InitialTreeRequested => {
+                let now = self.t0.elapsed();
+                if let Some(live) = self.live.as_mut()
+                    && let Some(access) = live.access.as_mut()
+                {
+                    access.attach(&mut live.shell, now);
+                }
+            }
+            accesskit_winit::WindowEvent::ActionRequested(request) => {
+                self.feed_with(None, |live, now| match live.access.as_mut() {
+                    Some(access) => access.act(&mut live.shell, &request, now),
+                    None => Vec::new(),
+                });
+            }
+            accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
+        }
+    }
+
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let Some(live) = self.live.as_mut()
+            && let Some(access) = live.access.as_mut()
+        {
+            access.process(&live.window, &event);
+        }
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::RedrawRequested => self.redraw(el),
@@ -2086,6 +2140,12 @@ impl ApplicationHandler for WinApp {
             return;
         }
         let timer_wake = self.pump_timers();
+        let now = self.t0.elapsed();
+        if let Some(live) = self.live.as_mut()
+            && let Some(access) = live.access.as_mut()
+        {
+            access.sync(&mut live.shell, now);
+        }
         // Fonts load on a worker thread; redraw once when they arrive so labels
         // appear, polling lightly until then. A running scan is polled for new
         // data at a steady, light rate; nothing else keeps the loop awake.
