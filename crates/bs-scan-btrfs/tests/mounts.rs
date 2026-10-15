@@ -303,3 +303,23 @@ fn the_failure_of_a_mounted_tree_is_a_read_error_kind() {
     let node = run.snapshot.node(id).unwrap();
     assert_eq!(node.read_failure().unwrap().kind, ReadErrorKind::Io);
 }
+
+#[test]
+fn two_mounts_on_one_folder_are_refused_when_one_belongs_to_the_drive() {
+    // The source is to hand over only the mount on top; if it hands over
+    // two for one folder, the reader cannot tell which a walk would see.
+    let mut src = distribution_layout().source();
+    src.mounts = vec![
+        mount(&["home"], HOME_MOUNT, here(257)),
+        mount(&["home"], OTHER_MOUNT, Mounted::Other),
+    ];
+    let err = read_with(&src, &[HOME_MOUNT]).err().unwrap();
+    assert!(matches!(err, BtrfsError::MountNotPlaced(_)), "{err}");
+
+    // Neither belongs to the drive: the folder is shown as not followed, once.
+    let run = read_with(&src, &[]).unwrap();
+    assert!(run.flat()["home"].flags.contains(NodeFlags::NOT_FOLLOWED));
+    assert_eq!(run.report.mounts_not_followed, 1);
+    assert_eq!(run.report.mounts_entered, 0);
+    assert_eq!(run.report.diagnostics.total(), 0);
+}

@@ -9,6 +9,12 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+# A statx-through-io_uring variant of the Linux walker, for measuring only.
+# Off by default; adds no dependency (the ring is driven with raw system
+# calls through `libc`) and nothing in the shipped programs enables it.
+iouring-bench = []
+
 [dependencies]
 bs-tree = { path = "../bs-tree" }
 # The category tables. No dependencies of its own.
@@ -40,3 +46,11 @@ libc = "0.2"
 
 [lints]
 workspace = true
+
+[[example]]
+name = "uring_bench"
+required-features = ["iouring-bench"]
+
+[[test]]
+name = "iouring"
+required-features = ["iouring-bench"]

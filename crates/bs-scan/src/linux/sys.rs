@@ -37,7 +37,7 @@ pub struct Stat {
 
 /// Only what the walker reads. Asking for less makes the kernel (and network
 /// filesystems) do less.
-const WANT: libc::c_uint = libc::STATX_TYPE
+pub(crate) const WANT: libc::c_uint = libc::STATX_TYPE
     | libc::STATX_MODE
     | libc::STATX_NLINK
     | libc::STATX_INO
@@ -48,10 +48,10 @@ const WANT: libc::c_uint = libc::STATX_TYPE
 
 /// Never follow a final symbolic link, never trigger an automount, and do not
 /// force a network filesystem to refresh its attributes.
-const FLAGS: libc::c_int =
+pub(crate) const FLAGS: libc::c_int =
     libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT | libc::AT_STATX_DONT_SYNC;
 
-fn convert(raw: &libc::statx) -> Stat {
+pub(crate) fn convert(raw: &libc::statx) -> Stat {
     let have_mount =
         raw.stx_mask & libc::STATX_MNT_ID != 0 && !IGNORE_MOUNT_IDS.load(Ordering::Relaxed);
     Stat {

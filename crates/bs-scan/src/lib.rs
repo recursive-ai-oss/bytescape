@@ -74,6 +74,18 @@ pub mod winrules {
 #[cfg(target_os = "linux")]
 pub use linux::Walker;
 
+/// The walker with its per-entry `statx` calls going through an io_uring, for
+/// the benchmark only. Not part of the product: it exists to answer whether
+/// that is faster, and is compiled only with the `iouring-bench` feature.
+#[cfg(all(target_os = "linux", feature = "iouring-bench"))]
+#[doc(hidden)]
+pub mod iouring_bench {
+    pub use crate::linux::uring::{
+        Config, IoUringWalker, Stats, Unavailable, probe, process_cpu_ms, set_force_ring_failure,
+        set_force_unavailable, take_stats,
+    };
+}
+
 /// The directory primitives the Linux walker is made of, for other producers
 /// that must list directories the same way: opening a directory without
 /// following links, reading its entries with `getdents64`, and asking for the

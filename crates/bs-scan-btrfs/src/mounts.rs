@@ -25,7 +25,7 @@ use crate::error::{Diagnostics, ProblemKind};
 use crate::items::{self, FIRST_FREE, ModeKind};
 use crate::model::{Model, Start};
 use bs_scan::{Boundary, Placement};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The most mounts below the start the reader works with. A system has
 /// dozens; a hostile table could list millions.
@@ -187,9 +187,23 @@ pub(crate) fn place(
     diag: &mut Diagnostics,
 ) -> Result<Grafts, BtrfsError> {
     let mut order: Vec<&MountPoint> = mounts.iter().collect();
-    // Shallow first, so that a mount inside another is placed through it; of
-    // two on the same folder the later one is the one that shows.
+    // Shallow first, so that a mount inside another is placed through it.
     order.sort_by_key(|m| (m.path.len(), m.mount_id));
+    // Which of two mounts on one folder shows cannot be told from here (the
+    // source is to hand over only the top one). If one of them belongs to
+    // the drive, a guess could enter a mount the walker does not see, or
+    // skip one it does: refuse, and let the walker answer.
+    for (i, m) in order.iter().enumerate() {
+        let shares = order
+            .iter()
+            .enumerate()
+            .any(|(j, other)| i != j && other.path == m.path);
+        if shares && boundary.allows(placement(m)) {
+            return Err(BtrfsError::MountNotPlaced(
+                "a mount of the drive shares its folder with another mount",
+            ));
+        }
+    }
     let mut grafts = Grafts::default();
     for m in order {
         let allowed = boundary.allows(placement(m));
@@ -256,6 +270,9 @@ pub(crate) fn place(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TableEntry {
     pub id: u64,
+    /// The mount this one is mounted on. For a mount stacked on another at
+    /// the same folder, that other mount.
+    pub parent: u64,
     pub device: u64,
     pub mount_point: Vec<u8>,
     pub fs_type: Vec<u8>,
@@ -304,8 +321,9 @@ pub(crate) fn parse_table(text: &[u8]) -> Vec<TableEntry> {
         if dash < 6 {
             continue;
         }
-        let (Some(id), Some(dev), Some(point), Some(fs_type)) = (
+        let (Some(id), Some(parent), Some(dev), Some(point), Some(fs_type)) = (
             fields.first().and_then(|f| number(f)),
+            fields.get(1).and_then(|f| number(f)),
             fields.get(2),
             fields.get(4),
             fields.get(dash.saturating_add(1)),
@@ -321,12 +339,36 @@ pub(crate) fn parse_table(text: &[u8]) -> Vec<TableEntry> {
         let device = (major & 0xffff_ffff) << 32 | (minor & 0xffff_ffff);
         out.push(TableEntry {
             id,
+            parent,
             device,
             mount_point: unescape(point),
             fs_type: fs_type.to_vec(),
         });
     }
     out
+}
+
+/// Drops the mounts that another mount is stacked on top of at the same
+/// folder: only the top one shows there, and it is the top one that a walk
+/// sees. The top is told by the mount table's parent IDs (a mount stacked on
+/// another has that other as its parent), never by the order of the IDs,
+/// which the kernel hands out lowest-free-first and so does not follow the
+/// order mounts were made in.
+pub(crate) fn without_covered(entries: Vec<TableEntry>) -> Vec<TableEntry> {
+    let covered: HashSet<(Vec<u8>, u64)> = entries
+        .iter()
+        .filter(|top| top.parent != top.id)
+        .filter(|top| {
+            entries
+                .iter()
+                .any(|below| below.id == top.parent && below.mount_point == top.mount_point)
+        })
+        .map(|top| (top.mount_point.clone(), top.parent))
+        .collect();
+    entries
+        .into_iter()
+        .filter(|e| !covered.contains(&(e.mount_point.clone(), e.id)))
+        .collect()
 }
 
 /// The names from `root` down to `point`, when `point` lies strictly below
@@ -369,6 +411,7 @@ mod tests {
         let t = parse_table(text);
         assert_eq!(t.len(), 3);
         assert_eq!(t[0].id, 36);
+        assert_eq!(t[0].parent, 35);
         assert_eq!(t[0].device, 98 << 32);
         assert_eq!(t[0].mount_point, b"/mnt/with space");
         assert_eq!(t[0].fs_type, b"btrfs");
@@ -396,6 +439,146 @@ mod tests {
         assert!(below(b"/mnt/a", b"/mnt/ab").is_none());
         assert!(below(b"/mnt/a", b"/mnt").is_none());
         assert!(below(b"/mnt/a", b"/mnt/a/../b").is_none());
+    }
+
+    fn entry(id: u64, parent: u64, point: &[u8]) -> TableEntry {
+        TableEntry {
+            id,
+            parent,
+            device: 0,
+            mount_point: point.to_vec(),
+            fs_type: b"btrfs".to_vec(),
+        }
+    }
+
+    fn ids(v: &[TableEntry]) -> Vec<u64> {
+        let mut ids: Vec<u64> = v.iter().map(|e| e.id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn the_mount_on_top_is_told_by_parent_not_by_id_order() {
+        // 31 is mounted on 40 at the same folder although its ID is lower:
+        // IDs are handed out lowest-free-first.
+        let t = without_covered(vec![
+            entry(40, 20, b"/home"),
+            entry(31, 40, b"/home"),
+            entry(41, 20, b"/srv"),
+        ]);
+        assert_eq!(ids(&t), vec![31, 41]);
+        // Three deep.
+        let t = without_covered(vec![
+            entry(7, 1, b"/a"),
+            entry(9, 7, b"/a"),
+            entry(8, 9, b"/a"),
+        ]);
+        assert_eq!(ids(&t), vec![8]);
+    }
+
+    #[test]
+    fn mounts_that_are_not_stacked_are_all_kept() {
+        // Same folder but no parent link between them (they cannot both be
+        // told apart by the table): both stay, and placement refuses if one
+        // belongs to the drive. A parent on another folder covers nothing.
+        let t = without_covered(vec![
+            entry(10, 1, b"/x"),
+            entry(11, 1, b"/x"),
+            entry(12, 10, b"/x/inner"),
+            entry(13, 13, b"/self"),
+        ]);
+        assert_eq!(ids(&t), vec![10, 11, 12, 13]);
+    }
+
+    /// Runs inside a private user and mount namespace; outside it has
+    /// nothing to do.
+    #[test]
+    fn inside_the_namespace_the_stacked_mount_on_top_is_found() {
+        let Some(dir) = std::env::var_os("BS_STACK_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let (one, two) = (dir.join("one"), dir.join("two"));
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let sh = |script: String| {
+            let ok = std::process::Command::new("sh")
+                .arg("-ec")
+                .arg(script)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        };
+        let (o, t) = (one.display(), two.display());
+        // Mount IDs are handed out lowest-free-first: freeing the first
+        // mount's ID and then stacking on `two` gives the mount on top a
+        // lower ID than the one it covers.
+        sh(format!(
+            "mount -t tmpfs none '{o}'; mount -t tmpfs none '{t}'; umount '{o}'; mount -t tmpfs none '{t}'"
+        ));
+        let text = std::fs::read("/proc/self/mountinfo").unwrap();
+        let here: Vec<TableEntry> = parse_table(&text)
+            .into_iter()
+            .filter(|e| e.mount_point == two.as_os_str().as_encoded_bytes())
+            .collect();
+        assert_eq!(here.len(), 2, "{here:?}");
+        let (low, high) = (
+            here.iter().min_by_key(|e| e.id).unwrap(),
+            here.iter().max_by_key(|e| e.id).unwrap(),
+        );
+        // The mount that was made last has the lower ID and is the one whose
+        // parent is the other.
+        assert_eq!(
+            low.parent, high.id,
+            "the ID order is the reverse of the stacking"
+        );
+        let tops = without_covered(here.clone());
+        assert_eq!(tops.len(), 1);
+        assert_eq!(tops[0].id, low.id);
+    }
+
+    #[test]
+    fn mounts_stacked_on_one_folder_are_told_apart_by_parent_in_a_real_table() {
+        if std::env::var_os("BS_STACK_DIR").is_some() {
+            return;
+        }
+        let probe = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "true"])
+            .output();
+        if !matches!(&probe, Ok(o) if o.status.success()) {
+            assert!(
+                std::env::var_os("BYTESCAPE_REQUIRE_NAMESPACES").is_none(),
+                "BYTESCAPE_REQUIRE_NAMESPACES is set but a user and mount namespace cannot be made"
+            );
+            eprintln!("NOT RUN: cannot create a user and mount namespace here");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bs-btrfs-stack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let script = format!(
+            "exec '{}' mounts::tests::inside_the_namespace_the_stacked_mount_on_top_is_found --exact --test-threads=1 --nocapture",
+            exe.display()
+        );
+        let out = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sh", "-c", &script])
+            .env("BS_STACK_DIR", &dir)
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "the namespace run failed:\n{text}");
+        assert!(
+            text.contains("1 passed"),
+            "the inner test did not run:\n{text}"
+        );
     }
 
     #[test]

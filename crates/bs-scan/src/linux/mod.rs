@@ -28,6 +28,8 @@
 //!   is only ever used as text for that lookup; nothing is opened by it.
 
 pub(crate) mod sys;
+#[cfg(feature = "iouring-bench")]
+pub(crate) mod uring;
 
 use crate::boundary::{Boundary, Placement};
 use crate::classify::{Classifier, Here, join};
@@ -105,6 +107,23 @@ impl Scanner for Walker {
     }
 
     fn scan(&self, root: &Path, ctx: &ScanContext) -> Result<ScanEnd, ScanError> {
+        scan_with_variant(root, ctx, StatVariant::default())
+    }
+}
+
+/// How the walker examines the entries a listing gave: one `statx` call each
+/// (the only way outside the benchmark build), or through a ring.
+#[cfg(feature = "iouring-bench")]
+pub(crate) type StatVariant = Option<uring::Config>;
+#[cfg(not(feature = "iouring-bench"))]
+pub(crate) type StatVariant = Option<std::convert::Infallible>;
+
+fn scan_with_variant(
+    root: &Path,
+    ctx: &ScanContext,
+    variant: StatVariant,
+) -> Result<ScanEnd, ScanError> {
+    {
         static LIMIT: Once = Once::new();
         LIMIT.call_once(|| {
             sys::raise_open_file_limit();
@@ -154,6 +173,7 @@ impl Scanner for Walker {
         let shared = Shared {
             boundary,
             classifier,
+            variant,
         };
         let roots = vec![Task {
             at: At::Open(Arc::new(fd)),
@@ -170,6 +190,8 @@ struct Shared {
     boundary: Boundary,
     /// `None` when the caller turned categories off.
     classifier: Option<Classifier>,
+    #[cfg_attr(not(feature = "iouring-bench"), allow(dead_code))]
+    variant: StatVariant,
 }
 
 enum At {
@@ -359,6 +381,24 @@ fn list_dir_into(
     buf: &mut [u8],
     used: &mut usize,
 ) -> Listing {
+    #[cfg(feature = "iouring-bench")]
+    if let Some(config) = shared.variant {
+        return uring::list_dir_into(shared, config, worker, dir, key, here, buf, used);
+    }
+    list_dir_plain(shared, worker, dir, key, here, buf, used)
+}
+
+/// The listing loop: read a buffer of entries, examine each with its own
+/// `statx`.
+fn list_dir_plain(
+    shared: &Shared,
+    worker: &mut Worker<'_, '_, Task>,
+    dir: &Arc<OwnedFd>,
+    key: DirKey,
+    here: &Here<'_>,
+    buf: &mut [u8],
+    used: &mut usize,
+) -> Listing {
     let mut seen = 0usize;
     loop {
         if worker.cancelled() {
@@ -405,6 +445,23 @@ fn handle_entry(
     here: &Here<'_>,
     entry: &dirent::RawEntry<'_>,
 ) {
+    handle_entry_with(shared, worker, dir, parent_key, here, entry, |name_c| {
+        sys::stat_at(dir.as_fd(), name_c)
+    });
+}
+
+/// Records one listed entry. `examine` says what `statx` makes of the name;
+/// it is called at most once, and not at all for names that cannot be
+/// examined.
+fn handle_entry_with(
+    shared: &Shared,
+    worker: &mut Worker<'_, '_, Task>,
+    dir: &Arc<OwnedFd>,
+    parent_key: DirKey,
+    here: &Here<'_>,
+    entry: &dirent::RawEntry<'_>,
+    examine: impl FnOnce(&CStr) -> io::Result<sys::Stat>,
+) {
     let Ok(name_c) = CStr::from_bytes_with_nul(entry.name_with_nul) else {
         return;
     };
@@ -424,7 +481,7 @@ fn handle_entry(
         add_entry(worker, NodeKind::Other, parent_key, name, &meta);
         return;
     }
-    let st = match sys::stat_at(dir.as_fd(), name_c) {
+    let st = match examine(name_c) {
         Ok(st) => st,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             worker.tally.vanished += 1;

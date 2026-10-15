@@ -131,6 +131,12 @@ impl IoctlSource {
             Ok(st) if st.mnt_id == Some(mount_id) => {}
             _ => return Mounted::HereUnplaced,
         }
+        // And it must be the root of that mount. A path whose parent was
+        // renamed since the table was read can land on a folder inside the
+        // mount, which would be taken for the mount's root.
+        if !is_mount_root(fd.as_raw_fd()) {
+            return Mounted::HereUnplaced;
+        }
         match statfs_of(fd.as_raw_fd()) {
             Ok((BTRFS_MAGIC, fsid)) if fsid == self.fsid => {}
             Ok(_) => return Mounted::Other,
@@ -144,6 +150,40 @@ impl IoctlSource {
             inode: stat.st_ino,
         })
     }
+}
+
+/// `STATX_ATTR_MOUNT_ROOT`: the directory is the root of its mount.
+const STATX_ATTR_MOUNT_ROOT: u64 = 0x0000_2000;
+
+/// Whether the attributes say a directory is its mount's root. A kernel that
+/// does not report the attribute (`mask` lacks it) cannot say, which counts
+/// as not.
+fn mount_root_from(attributes: u64, mask: u64) -> bool {
+    mask & STATX_ATTR_MOUNT_ROOT != 0 && attributes & STATX_ATTR_MOUNT_ROOT != 0
+}
+
+/// Whether the directory `fd` is the root of the mount it is on.
+fn is_mount_root(fd: RawFd) -> bool {
+    let mut buf = MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: `fd` is an open descriptor, the path is the empty string with
+    // `AT_EMPTY_PATH` (so it names the descriptor itself), and `buf` is a
+    // writable `statx` buffer that was zeroed, so it is initialized whether
+    // or not the call fills it.
+    let rc = unsafe {
+        libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+            libc::STATX_TYPE,
+            buf.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    // SAFETY: zero-initialized above, and a plain-data struct.
+    let raw = unsafe { buf.assume_init() };
+    mount_root_from(raw.stx_attributes, raw.stx_attributes_mask)
 }
 
 /// `f_type` and `f_fsid` of the file system of a descriptor.
@@ -272,16 +312,28 @@ impl TreeSource for IoctlSource {
 
     fn mounts(&self) -> Result<Vec<MountPoint>, BtrfsError> {
         let text = std::fs::read("/proc/self/mountinfo")?;
-        let mut out = Vec::new();
+        let mut below = Vec::new();
         for entry in mounts::parse_table(&text) {
             let Some(path) = mounts::below(self.root.as_os_str().as_bytes(), &entry.mount_point)
             else {
                 continue;
             };
-            if out.len() >= mounts::MAX_MOUNTS {
+            if below.len() >= mounts::MAX_MOUNTS {
                 return Err(BtrfsError::TooLarge(
                     "more mounts than the reader works with",
                 ));
+            }
+            below.push((path, entry));
+        }
+        // A mount that another is stacked on is hidden, and a walk sees the
+        // one on top. Opening a hidden mount's folder would reach the top
+        // one instead.
+        let tops: Vec<mounts::TableEntry> =
+            mounts::without_covered(below.iter().map(|(_, e)| e.clone()).collect());
+        let mut out = Vec::new();
+        for (path, entry) in below {
+            if !tops.iter().any(|t| t.id == entry.id) {
+                continue;
             }
             let mounted = if entry.fs_type == b"btrfs" {
                 let mut at = self.root.clone();
@@ -300,5 +352,47 @@ impl TreeSource for IoctlSource {
             });
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    #[test]
+    fn only_a_reported_and_set_attribute_makes_a_mount_root() {
+        assert!(mount_root_from(
+            STATX_ATTR_MOUNT_ROOT,
+            STATX_ATTR_MOUNT_ROOT
+        ));
+        // Set but the kernel never said it reports it, or reported unset.
+        assert!(!mount_root_from(STATX_ATTR_MOUNT_ROOT, 0));
+        assert!(!mount_root_from(0, STATX_ATTR_MOUNT_ROOT));
+        assert!(!mount_root_from(
+            !STATX_ATTR_MOUNT_ROOT,
+            !STATX_ATTR_MOUNT_ROOT
+        ));
+    }
+
+    fn open_dir(path: &str) -> OwnedFd {
+        File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(path)
+            .unwrap()
+            .into()
+    }
+
+    #[test]
+    fn a_directory_inside_a_mount_is_not_its_root() {
+        // `/proc` is a mount of its own; `/proc/sys` is a folder inside it.
+        let root = open_dir("/proc");
+        let inside = open_dir("/proc/sys");
+        assert!(is_mount_root(root.as_raw_fd()), "/proc is a mount root");
+        assert!(
+            !is_mount_root(inside.as_raw_fd()),
+            "/proc/sys is inside the mount"
+        );
     }
 }
