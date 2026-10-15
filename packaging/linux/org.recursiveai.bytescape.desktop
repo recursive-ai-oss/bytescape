@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Bytescape
+GenericName=Disk Space Visualizer
+Comment=See where the space on a drive is used
+Exec=bytescape
+Icon=org.recursiveai.bytescape
+Terminal=false
+Categories=System;Filesystem;
+Keywords=disk;space;usage;storage;treemap;size;folders;
+StartupNotify=true
+# No MimeType line on purpose: listing inode/directory could make Bytescape the
+# program that opens folders. "Analyze with Bytescape" is a separate menu entry
+# in the file managers (see bytescape-analyze.desktop and the Nautilus
+# extension).

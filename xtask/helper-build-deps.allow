@@ -1,0 +1,11 @@
+# Crates the elevated helper may use at build time (its direct build
+# dependencies, all four release targets). `cargo xtask helper-deps` fails when
+# the helper has a build dependency that is not listed here.
+#
+# Build dependencies run while the helper is compiled. Nothing of them is
+# linked into the program except what they write, so they are not in
+# helper-deps.allow. Code that runs in the build of a program that runs with
+# administrator rights is reviewed all the same, so every entry needs a
+# maintainer's explicit approval and a reason here.
+
+embed-resource  # Windows only: compiles the icon, version information and application manifest (requireAdministrator) into bytescape-helper.exe. On Linux its build script does nothing.

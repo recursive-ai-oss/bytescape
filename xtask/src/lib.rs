@@ -5,6 +5,7 @@
 //! here, not in the CI configuration.
 
 pub mod helper_deps;
+pub mod manifests;
 pub mod net_ban;
 pub mod public_text;
 pub mod ui_wording;

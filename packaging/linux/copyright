@@ -1,0 +1,14 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Bytescape
+Upstream-Contact: https://github.com/recursive-ai-oss/bytescape
+Source: https://github.com/recursive-ai-oss/bytescape
+
+Files: *
+Copyright: 2026 Recursive AI, LLC
+License: MIT or Apache-2.0
+
+License: MIT
+ The full text is in /usr/share/doc/bytescape/LICENSE-MIT.
+
+License: Apache-2.0
+ The full text is in /usr/share/doc/bytescape/LICENSE-APACHE.

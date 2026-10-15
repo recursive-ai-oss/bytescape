@@ -56,3 +56,9 @@ windows-sys = { version = "0.61", default-features = false, features = [
 
 [lints]
 workspace = true
+
+# Build time only, and only on Windows does it do anything: it compiles the icon,
+# the version information and the administrator manifest into the program.
+# Listed in `xtask/helper-build-deps.allow`.
+[build-dependencies]
+embed-resource = { workspace = true }

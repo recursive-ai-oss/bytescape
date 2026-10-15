@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.recursiveai.bytescape</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>Bytescape</name>
+  <summary>See where the space on a drive is used</summary>
+  <developer id="org.recursiveai">
+    <name>Recursive AI, LLC</name>
+  </developer>
+  <description>
+    <p>
+      Bytescape scans a drive or folder and draws every file and folder as a
+      box whose area is its size, so the biggest things stand out at once.
+      Click into a folder to zoom in, step back out, and move a file to the
+      Trash from the map.
+    </p>
+    <p>
+      It is a visualizer: it shows what is there and who manages it, and
+      leaves the decisions to you. It never connects to the internet.
+      Inspired by SpaceMonger 1.4.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.recursiveai.bytescape.desktop</launchable>
+  <provides>
+    <binary>bytescape</binary>
+  </provides>
+  <url type="homepage">https://github.com/recursive-ai-oss/bytescape</url>
+  <url type="bugtracker">https://github.com/recursive-ai-oss/bytescape/issues</url>
+  <categories>
+    <category>System</category>
+    <category>Filesystem</category>
+  </categories>
+  <keywords>
+    <keyword>disk</keyword>
+    <keyword>space</keyword>
+    <keyword>treemap</keyword>
+    <keyword>storage</keyword>
+  </keywords>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-15"/>
+  </releases>
+</component>

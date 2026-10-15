@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Linux tests that need more than an ordinary user: two that run inside a
-# private user and mount namespace, one that mounts real file systems as root,
-# and one that reads the machine's own root device as root. A test that
-# cannot do its job prints "NOT RUN" and still passes, so this script fails
-# when it sees that text. A skipped test is not a result.
+# Linux tests that need more than an ordinary user. Three run inside a private
+# user and mount namespace (two of the walker's, one of the elevated helper's).
+# Five run as root: the walker's test that mounts real file systems, the
+# helper's test with the rights of root, the raw ext4 reader on the machine's
+# own root device, and the btrfs and XFS readers on file systems made for the
+# test. A test that cannot do its job prints "NOT RUN" and
+# still passes, so this script fails when it sees that text. A skipped test is
+# not a result.
 #
 #   BYTESCAPE_DISPOSABLE_HOST=1 packaging/ci/linux-privileged-tests.sh
 #
@@ -51,9 +54,39 @@ if [ -z "$root_test" ] || [ ! -x "$root_test" ]; then
 fi
 root_test="$(cd "$(dirname "$root_test")" && pwd)/$(basename "$root_test")"
 
+# The helper's root test makes a copy of `env` that is set-user-id root, in a
+# folder below the system's temporary folder. It runs as root through sudo,
+# which drops TMPDIR, so that folder is /tmp; the run below pins TMPDIR=/tmp
+# so it is the same when this script already runs as root. A file system
+# mounted `nosuid` there would make the stand-in useless, so check before
+# building.
+if findmnt -no OPTIONS --target /tmp | tr ',' '\n' | grep -qx nosuid; then
+  echo "/tmp is on a file system mounted nosuid; the helper's root test cannot run there" >&2
+  exit 1
+fi
+
+# The helper's two privileged test programs, built the same way.
+cargo test --locked -p bytescape-helper --no-run --test mounts_namespace --test root 2>&1 | tee "$build_log"
+find_helper_test() {
+  local name="$1" path
+  path="$(sed 's/\x1b\[[0-9;]*m//g' "$build_log" |
+    sed -n "s|^ *Executable tests/$name\.rs (\(.*\))\$|\1|p")"
+  if [ -z "$path" ] || [ ! -x "$path" ]; then
+    echo "could not find the built $name test program" >&2
+    exit 1
+  fi
+  echo "$(cd "$(dirname "$path")" && pwd)/$(basename "$path")"
+}
+helper_ns_test="$(find_helper_test mounts_namespace)"
+helper_root_test="$(find_helper_test root)"
+
 echo "== in a user and mount namespace"
 cargo test --locked -p bs-scan --test huge_sizes --test mount_race \
   -- --nocapture --test-threads=1 2>&1 | tee -a "$log"
+# The helper's delete code around other mounts, in a namespace of its own.
+( cd crates/bytescape-helper
+  unshare --user --map-root-user --mount "$helper_ns_test" --nocapture --test-threads=1
+) 2>&1 | tee -a "$log"
 
 # The root run starts the finished test program directly instead of running
 # cargo as root. Cargo as root could rebuild into the target folder and leave
@@ -78,6 +111,16 @@ echo "== as root"
   fi
 ) 2>&1 | tee -a "$log"
 
+echo "== the elevated helper, as root"
+(
+  cd crates/bytescape-helper
+  if [ "$(id -u)" = 0 ]; then
+    BYTESCAPE_DISPOSABLE_HOST=1 TMPDIR=/tmp "$helper_root_test" --nocapture --test-threads=1
+  else
+    sudo -E env BYTESCAPE_DISPOSABLE_HOST=1 TMPDIR=/tmp "$helper_root_test" --nocapture --test-threads=1
+  fi
+) 2>&1 | tee -a "$log"
+
 echo "== raw ext4 reader on this machine's own root file system"
 # Reads the root device as root and compares the raw reader with the walker.
 # On a root file system that is not ext4 the test prints NOT RUN, and the
@@ -99,6 +142,32 @@ live_test="$(cd "$(dirname "$live_test")" && pwd)/$(basename "$live_test")"
   fi
 ) 2>&1 | tee -a "$log"
 
+echo "== btrfs and XFS readers against the walker, on mounted file systems"
+# Each test makes a loop-mounted file system, fills it, and compares the
+# reader with the walker path by path. XFS needs its module loaded.
+sudo modprobe xfs 2> /dev/null || true
+run_live() { # crate
+  local crate="$1" prog
+  cargo test --locked -p "$crate" --test live --no-run 2>&1 | tee "$build_log"
+  prog="$(sed 's/\x1b\[[0-9;]*m//g' "$build_log" |
+    sed -n 's|^ *Executable tests/live\.rs (\(.*\))$|\1|p')"
+  if [ -z "$prog" ] || [ ! -x "$prog" ]; then
+    echo "could not find the built $crate live test program" >&2
+    exit 1
+  fi
+  prog="$(cd "$(dirname "$prog")" && pwd)/$(basename "$prog")"
+  (
+    cd "crates/$crate"
+    if [ "$(id -u)" = 0 ]; then
+      BYTESCAPE_DISPOSABLE_HOST=1 "$prog" --nocapture --test-threads=1
+    else
+      sudo -E env BYTESCAPE_DISPOSABLE_HOST=1 "$prog" --nocapture --test-threads=1
+    fi
+  ) 2>&1 | tee -a "$log"
+}
+run_live bs-scan-btrfs
+run_live bs-scan-xfs
+
 fix_ownership
 if [ "$(id -u)" != 0 ] && [ -n "$(find "$target" -user root -print -quit)" ]; then
   echo "files owned by root are left in $target" >&2
@@ -111,8 +180,8 @@ if grep -q 'NOT RUN' "$log"; then
   exit 1
 fi
 # Every test program must have run at least one test.
-if [ "$(grep -c '^test result: ok\. [1-9][0-9]* passed' "$log")" -ne 4 ]; then
-  echo "expected four test programs that each passed at least one test" >&2
+if [ "$(grep -c '^test result: ok\. [1-9][0-9]* passed' "$log")" -ne 8 ]; then
+  echo "expected eight test programs that each passed at least one test" >&2
   exit 1
 fi
 echo "all privileged and namespace tests ran"

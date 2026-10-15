@@ -1,6 +1,6 @@
 [package]
 name = "bytescape"
-description = "Bytescape: the disk-space visualizer (the user interface, never elevated)."
+description = "Disk-space visualizer that maps where space on a drive is used"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -26,3 +26,51 @@ accesskit_winit = { workspace = true }
 # Screen readers on Linux speak AT-SPI over the local session bus.
 [target.'cfg(target_os = "linux")'.dependencies]
 accesskit_winit = { workspace = true, features = ["accesskit_unix", "async-io"] }
+
+# The Debian package (built by packaging/linux/build-deb.sh with cargo-deb).
+# The helper ships in the same package, in a folder only administrators can
+# write to, next to the policy that lets pkexec ask for the right password.
+[package.metadata.deb]
+name = "bytescape"
+maintainer = "\"Recursive AI, LLC\" <kurtis+security@recursiveai.net>"
+copyright = "2026, Recursive AI, LLC"
+changelog = "../../packaging/linux/changelog"
+section = "utils"
+priority = "optional"
+extended-description = """\
+Bytescape scans a drive or folder and draws every file and folder as a box
+whose area is its size, so the biggest things stand out at once. It shows
+what is there and leaves the decisions to you. It never connects to the
+internet. The elevated helper, started through pkexec only when you ask for
+a full scan or a delete that needs administrator rights, is installed in
+/usr/libexec/bytescape."""
+depends = "$auto"
+# The display and keyboard libraries are loaded when the program starts, so
+# the automatic list cannot see them; a desktop already has them.
+recommends = "pkexec | policykit-1, libx11-6, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, fonts-dejavu-core | fonts-noto-core"
+suggests = "python3-nautilus"
+assets = [
+    ["target/release/bytescape", "usr/bin/bytescape", "755"],
+    ["target/release/bytescape-helper", "usr/libexec/bytescape/bytescape-helper", "755"],
+    ["../../packaging/linux/org.recursiveai.bytescape.helper.policy", "usr/share/polkit-1/actions/org.recursiveai.bytescape.helper.policy", "644"],
+    ["../../packaging/linux/org.recursiveai.bytescape.desktop", "usr/share/applications/org.recursiveai.bytescape.desktop", "644"],
+    ["../../packaging/linux/org.recursiveai.bytescape.metainfo.xml", "usr/share/metainfo/org.recursiveai.bytescape.metainfo.xml", "644"],
+    ["../../packaging/icons/bytescape.svg", "usr/share/icons/hicolor/scalable/apps/org.recursiveai.bytescape.svg", "644"],
+    ["../../packaging/icons/bytescape-16.png", "usr/share/icons/hicolor/16x16/apps/org.recursiveai.bytescape.png", "644"],
+    ["../../packaging/icons/bytescape-24.png", "usr/share/icons/hicolor/24x24/apps/org.recursiveai.bytescape.png", "644"],
+    ["../../packaging/icons/bytescape-32.png", "usr/share/icons/hicolor/32x32/apps/org.recursiveai.bytescape.png", "644"],
+    ["../../packaging/icons/bytescape-48.png", "usr/share/icons/hicolor/48x48/apps/org.recursiveai.bytescape.png", "644"],
+    ["../../packaging/icons/bytescape-64.png", "usr/share/icons/hicolor/64x64/apps/org.recursiveai.bytescape.png", "644"],
+    ["../../packaging/icons/bytescape-128.png", "usr/share/icons/hicolor/128x128/apps/org.recursiveai.bytescape.png", "644"],
+    ["../../packaging/icons/bytescape-256.png", "usr/share/icons/hicolor/256x256/apps/org.recursiveai.bytescape.png", "644"],
+    ["../../packaging/icons/bytescape-512.png", "usr/share/icons/hicolor/512x512/apps/org.recursiveai.bytescape.png", "644"],
+    ["../../packaging/linux/bytescape-analyze.desktop", "usr/share/kio/servicemenus/bytescape-analyze.desktop", "644"],
+    ["../../packaging/linux/bytescape-nautilus.py", "usr/share/nautilus-python/extensions/bytescape-nautilus.py", "644"],
+    ["../../packaging/linux/copyright", "usr/share/doc/bytescape/copyright", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/bytescape/LICENSE-MIT", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/bytescape/LICENSE-APACHE", "644"],
+    ["../../README.md", "usr/share/doc/bytescape/README.md", "644"],
+]
+
+[build-dependencies]
+embed-resource = { workspace = true }

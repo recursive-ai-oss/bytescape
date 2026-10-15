@@ -7,8 +7,12 @@
 //! that can elevate without being asked, as a CI runner can: elsewhere it
 //! prints `NOT RUN` and passes.
 //!
-//! The checks that do not need elevation start the helper without it: the
-//! helper works unelevated, and its checks on the pipe are the same.
+//! The checks on the pipe start the helper directly with `CreateProcess`.
+//! The helper's manifest asks for administrator rights, so a program that
+//! starts it this way needs an elevated token itself (Windows refuses with
+//! error 740 otherwise). A CI runner has one; from your own machine, start the
+//! tests from an elevated prompt. Without it they stop at once and say so,
+//! instead of failing on the launch.
 
 #![cfg(windows)]
 #![allow(unsafe_code)]
@@ -111,7 +115,24 @@ fn server(name: &str) -> PipeEnd {
     unsafe { PipeEnd::from_raw(handle) }
 }
 
+/// Stops the test with a clear message unless this process has an
+/// administrator token (`net session` needs one).
+fn require_administrator() {
+    let admin = Command::new("net")
+        .arg("session")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    assert!(
+        admin,
+        "these tests start bytescape-helper.exe, whose manifest requires administrator rights: run them from an elevated prompt"
+    );
+}
+
 fn run_helper(args: &[&str]) -> std::process::ExitStatus {
+    require_administrator();
     Command::new(helper())
         .args(args)
         .stdin(Stdio::null())

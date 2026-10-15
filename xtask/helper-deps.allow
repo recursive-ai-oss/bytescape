@@ -5,6 +5,9 @@
 # The helper runs with administrator rights and reads untrusted disk data, so
 # every new entry needs a maintainer's explicit approval. One crate name per
 # line; text after `#` is a comment.
+#
+# Build dependencies (code that runs while the helper is compiled) are listed,
+# with the reason, in xtask/helper-build-deps.allow.
 
 # Workspace crates the helper is designed to use.
 bs-tree

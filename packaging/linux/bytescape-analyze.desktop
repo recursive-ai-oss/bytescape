@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Service
+Name=Bytescape
+MimeType=inode/directory;
+Actions=analyzeWithBytescape;
+X-KDE-Priority=TopLevel
+
+[Desktop Action analyzeWithBytescape]
+Name=Analyze with Bytescape
+Icon=org.recursiveai.bytescape
+Exec=bytescape %f

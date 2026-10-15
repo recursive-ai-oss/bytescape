@@ -11,18 +11,18 @@
 
 ## Install
 
-No release exists yet, so none of these channels is live. The table will gain links as each one ships.
+No release exists yet, so none of these channels is live. The table will gain links as each one ships. [docs/installing.md](docs/installing.md) says what each file is and how it installs.
 
-| Channel | Platforms | Status |
-|---|---|---|
-| GitHub Releases: installer | Windows x64, Windows ARM64 | planned |
-| GitHub Releases: portable `.zip` (both programs) | Windows x64, Windows ARM64 | planned |
-| GitHub Releases: `.deb` | Linux x64, Linux ARM64 | planned |
-| GitHub Releases: AppImage | Linux x64, Linux ARM64 | planned |
-| winget | Windows | planned |
-| Chocolatey | Windows | planned |
-| Microsoft Store | Windows | planned |
-| Snap | Linux | planned |
+| Channel | Platforms | File | Status |
+|---|---|---|---|
+| GitHub Releases: installer | Windows x64, Windows ARM64 | `bytescape-<version>-windows-<arch>-setup.exe` | planned |
+| GitHub Releases: portable `.zip` (both programs) | Windows x64, Windows ARM64 | `bytescape-<version>-windows-<arch>-portable.zip` | planned |
+| GitHub Releases: `.deb` | Linux x64, Linux ARM64 | `bytescape-<version>-linux-<arch>.deb` | planned |
+| GitHub Releases: AppImage | Linux x64, Linux ARM64 | `bytescape-<version>-linux-<arch>.AppImage` | planned |
+| winget | Windows | `winget install RecursiveAI.Bytescape` | planned |
+| Chocolatey | Windows | `choco install bytescape` | planned |
+| Microsoft Store | Windows | Store listing | planned |
+| Snap | Linux | `snap install bytescape` | planned |
 
 To build it yourself today, see [docs/building.md](docs/building.md).
 
@@ -31,6 +31,8 @@ To build it yourself today, see [docs/building.md](docs/building.md).
 **Bytescape never connects to the internet.** There is no networking code in either program, no update check, no telemetry and no account. Two independent checks in the build reject the networking libraries that we know of. One of them also rejects library features (including the Windows networking APIs) and system calls, so adding any of these fails the build. They are a backstop for code review, not a proof: a networking library they do not know about would not be caught.
 
 Where the screen is shown is your session's choice: if `DISPLAY` points at a remote or forwarded X display (`DISPLAY=host:0`, `ssh -X`), the window's drawing goes to that display like it does for any X program. That connection is made by your session and display server, not by Bytescape, which never connects anywhere itself.
+
+On Linux, screen readers read the window through the accessibility bus. Bytescape uses it only when every address involved is a local `unix:` socket, and runs without screen-reader support otherwise; it never opens a network connection for it.
 
 What stays on your machine:
 

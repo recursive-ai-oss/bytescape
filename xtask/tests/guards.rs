@@ -972,6 +972,40 @@ fn helper_deps_fails_when_the_helper_is_missing() {
 }
 
 #[test]
+fn helper_build_dependencies_must_be_listed() {
+    let doc = metadata(&[
+        (
+            "bytescape-helper",
+            &[],
+            &[
+                ("bs-ipc", None),
+                ("embed-resource", Some("build")),
+                ("cc", Some("build")),
+                ("tester", Some("dev")),
+            ],
+        ),
+        ("bs-ipc", &[], &[]),
+        ("embed-resource", &[], &[]),
+        ("cc", &[], &[]),
+        ("tester", &[], &[]),
+    ]);
+    let findings = helper_deps::check_build_dependencies(&doc, "t", &allow(&["embed-resource"]));
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].subject, "cc");
+    let both = allow(&["embed-resource", "cc"]);
+    assert!(helper_deps::check_build_dependencies(&doc, "t", &both).is_empty());
+}
+
+#[test]
+fn helper_build_dependencies_fail_when_the_helper_is_missing() {
+    let doc = metadata(&[("bytescape", &[], &[])]);
+    assert_eq!(
+        helper_deps::check_build_dependencies(&doc, "t", &allow(&[])).len(),
+        1
+    );
+}
+
+#[test]
 fn helper_deps_allow_file_ignores_comments() {
     let parsed = helper_deps::parse_allow("# note\nbs_tree  # why\n\nbs-ipc\n");
     assert_eq!(parsed, allow(&["bs-tree", "bs-ipc"]));

@@ -75,11 +75,19 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    # The job limit is the sum of its step limits plus 15 minutes for checkout,
+    # toolchain and cache, so a step's own limit is always what ends a hang.
+    # Linux: 5 + 20 + 15 (ext4) + 15 (btrfs) + 20 = 75, limit 90. Windows:
+    # 10 + 20 = 30, limit 45.
+    timeout-minutes: ${{ matrix.limit }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025]
+        include:
+          - os: ubuntu-24.04
+            limit: 90
+          - os: windows-2025
+            limit: 45
     env:
       # These runners are throwaway machines, so tests that change operating
       # system state (Recycle Bin, Trash, deletes) may run here. Never set
@@ -102,23 +110,52 @@ jobs:
       # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor. Two
       # tests need them, and a test that cannot run would pass quietly, so the
       # restriction is lifted on this throwaway runner. btrfs-progs is for the
-      # test that builds a btrfs file system.
-      - name: Allow user namespaces, install btrfs tools
+      # test that builds a btrfs file system; e2fsprogs for the ext4 images the
+      # scanner and helper tests build; xfsprogs for the XFS reader tests.
+      - name: Allow user namespaces, install file system tools
         if: runner.os == 'Linux'
+        timeout-minutes: 5
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends btrfs-progs
-      - run: cargo test --locked --workspace
+          sudo apt-get install -y --no-install-recommends btrfs-progs e2fsprogs xfsprogs
+      # The helper starts itself with administrator rights on Windows, which
+      # needs an elevated account, and a prompt would wait for a click that
+      # never comes. It gets its own step with its own limit, so a stuck test
+      # costs ten minutes and names itself, and does not use up the job.
+      - name: Helper and file operation tests (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        timeout-minutes: 10
+        run: cargo test --locked -p bs-fsops -p bs-ipc -p bs-platform -p bytescape-helper -- --nocapture --test-threads=1
+      # The four packages above ran one test at a time. They are left out here:
+      # run in parallel they fight over the Recycle Bin, which is what the
+      # one-at-a-time step avoids. It runs even when the step above failed, so
+      # one run shows both results.
+      - name: Tests (Windows)
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test --locked --workspace --exclude bs-fsops --exclude bs-ipc --exclude bs-platform --exclude bytescape-helper
+      - name: Tests (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        timeout-minutes: 20
+        run: cargo test --locked --workspace
       # The raw ext4 reader's image tests build ext4 images with mke2fs and
       # compare them with the walker and with debugfs (both from e2fsprogs).
       - name: Raw ext4 reader image tests (Linux)
         if: ${{ runner.os == 'Linux' && !cancelled() }}
+        timeout-minutes: 15
         run: cargo test --locked -p bs-scan-ext4 --features image-tests --no-fail-fast
+      # The btrfs reader's image tests build btrfs images with mkfs.btrfs and
+      # read them without mounting, through a parser of the image's B-trees.
+      - name: Raw btrfs reader image tests (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test --locked -p bs-scan-btrfs --features image-tests --no-fail-fast
       # The tests that need a private namespace or root, run for real. The
       # script fails when any of them reports NOT RUN.
       - name: Namespace and root tests (Linux)
         if: ${{ runner.os == 'Linux' && !cancelled() }}
+        timeout-minutes: 20
         env:
           BYTESCAPE_DISPOSABLE_HOST: "1"
         run: bash packaging/ci/linux-privileged-tests.sh
@@ -207,7 +244,9 @@ jobs:
     name: arm64 (${{ matrix.os }})
     if: ${{ vars.ARM64_CI == 'true' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # Sum of the step limits below (Linux 5 + 20 + 20 + 20 + 10, Windows 20 + 10
+    # + 20 + 10) plus 15 minutes for checkout, toolchain and cache.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -224,25 +263,41 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Allow user namespaces, install btrfs tools
+      - name: Allow user namespaces, install file system tools
         if: runner.os == 'Linux'
+        timeout-minutes: 5
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends btrfs-progs
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Tests
-        if: ${{ !cancelled() }}
+          sudo apt-get install -y --no-install-recommends btrfs-progs e2fsprogs xfsprogs
+      - name: Clippy
+        timeout-minutes: 20
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # On Windows the four packages that need one test at a time run in their
+      # own step, as in the test job, and are left out here.
+      - name: Helper and file operation tests (Windows)
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        timeout-minutes: 10
+        run: cargo test --locked -p bs-fsops -p bs-ipc -p bs-platform -p bytescape-helper -- --nocapture --test-threads=1
+      - name: Tests (Windows)
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test --locked --workspace --exclude bs-fsops --exclude bs-ipc --exclude bs-platform --exclude bytescape-helper
+      - name: Tests (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        timeout-minutes: 20
         run: cargo test --locked --workspace
       - name: Namespace and root tests (Linux)
         if: ${{ runner.os == 'Linux' && !cancelled() }}
+        timeout-minutes: 20
         env:
           BYTESCAPE_DISPOSABLE_HOST: "1"
         run: bash packaging/ci/linux-privileged-tests.sh
       - name: Project checks
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         run: cargo xtask guards
 
   # Cold-cache walker benchmark. It needs the operating system's file cache to
@@ -279,6 +334,7 @@ jobs:
         if: steps.script.outputs.present == 'true'
       - name: Build release
         if: steps.script.outputs.present == 'true'
+        timeout-minutes: 20
         run: cargo build --release --locked --workspace
       - name: Check that the file cache can be emptied
         if: steps.script.outputs.present == 'true'
@@ -306,6 +362,7 @@ jobs:
       # $BENCH_RESULTS.
       - name: Run the cold-cache benchmark
         if: steps.script.outputs.present == 'true'
+        timeout-minutes: 45
         run: |
           status=0
           bash "$BENCH_SCRIPT" || status=$?
@@ -320,6 +377,7 @@ jobs:
       # loudly, when the root file system is not ext4.
       - name: Run the raw ext4 reader benchmark
         if: ${{ !cancelled() && steps.script.outputs.present == 'true' }}
+        timeout-minutes: 40
         run: |
           fstype="$(findmnt -no FSTYPE /)"
           echo "root file system: $fstype"
@@ -335,4 +393,192 @@ jobs:
         with:
           name: bench-cold-${{ github.run_id }}
           path: bench-results/
+          if-no-files-found: error
+
+  # Cold-cache speed of the btrfs and XFS readers against the walker, one job
+  # each so that a slow or failed one does not use up the other's time. Same
+  # rules as bench-cold: throwaway runner with passwordless sudo, only on
+  # request or on the weekly schedule. Each script builds what it needs and
+  # empties the file cache before every cold run.
+  bench-cold-btrfs:
+    name: bench-cold (btrfs)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      BYTESCAPE_DISPOSABLE_HOST: "1"
+      BENCH_RESULTS: ${{ github.workspace }}/bench-results/btrfs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - name: Install btrfs tools
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends btrfs-progs
+      - name: Run the btrfs reader benchmark
+        timeout-minutes: 60
+        run: |
+          mkdir -p "$BENCH_RESULTS"
+          img=/mnt/btrfs-bench.img
+          mp=/mnt/btrfs-bench
+          sudo truncate -s 12G "$img"
+          sudo mkfs.btrfs -q -f "$img"
+          sudo mkdir -p "$mp"
+          sudo mount -o loop "$img" "$mp"
+          # The data set: the runner's /usr, and a reflinked copy of it, so
+          # that sharing is part of what is measured.
+          sudo cp -a /usr "$mp/usr"
+          sudo cp -a --reflink=always "$mp/usr" "$mp/usr-copy"
+          # The snapshot is part of the data set too. If it cannot be made the
+          # job fails: a run without it would measure something else.
+          sudo btrfs subvolume snapshot "$mp" "$mp/snapshot" > /dev/null
+          sudo sync
+          bash crates/bs-scan-btrfs/bench/btrfs-bench.sh --mount "$mp" --runs 10
+          sudo umount "$mp"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: bench-cold-btrfs-${{ github.run_id }}
+          path: bench-results/
+          if-no-files-found: error
+
+  bench-cold-xfs:
+    name: bench-cold (xfs)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      BYTESCAPE_DISPOSABLE_HOST: "1"
+      BENCH_RESULTS: ${{ github.workspace }}/bench-results/xfs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - name: Install XFS tools
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xfsprogs
+      - name: Run the XFS reader benchmark
+        timeout-minutes: 60
+        run: |
+          mkdir -p "$BENCH_RESULTS"
+          # The module must load: without it the mount below fails and so
+          # does the job, which is the right result.
+          sudo modprobe xfs
+          img=/mnt/xfs-bench.img
+          mp=/mnt/xfs-bench
+          sudo truncate -s 12G "$img"
+          sudo mkfs.xfs -q -f "$img"
+          sudo mkdir -p "$mp"
+          sudo mount -o loop "$img" "$mp"
+          sudo cp -a /usr "$mp/usr"
+          sudo cp -a --reflink=always "$mp/usr" "$mp/usr-copy"
+          sudo sync
+          bash crates/bs-scan-xfs/bench/xfs-bench.sh --mount "$mp" --runs 10
+          sudo umount "$mp"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: bench-cold-xfs-${{ github.run_id }}
+          path: bench-results/
+          if-no-files-found: error
+
+  # The NTFS table reader on Linux (images made with ntfs-3g) and on Windows
+  # (virtual disks made with diskpart, and the runner's own system drive).
+  ntfs-linux:
+    name: ntfs (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install ntfs-3g
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ntfs-3g fuse3
+      # The runner cannot mount FUSE file systems as an ordinary user, so the
+      # test programs are built as the user and run as root.
+      - name: Reader tests with images (as root)
+        timeout-minutes: 30
+        run: |
+          cargo test --locked -p bs-scan-ntfs --features image-tests --no-run --message-format=json > build.json
+          jq -r 'select(.reason=="compiler-artifact" and .profile.test==true and .executable!=null) | .executable' build.json > exes.txt
+          cat exes.txt
+          test -s exes.txt
+          cd crates/bs-scan-ntfs
+          fail=0
+          : > ../../ntfs-test.log
+          while read -r exe; do
+            sudo -E env BYTESCAPE_DISPOSABLE_HOST=1 "$exe" --nocapture --test-threads=1 2>&1 | tee -a ../../ntfs-test.log || fail=1
+          done < ../../exes.txt
+          # A test that cannot do its job prints NOT RUN and still passes, and
+          # a skipped test is not a result.
+          if grep -q 'NOT RUN' ../../ntfs-test.log; then
+            echo "::error title=Tests did not run::a test above printed NOT RUN"
+            grep 'NOT RUN' ../../ntfs-test.log
+            fail=1
+          fi
+          exit "$fail"
+
+  ntfs-windows:
+    name: ntfs (windows-2025)
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      BYTESCAPE_DISPOSABLE_HOST: "1"
+      # Strict: any difference between the reader and the walker fails the
+      # test. The value `report` only lists differences, for diagnosis.
+      BYTESCAPE_NTFS_LIVE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Reader tests on virtual disks and the system drive
+        timeout-minutes: 30
+        run: |
+          cargo test --locked -p bs-scan-ntfs -- --nocapture --test-threads=1 2>&1 | tee ntfs-test.log
+          # A test that cannot do its job prints NOT RUN and still passes, and
+          # a skipped test is not a result.
+          if grep -q 'NOT RUN' ntfs-test.log; then
+            echo "::error title=Tests did not run::a test above printed NOT RUN"
+            grep 'NOT RUN' ntfs-test.log
+            exit 1
+          fi
+      # The timing run takes a long time and is not needed to judge a change,
+      # so it runs only when asked for and on the weekly schedule.
+      - name: Reader against walker, timed
+        if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+        timeout-minutes: 30
+        env:
+          BYTESCAPE_NTFS_BENCH: "1"
+          BENCH_FILES: "100000"
+          BENCH_OUT: ${{ github.workspace }}/ntfs-results/ntfs-speed.md
+        run: |
+          mkdir -p ntfs-results
+          cargo test --locked --release -p bs-scan-ntfs --test windows_speed -- --nocapture --test-threads=1 2>&1 | tee ntfs-speed.log
+          if grep -q 'NOT RUN' ntfs-speed.log; then
+            echo "::error title=Tests did not run::the timing test printed NOT RUN"
+            exit 1
+          fi
+      # A missing table fails the job: the run is not evidence without it.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+        with:
+          name: ntfs-windows-${{ github.run_id }}
+          path: ntfs-results/
           if-no-files-found: error

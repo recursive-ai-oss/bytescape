@@ -1,0 +1,780 @@
+name: Release
+
+# One tag push (v1.2.3) builds every release file on its own runner and puts
+# them, with SHA256SUMS, in a DRAFT GitHub Release. Publishing the draft is a
+# person's decision. A manual run on any branch builds and checks everything
+# and keeps the files as workflow artifacts, without creating a release.
+#
+# Where the credentials are. Building never has one: the jobs that compile
+# code (our own and every dependency's build scripts) run with no secret and no
+# login token. Signing and the store upload are separate small jobs that only
+# download the finished files. Those jobs run in the `release` environment, the
+# secrets live in that environment and nowhere else, and the environment only
+# accepts `v*` tags. Only maintainers can create `v*` tags (a tag rule on the
+# repository, see docs/release-pipeline.md), so a branch, a pull request or an
+# ordinary contributor's push cannot reach them. Which
+# optional steps run is decided by repository variables, which hold no secret
+# (see docs/release-pipeline.md). Nothing here ever fakes a signature.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      check_oidc_subject:
+        description: "Only print the subject that Azure's login would see (no build, no secret)"
+        type: boolean
+        default: false
+
+# Read-only token for every job unless a job says otherwise below. Jobs that
+# need more name exactly what they need and why.
+permissions:
+  contents: read
+
+# One release at a time per tag, and a running release is never cancelled.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Prints the subject claim of the login token the signing jobs would send to
+  # Azure, so the federated credential can be set up with the exact text. The
+  # token itself is masked and never printed, and nothing else runs.
+  oidc-subject-check:
+    name: oidc subject check
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.check_oidc_subject }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - name: Print the subject claim
+        run: |
+          response="$(curl -fsS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange")"
+          token="$(printf '%s' "$response" | jq -r .value)"
+          echo "::add-mask::$token"
+          payload="$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+')"
+          while [ $((${#payload} % 4)) -ne 0 ]; do payload="$payload="; done
+          # Only these three claims are printed.
+          printf '%s' "$payload" | base64 -d | jq '{iss, sub, aud}'
+
+  # The version, the signing state, and which architectures can be built. No
+  # secret is read here: the optional steps are switched on by repository
+  # variables, and only for tag builds (the `release` environment accepts
+  # nothing else).
+  prepare:
+    name: prepare
+    if: ${{ !inputs.check_oidc_subject }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      has_win_signing: ${{ steps.flags.outputs.has_win_signing }}
+      has_linux_signing: ${{ steps.flags.outputs.has_linux_signing }}
+      has_snap_upload: ${{ steps.flags.outputs.has_snap_upload }}
+      linux_matrix: ${{ steps.flags.outputs.linux_matrix }}
+      snap_matrix: ${{ steps.flags.outputs.snap_matrix }}
+      arm64_native: ${{ steps.flags.outputs.arm64_native }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The tag must name the version in Cargo.toml, and the package metadata
+      # that carries the version in text must agree, so a release never ships
+      # one number inside and another on the label.
+      - name: Check that the version is the same everywhere
+        id: version
+        run: |
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -1)"
+          test -n "$version" || { echo "no version in Cargo.toml" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v$version" ]; then
+            echo "::error title=Tag and version differ::the tag is ${GITHUB_REF_NAME} but Cargo.toml says $version"
+            exit 1
+          fi
+          grep -q "<release version=\"$version\"" packaging/linux/org.recursiveai.bytescape.metainfo.xml || {
+            echo "::error title=Metadata is out of date::packaging/linux/org.recursiveai.bytescape.metainfo.xml has no release entry for $version"
+            exit 1
+          }
+          head -1 packaging/linux/changelog | grep -q "^bytescape ($version-1)" || {
+            echo "::error title=Metadata is out of date::packaging/linux/changelog does not start with version $version-1"
+            exit 1
+          }
+          echo "version $version"
+      - name: Find out which signing and upload steps are switched on
+        id: flags
+        env:
+          WINDOWS_SIGNING_ENABLED: ${{ vars.WINDOWS_SIGNING_ENABLED }}
+          LINUX_SIGNING_ENABLED: ${{ vars.LINUX_SIGNING_ENABLED }}
+          SNAP_UPLOAD_ENABLED: ${{ vars.SNAP_UPLOAD_ENABLED }}
+          ARM64_CI: ${{ vars.ARM64_CI }}
+        run: |
+          # The credentials are only reachable from tag builds, so the steps
+          # that use them are only switched on for a tag.
+          tag=false
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tag=true; fi
+          win=false; linux=false; snap=false
+          if [ "$tag" = true ] && [ "$WINDOWS_SIGNING_ENABLED" = true ]; then win=true; fi
+          if [ "$tag" = true ] && [ "$LINUX_SIGNING_ENABLED" = true ]; then linux=true; fi
+          if [ "$tag" = true ] && [ "$SNAP_UPLOAD_ENABLED" = true ]; then snap=true; fi
+          {
+            echo "has_win_signing=$win"
+            echo "has_linux_signing=$linux"
+            echo "has_snap_upload=$snap"
+          } >> "$GITHUB_OUTPUT"
+          # ARM64 Linux packages are built only on a native ARM64 runner, which
+          # a public repository gets for free (the ARM64_CI variable says it is
+          # on). Without it they are not built, and the ARM64 code is only
+          # compile-checked by the arm64-compile-check job.
+          linux_matrix='{"include":[{"arch":"x64","runner":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"}'
+          snap_matrix='{"include":[{"arch":"x64","runner":"ubuntu-24.04"}'
+          native=false
+          if [ "$ARM64_CI" = true ]; then
+            native=true
+            linux_matrix="$linux_matrix"',{"arch":"arm64","runner":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu"}'
+            snap_matrix="$snap_matrix"',{"arch":"arm64","runner":"ubuntu-24.04-arm"}'
+          fi
+          {
+            echo "linux_matrix=$linux_matrix]}"
+            echo "snap_matrix=$snap_matrix]}"
+            echo "arm64_native=$native"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$win" != true ]; then
+            echo "::warning title=Unsigned build::The Windows files will not be signed: signing runs for tag builds only, and only when the repository variable WINDOWS_SIGNING_ENABLED is true. See docs/release-pipeline.md."
+          fi
+          if [ "$linux" != true ]; then
+            echo "::warning title=Unsigned build::The Linux packages will not be signed: signing runs for tag builds only, and only when the repository variable LINUX_SIGNING_ENABLED is true. See docs/release-pipeline.md."
+          fi
+          if [ "$snap" != true ]; then
+            echo "::warning title=Snap not uploaded::The snap is built and checked but not uploaded: the upload runs for tag builds only, and only when the repository variable SNAP_UPLOAD_ENABLED is true. See docs/release-pipeline.md."
+          fi
+          if [ "$native" != true ]; then
+            echo "::warning title=Linux ARM64 not built::No native ARM64 runner (variable ARM64_CI is not true), so the Linux ARM64 packages and the ARM64 install checks are skipped. The ARM64 code is compile-checked only."
+          fi
+
+  # With no native ARM64 runner, at least prove that the ARM64 code compiles.
+  arm64-compile-check:
+    name: arm64 compile check
+    needs: prepare
+    if: ${{ needs.prepare.outputs.arm64_native != 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - name: Check the ARM64 Linux build
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          cargo check --locked --release --target aarch64-unknown-linux-gnu -p bytescape -p bytescape-helper
+
+  # ---- Windows -------------------------------------------------------------
+  # windows-build compiles with no credential. windows-sign-programs signs the
+  # two programs, windows-package makes the zip and the installer from them,
+  # windows-sign-installer signs the installer, windows-check installs it.
+
+  windows-build:
+    name: windows build ${{ matrix.arch }}
+    needs: prepare
+    runs-on: windows-2025
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The ARM64 files are cross-built on the x64 runner: they are not
+          # run in this job. The install check for them runs on a native ARM64
+          # runner when there is one (windows-arm64-check).
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - name: Add the build target
+        run: rustup target add ${{ matrix.target }}
+      # The build date comes from the commit time, so building one commit twice
+      # gives the same date.
+      - name: Set the build date
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - name: Build both programs
+        timeout-minutes: 30
+        run: packaging/windows/build-windows.sh stage --arch ${{ matrix.arch }}
+      # Debug symbols are a separate download: the installer stays small, and
+      # a crash report's backtrace can still be read with them.
+      - name: Collect the debug symbols
+        run: |
+          release_dir="target/${{ matrix.target }}/release"
+          7z a -tzip -mx=9 "dist/bytescape-${{ needs.prepare.outputs.version }}-windows-${{ matrix.arch }}-symbols.zip" "$release_dir"/*.pdb
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-windows-stage-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  windows-sign-programs:
+    name: windows sign programs ${{ matrix.arch }}
+    needs: [prepare, windows-build]
+    if: ${{ needs.prepare.outputs.has_win_signing == 'true' }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    # The secrets belong to this environment, which accepts v* tags only. The
+    # id-token permission is for signing in to Azure through OpenID Connect, so
+    # no client secret is stored. No code of ours is built in this job.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-windows-stage-${{ matrix.arch }}
+          path: dist
+      - name: Check that the signing secrets are set
+        id: secrets
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
+        run: |
+          if [ -n "$AZURE_CLIENT_ID" ] && [ -n "$AZURE_TENANT_ID" ] && [ -n "$AZURE_SUBSCRIPTION_ID" ] \
+            && [ -n "$AZURE_SIGNING_ENDPOINT" ] && [ -n "$AZURE_SIGNING_ACCOUNT" ] && [ -n "$AZURE_SIGNING_PROFILE" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Unsigned build::WINDOWS_SIGNING_ENABLED is true but the environment secrets are not all set, so bytescape.exe and bytescape-helper.exe (${{ matrix.arch }}) were not signed. See docs/release-pipeline.md."
+          fi
+      - name: Sign in to Azure
+        if: ${{ steps.secrets.outputs.ok == 'true' }}
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign the programs
+        if: ${{ steps.secrets.outputs.ok == 'true' }}
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist\stage-${{ matrix.arch }}
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-windows-stage-${{ matrix.arch }}
+          path: dist/stage-${{ matrix.arch }}/
+          if-no-files-found: error
+
+  windows-package:
+    name: windows package ${{ matrix.arch }}
+    needs: [prepare, windows-build, windows-sign-programs]
+    # The signing job is skipped when signing is off, which is fine. When it
+    # ran, it must have succeeded.
+    if: ${{ !cancelled() && needs.windows-build.result == 'success' && (needs.windows-sign-programs.result == 'success' || needs.windows-sign-programs.result == 'skipped') }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-windows-stage-${{ matrix.arch }}
+          path: dist
+      # The signed programs replace the unsigned ones, so the zip and the
+      # installer contain the signed files.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: ${{ needs.windows-sign-programs.result == 'success' }}
+        with:
+          name: signed-windows-stage-${{ matrix.arch }}
+          path: dist/stage-${{ matrix.arch }}
+      - name: Make the portable zip
+        run: packaging/windows/build-windows.sh zip --arch ${{ matrix.arch }}
+      - name: Install Inno Setup
+        timeout-minutes: 10
+        run: packaging/windows/build-windows.sh install-inno
+      - name: Make the installer
+        run: packaging/windows/build-windows.sh installer --arch ${{ matrix.arch }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-${{ matrix.arch }}
+          path: |
+            dist/*-portable.zip
+            dist/*-symbols.zip
+          if-no-files-found: error
+      # With signing off the installer is final. With signing on it goes to the
+      # signing job first and comes back under the final name.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ needs.prepare.outputs.has_win_signing != 'true' }}
+        with:
+          name: windows-${{ matrix.arch }}-setup
+          path: dist/*-setup.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ needs.prepare.outputs.has_win_signing == 'true' }}
+        with:
+          name: unsigned-windows-installer-${{ matrix.arch }}
+          path: dist/*-setup.exe
+          if-no-files-found: error
+
+  windows-sign-installer:
+    name: windows sign installer ${{ matrix.arch }}
+    needs: [prepare, windows-package]
+    if: ${{ needs.prepare.outputs.has_win_signing == 'true' }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    outputs:
+      signed: ${{ steps.secrets.outputs.ok }}
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-windows-installer-${{ matrix.arch }}
+          path: dist
+      - name: Check that the signing secrets are set
+        id: secrets
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
+        run: |
+          if [ -n "$AZURE_CLIENT_ID" ] && [ -n "$AZURE_TENANT_ID" ] && [ -n "$AZURE_SUBSCRIPTION_ID" ] \
+            && [ -n "$AZURE_SIGNING_ENDPOINT" ] && [ -n "$AZURE_SIGNING_ACCOUNT" ] && [ -n "$AZURE_SIGNING_PROFILE" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Unsigned build::WINDOWS_SIGNING_ENABLED is true but the environment secrets are not all set, so the installer (${{ matrix.arch }}) was not signed. See docs/release-pipeline.md."
+          fi
+      - name: Sign in to Azure
+        if: ${{ steps.secrets.outputs.ok == 'true' }}
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign the installer
+        if: ${{ steps.secrets.outputs.ok == 'true' }}
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-${{ matrix.arch }}-setup
+          path: dist/*-setup.exe
+          if-no-files-found: error
+
+  # The x64 installer, installed, checked and removed on a real Windows runner.
+  windows-check:
+    name: windows install check x64
+    needs: [prepare, windows-package, windows-sign-installer]
+    if: ${{ !cancelled() && needs.windows-package.result == 'success' && (needs.windows-sign-installer.result == 'success' || needs.windows-sign-installer.result == 'skipped') }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-x64-setup
+          path: dist
+      - name: Check the installer
+        timeout-minutes: 10
+        shell: pwsh
+        run: packaging/windows/smoke-installer.ps1 -Installer "dist\bytescape-${{ needs.prepare.outputs.version }}-windows-x64-setup.exe" -Version "${{ needs.prepare.outputs.version }}"
+
+  # The ARM64 installer, installed and removed on real ARM64 Windows.
+  windows-arm64-check:
+    name: windows arm64 install check
+    needs: [prepare, windows-package, windows-sign-installer]
+    if: ${{ !cancelled() && needs.prepare.outputs.arm64_native == 'true' && needs.windows-package.result == 'success' && (needs.windows-sign-installer.result == 'success' || needs.windows-sign-installer.result == 'skipped') }}
+    runs-on: windows-11-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-arm64-setup
+          path: dist
+      - name: Check the installer
+        timeout-minutes: 10
+        shell: pwsh
+        run: packaging/windows/smoke-installer.ps1 -Installer "dist\bytescape-${{ needs.prepare.outputs.version }}-windows-arm64-setup.exe" -Version "${{ needs.prepare.outputs.version }}"
+
+  # ---- Linux ---------------------------------------------------------------
+  # linux-build compiles with no credential. linux-sign signs the finished
+  # files. linux-check installs the final files in clean containers.
+
+  linux-build:
+    name: linux build ${{ matrix.arch }}
+    needs: prepare
+    # Built on Ubuntu 22.04 so the files run on the oldest system we support
+    # (its C library is the baseline).
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.linux_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - name: Set the build date
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - name: Install the packaging tools
+        timeout-minutes: 15
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config dpkg-dev file desktop-file-utils
+          cargo install --locked cargo-deb@3.8.0
+      - name: Build the .deb
+        timeout-minutes: 30
+        run: packaging/linux/build-deb.sh --target ${{ matrix.target }} --out dist
+      # The folder that goes into the AppImage is saved too, so the signing job
+      # can pack and sign it without compiling anything.
+      - name: Build the AppImage
+        timeout-minutes: 30
+        run: packaging/linux/build-appimage.sh --target ${{ matrix.target }} --out dist --save-appdir work/appdir-${{ matrix.arch }}.tar
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-linux-${{ matrix.arch }}
+          path: |
+            dist/*.deb
+            dist/*.AppImage
+            work/appdir-${{ matrix.arch }}.tar
+          if-no-files-found: error
+      # With signing off the files are final.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ needs.prepare.outputs.has_linux_signing != 'true' }}
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dist/*.deb
+            dist/*.AppImage
+          if-no-files-found: error
+
+  linux-sign:
+    name: linux sign ${{ matrix.arch }}
+    needs: [prepare, linux-build]
+    if: ${{ needs.prepare.outputs.has_linux_signing == 'true' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    outputs:
+      signed: ${{ steps.sign.outputs.signed }}
+    # The key belongs to this environment, which accepts v* tags only. This job
+    # compiles nothing: it signs the .deb and packs the AppImage folder that the
+    # build job saved.
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.linux_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-linux-${{ matrix.arch }}
+          path: unsigned
+      - name: Sign
+        id: sign
+        env:
+          LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
+          LINUX_GPG_KEY_ID: ${{ secrets.LINUX_GPG_KEY_ID }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p dist
+          cp unsigned/dist/*.deb unsigned/dist/*.AppImage dist/
+          if [ -z "$LINUX_GPG_PRIVATE_KEY" ] || [ -z "$LINUX_GPG_KEY_ID" ]; then
+            echo "::warning title=Unsigned build::LINUX_SIGNING_ENABLED is true but the environment secrets are not all set, so the .deb and the AppImage (${{ matrix.arch }}) were not signed. See docs/release-pipeline.md."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s' "$LINUX_GPG_PRIVATE_KEY" | gpg --batch --import
+          for deb in dist/*.deb; do
+            gpg --batch --yes --armor --detach-sign --local-user "$LINUX_GPG_KEY_ID" --output "$deb.asc" "$deb"
+          done
+          rm dist/*.AppImage
+          APPIMAGE_SIGN_KEY="$LINUX_GPG_KEY_ID" packaging/linux/build-appimage.sh \
+            --target ${{ matrix.target }} --out dist --pack-appdir "unsigned/work/appdir-${{ matrix.arch }}.tar" --version "$VERSION"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dist/*.deb
+            dist/*.deb.asc
+            dist/*.AppImage
+          if-no-files-found: error
+
+  # Install the .deb in a clean container of the oldest and the newest
+  # supported release, and run the AppImage on the oldest. These are the files
+  # that will be released.
+  linux-check:
+    name: linux check ${{ matrix.arch }}
+    needs: [prepare, linux-build, linux-sign]
+    if: ${{ !cancelled() && needs.linux-build.result == 'success' && (needs.linux-sign.result == 'success' || needs.linux-sign.result == 'skipped') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.linux_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist
+      - name: Install the .deb in clean containers
+        timeout-minutes: 15
+        run: |
+          for image in ubuntu:22.04 ubuntu:24.04; do
+            docker run --rm --memory=4g -v "$PWD:/repo:ro" -v "$PWD/dist:/pkg:ro" "$image" \
+              bash /repo/packaging/linux/smoke-deb.sh /pkg/bytescape-${{ needs.prepare.outputs.version }}-linux-${{ matrix.arch }}.deb
+          done
+      - name: Run the AppImage in a clean container
+        timeout-minutes: 10
+        run: |
+          docker run --rm --memory=4g -v "$PWD:/repo:ro" -v "$PWD/dist:/pkg:ro" ubuntu:22.04 \
+            bash /repo/packaging/linux/smoke-appimage.sh /pkg/bytescape-${{ needs.prepare.outputs.version }}-linux-${{ matrix.arch }}.AppImage
+
+  # ---- Snap ----------------------------------------------------------------
+
+  snap:
+    name: snap ${{ matrix.arch }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.snap_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install snapcraft
+        timeout-minutes: 10
+        run: sudo snap install snapcraft --classic
+      - name: Build the strict snap
+        timeout-minutes: 40
+        run: sudo packaging/snap/build-snap.sh strict --out dist
+      # The classic edition is built so it is ready the day the store approves
+      # classic confinement. It is never uploaded to the store from here.
+      - name: Build the classic-ready snap
+        timeout-minutes: 40
+        run: sudo packaging/snap/build-snap.sh classic --out dist
+      # A strict snap can be installed from a file with --dangerous. The plugs
+      # it asks for are listed and checked; the program is not started here.
+      - name: Install the strict snap
+        timeout-minutes: 10
+        run: |
+          sudo snap install --dangerous dist/bytescape-${{ needs.prepare.outputs.version }}-linux-${{ matrix.arch }}-strict.snap
+          snap list bytescape
+          snap connections bytescape
+          for plug in home removable-media mount-observe hardware-observe desktop wayland x11; do
+            snap connections bytescape | grep -q "bytescape:$plug" || { echo "::error title=Plug missing::bytescape:$plug is not listed" >&2; exit 1; }
+          done
+          sudo snap remove bytescape
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: snap-${{ matrix.arch }}
+          path: dist/*.snap
+          if-no-files-found: error
+
+  # Only the strict snap goes to the store, only to the edge channel, only from
+  # a tag build, and only from the `release` environment that holds the store
+  # credentials. Moving it to a more stable channel is a person's decision.
+  snap-upload:
+    name: snap upload ${{ matrix.arch }}
+    needs: [prepare, snap]
+    if: ${{ needs.prepare.outputs.has_snap_upload == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.snap_matrix) }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: snap-${{ matrix.arch }}
+          path: dist
+      - name: Install snapcraft
+        timeout-minutes: 10
+        run: sudo snap install snapcraft --classic
+      - name: Upload the strict snap to the edge channel
+        timeout-minutes: 10
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          if [ -z "$SNAPCRAFT_STORE_CREDENTIALS" ]; then
+            echo "::warning title=Snap not uploaded::SNAP_UPLOAD_ENABLED is true but SNAPCRAFT_STORE_CREDENTIALS is not set in the release environment, so nothing was uploaded. See docs/release-pipeline.md."
+            exit 0
+          fi
+          snapcraft upload --release=edge dist/bytescape-${{ needs.prepare.outputs.version }}-linux-${{ matrix.arch }}-strict.snap
+
+  # ---- Files together ------------------------------------------------------
+
+  # Gathers every file, writes the checksums, generates the winget and
+  # Chocolatey files from them, and records where the files were built.
+  assemble:
+    name: assemble
+    needs: [prepare, windows-check, linux-check, snap]
+    # A job whose needs include a skipped job is skipped unless its condition
+    # says otherwise. The signing jobs are skipped when signing is off, and
+    # that must not stop the release, so the checks are named here by result.
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.windows-check.result == 'success' && needs.linux-check.result == 'success' && needs.snap.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # The two extra permissions are for the build-provenance statement, which
+    # needs no stored secret. It is made only in a public repository.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "{windows,linux,snap}-*"
+          merge-multiple: true
+          path: dist
+      - name: Write the checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * | grep -v ' SHA256SUMS$' > SHA256SUMS
+          cat SHA256SUMS
+      - name: Generate the winget and Chocolatey files
+        run: |
+          date="$(date -u -d "@$(git log -1 --format=%ct)" +%F)"
+          cargo xtask manifests --version "${{ needs.prepare.outputs.version }}" --sums dist/SHA256SUMS --date "$date" --out manifests
+          (cd manifests && zip -r -q "../dist/bytescape-${{ needs.prepare.outputs.version }}-package-manifests.zip" .)
+      - name: Record how the files were built
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*-setup.exe
+            dist/*-portable.zip
+            dist/*-symbols.zip
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.snap
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-manifests
+          path: manifests/
+          if-no-files-found: error
+
+  # The Chocolatey package must build with the real tool.
+  chocolatey-pack:
+    name: chocolatey pack
+    needs: assemble
+    if: ${{ !cancelled() && needs.assemble.result == 'success' }}
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package-manifests
+          path: manifests
+      - name: Pack
+        run: |
+          choco pack manifests/chocolatey/bytescape.nuspec --outputdirectory packed
+          ls packed
+          test -n "$(ls packed/*.nupkg)"
+
+  # A tag creates the draft. Publishing it is a person's decision.
+  draft-release:
+    name: draft release
+    needs: [prepare, assemble, chocolatey-pack, windows-sign-installer, linux-sign]
+    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.assemble.result == 'success' && needs.chocolatey-pack.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: dist
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          # What the signing jobs really did, not what the variables asked for.
+          WIN_SIGNED: ${{ needs.windows-sign-installer.outputs.signed == 'true' }}
+          LINUX_SIGNED: ${{ needs.linux-sign.outputs.signed == 'true' }}
+          ARM64_NATIVE: ${{ needs.prepare.outputs.arm64_native }}
+        run: |
+          {
+            echo "Release candidate for $VERSION. This is a draft: read the notes, check the files, then publish."
+            echo
+            echo "- Windows files signed: $WIN_SIGNED"
+            echo "- Linux packages signed: $LINUX_SIGNED"
+            echo "- Linux ARM64 packages built and checked on ARM64: $ARM64_NATIVE"
+            echo "- SHA256SUMS lists every file. The winget and Chocolatey files are in the package-manifests zip."
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "Bytescape $VERSION" --notes-file notes.md dist/*

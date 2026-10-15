@@ -43,3 +43,6 @@ accesskit = "0.25"
 # No Linux screen-reader adapter here: it brings in D-Bus and an async runtime.
 accesskit_winit = { version = "0.34", default-features = false, features = ["rwh_06"] }
 accesskit_consumer = "0.39"
+# Compiles the Windows resources (icon, version information, manifest) into the
+# two programs. Used by their build scripts only.
+embed-resource = "3"

@@ -1,6 +1,9 @@
 //! `cargo xtask helper-deps`: the elevated helper has a tight dependency
 //! allowlist. Its normal-dependency closure, on every target, must be a
-//! subset of `xtask/helper-deps.allow`.
+//! subset of `xtask/helper-deps.allow`. Its direct build dependencies (code
+//! that runs while the helper is compiled, and ships nothing but what it
+//! writes) must be listed, with the reason, in
+//! `xtask/helper-build-deps.allow`.
 
 use crate::util::{
     Finding, TARGETS, cargo_metadata, normalize_crate_name, package_names, parse_allow_lines,
@@ -62,6 +65,62 @@ pub fn helper_closure(metadata: &Value) -> Option<BTreeSet<String>> {
     )
 }
 
+/// The names of the helper's direct build dependencies. Build dependencies run
+/// while the helper is compiled and nothing of them is linked into it, so
+/// they are not part of the closure above; but code that runs in the build of
+/// a program that runs as administrator is reviewed all the same. `None` when
+/// the helper is not in the document.
+pub fn helper_build_dependencies(metadata: &Value) -> Option<BTreeSet<String>> {
+    let names = package_names(metadata);
+    let start = names
+        .iter()
+        .find(|(_, name)| name.as_str() == HELPER)
+        .map(|(id, _)| id.clone())?;
+    let node = metadata["resolve"]["nodes"]
+        .as_array()?
+        .iter()
+        .find(|node| node["id"].as_str() == Some(start.as_str()))?;
+    let mut found = BTreeSet::new();
+    for dep in node["deps"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        let is_build = dep["dep_kinds"].as_array().is_some_and(|kinds| {
+            kinds
+                .iter()
+                .any(|kind| kind["kind"].as_str() == Some("build"))
+        });
+        if is_build && let Some(name) = dep["pkg"].as_str().and_then(|id| names.get(id)) {
+            found.insert(normalize_crate_name(name));
+        }
+    }
+    Some(found)
+}
+
+/// Compares the helper's direct build dependencies with their allowlist.
+pub fn check_build_dependencies(
+    metadata: &Value,
+    target: &str,
+    allow: &BTreeSet<String>,
+) -> Vec<Finding> {
+    let Some(found) = helper_build_dependencies(metadata) else {
+        return vec![Finding::new(
+            target,
+            None,
+            format!("package `{HELPER}` not found in the dependency graph"),
+        )];
+    };
+    found
+        .difference(allow)
+        .map(|name| {
+            Finding::new(
+                name.clone(),
+                None,
+                format!(
+                    "is a build dependency of {HELPER} on {target} but is not in xtask/helper-build-deps.allow"
+                ),
+            )
+        })
+        .collect()
+}
+
 /// Compares one target's closure with the allowlist.
 pub fn check_metadata(metadata: &Value, target: &str, allow: &BTreeSet<String>) -> Vec<Finding> {
     let Some(closure) = helper_closure(metadata) else {
@@ -90,10 +149,14 @@ pub fn run(root: &Path) -> Result<Vec<Finding>, String> {
     let allow_text = read_text(&root.join("xtask/helper-deps.allow"))
         .ok_or_else(|| String::from("xtask/helper-deps.allow is missing"))?;
     let allow = parse_allow(&allow_text);
+    let build_allow_text = read_text(&root.join("xtask/helper-build-deps.allow"))
+        .ok_or_else(|| String::from("xtask/helper-build-deps.allow is missing"))?;
+    let build_allow = parse_allow(&build_allow_text);
     let mut findings = Vec::new();
     for target in TARGETS {
         let metadata = cargo_metadata(root, target)?;
         findings.extend(check_metadata(&metadata, target, &allow));
+        findings.extend(check_build_dependencies(&metadata, target, &build_allow));
     }
     Ok(findings)
 }

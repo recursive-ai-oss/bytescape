@@ -1,0 +1,65 @@
+# The strict edition of the snap: the walker only.
+#
+# A strict snap cannot read other users' files or start a program with
+# administrator rights, so this edition has no elevated helper and no
+# "Full scan" button. It reads what the plugs below allow: your home folder,
+# removable media, and the mount table. The classic edition
+# (snapcraft-classic.yaml, built the same way) has the full-disk reach and is
+# published once the store approves classic confinement.
+#
+# Build from the repository root: packaging/snap/build-snap.sh strict
+name: bytescape
+base: core24
+adopt-info: bytescape
+summary: See where the space on a drive is used
+description: |
+  Bytescape scans a drive or folder and draws every file and folder as a box
+  whose area is its size, so the biggest things stand out at once. It shows
+  what is there and leaves the decisions to you. It never connects to the
+  internet. This edition reads your home folder and removable media; it has no
+  administrator access.
+grade: stable
+confinement: strict
+license: MIT OR Apache-2.0
+contact: https://github.com/recursive-ai-oss/bytescape/issues
+issues: https://github.com/recursive-ai-oss/bytescape/issues
+source-code: https://github.com/recursive-ai-oss/bytescape
+website: https://github.com/recursive-ai-oss/bytescape
+compression: lzo
+
+apps:
+  bytescape:
+    command: bin/bytescape
+    extensions: [gnome]
+    common-id: org.recursiveai.bytescape
+    desktop: usr/share/applications/org.recursiveai.bytescape.desktop
+    plugs:
+      - home
+      - removable-media
+      - mount-observe
+      - hardware-observe
+      - desktop
+      - wayland
+      - x11
+
+parts:
+  bytescape:
+    plugin: rust
+    source: .
+    # The interface only. The helper is not part of this edition.
+    rust-path: [crates/bytescape]
+    rust-channel: "1.99.0"
+    build-packages:
+      - pkg-config
+    build-environment:
+      - SOURCE_DATE_EPOCH: "$(git -C $CRAFT_PART_SRC log -1 --format=%ct 2>/dev/null || echo 0)"
+    override-build: |
+      craftctl default
+      install -Dm644 packaging/linux/org.recursiveai.bytescape.desktop \
+        "$CRAFT_PART_INSTALL/usr/share/applications/org.recursiveai.bytescape.desktop"
+      # A snap's menu entry points at the icon inside the snap.
+      sed -i 's|^Icon=.*|Icon=${SNAP}/meta/gui/bytescape.png|' \
+        "$CRAFT_PART_INSTALL/usr/share/applications/org.recursiveai.bytescape.desktop"
+      install -Dm644 packaging/linux/org.recursiveai.bytescape.metainfo.xml \
+        "$CRAFT_PART_INSTALL/usr/share/metainfo/org.recursiveai.bytescape.metainfo.xml"
+      craftctl set version="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"name":"bytescape","version":"\([^"]*\)".*/\1/p' | head -1)"
