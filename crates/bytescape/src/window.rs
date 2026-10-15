@@ -715,7 +715,37 @@ struct LiveStats {
     scan_done_ms: Option<f64>,
 }
 
+/// Whether the window can still be asked to redraw from another thread. The
+/// event loop refuses (and the windowing library panics) once it has closed,
+/// and the GPU start-up thread may finish after the program began to leave.
+#[derive(Clone, Default)]
+struct RedrawGate(Arc<std::sync::Mutex<bool>>);
+
+impl RedrawGate {
+    fn open() -> RedrawGate {
+        RedrawGate(Arc::new(std::sync::Mutex::new(true)))
+    }
+
+    /// Runs `ask` only while the gate is open. Closing waits for an ask that
+    /// is in progress, so none starts after the loop is gone.
+    fn ask(&self, ask: impl FnOnce()) {
+        if let Ok(open) = self.0.lock()
+            && *open
+        {
+            ask();
+        }
+    }
+
+    fn close(&self) {
+        if let Ok(mut open) = self.0.lock() {
+            *open = false;
+        }
+    }
+}
+
 struct WinApp {
+    /// Lets other threads ask for a redraw, until the loop closes.
+    redraw_gate: RedrawGate,
     proxy: EventLoopProxy<UserEvent>,
     mode: Mode,
     t0: Instant,
@@ -781,6 +811,7 @@ fn run_window(mode: Mode, t0: Instant) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let loop_built = t0.elapsed().as_secs_f64() * 1000.0;
     let mut app = WinApp {
+        redraw_gate: RedrawGate::open(),
         proxy: event_loop.create_proxy(),
         mode,
         t0,
@@ -1801,7 +1832,8 @@ impl WinApp {
                 },
                 wake: Some({
                     let w = window.clone();
-                    Arc::new(move || w.request_redraw())
+                    let gate = self.redraw_gate.clone();
+                    Arc::new(move || gate.ask(|| w.request_redraw()))
                 }),
             },
         )?;
@@ -2667,6 +2699,7 @@ fn translate_key(key: &WKey, mods: ModifiersState) -> Option<Key> {
     let (alt, ctrl, shift) = (mods.alt_key(), mods.control_key(), mods.shift_key());
     Some(match key {
         WKey::Named(NamedKey::Enter) => Key::Enter,
+        WKey::Named(NamedKey::Space) if ctrl => Key::ToggleSelected,
         WKey::Named(NamedKey::Space) => Key::Space,
         WKey::Named(NamedKey::Tab) if shift => Key::BackTab,
         WKey::Named(NamedKey::Tab) => Key::Tab,
@@ -2686,6 +2719,10 @@ fn translate_key(key: &WKey, mods: ModifiersState) -> Option<Key> {
         WKey::Named(NamedKey::ArrowLeft) if alt => Key::AltLeft,
         WKey::Named(NamedKey::ArrowRight) if alt => Key::AltRight,
         WKey::Named(NamedKey::ArrowUp) if alt => Key::AltUp,
+        WKey::Named(NamedKey::ArrowLeft) if shift => Key::ExtendArrow(Direction::Left),
+        WKey::Named(NamedKey::ArrowRight) if shift => Key::ExtendArrow(Direction::Right),
+        WKey::Named(NamedKey::ArrowUp) if shift => Key::ExtendArrow(Direction::Up),
+        WKey::Named(NamedKey::ArrowDown) if shift => Key::ExtendArrow(Direction::Down),
         WKey::Named(NamedKey::ArrowLeft) => Key::Arrow(Direction::Left),
         WKey::Named(NamedKey::ArrowRight) => Key::Arrow(Direction::Right),
         WKey::Named(NamedKey::ArrowUp) => Key::Arrow(Direction::Up),
@@ -2695,6 +2732,11 @@ fn translate_key(key: &WKey, mods: ModifiersState) -> Option<Key> {
 }
 
 impl ApplicationHandler<UserEvent> for WinApp {
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        // From here on the loop no longer takes redraw requests.
+        self.redraw_gate.close();
+    }
+
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.live.is_none()
             && let Err(e) = self.create(el)
@@ -2953,5 +2995,52 @@ mod elevation_tests {
         ]);
         assert_eq!(extra_mounts_of(&d), vec![11]);
         assert!(extra_mounts_of(&drive(Vec::new())).is_empty());
+    }
+
+    /// The GPU start-up thread asks for a redraw when it finishes, which can
+    /// be after the program began to leave. Once the loop has closed that
+    /// request must not reach the windowing library.
+    #[test]
+    fn a_redraw_asked_for_after_the_loop_closed_is_dropped() {
+        let gate = RedrawGate::open();
+        let mut asked = 0;
+        gate.ask(|| asked += 1);
+        assert_eq!(asked, 1);
+        gate.close();
+        gate.ask(|| asked += 1);
+        gate.ask(|| panic!("the windowing library would panic here"));
+        assert_eq!(asked, 1);
+        // A copy of the gate (the one a thread holds) is closed too.
+        let copy = gate.clone();
+        copy.ask(|| asked += 1);
+        assert_eq!(asked, 1);
+    }
+
+    /// Asking from another thread while the loop closes never reaches the
+    /// library after the close returned.
+    #[test]
+    fn closing_waits_for_a_request_in_progress() {
+        for _ in 0..50 {
+            let gate = RedrawGate::open();
+            let after_close = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let t = {
+                let (gate, after_close, closed) =
+                    (gate.clone(), after_close.clone(), closed.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        gate.ask(|| {
+                            if closed.load(std::sync::atomic::Ordering::SeqCst) {
+                                after_close.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        });
+                    }
+                })
+            };
+            gate.close();
+            closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            t.join().unwrap();
+            assert!(!after_close.load(std::sync::atomic::Ordering::SeqCst));
+        }
     }
 }

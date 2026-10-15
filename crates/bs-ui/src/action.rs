@@ -78,6 +78,49 @@ impl Action {
         }
     }
 
+    /// What the action does, as a short sentence for a screen reader. A
+    /// disabled action says why it can't be done instead (see [`reason`]).
+    pub fn describe(self) -> &'static str {
+        match self {
+            Action::Open => "Opens it with the program the system chooses",
+            Action::ShowInFileManager => {
+                if cfg!(windows) {
+                    "Shows it in Explorer"
+                } else {
+                    "Shows it in the file manager"
+                }
+            }
+            Action::OpenTerminal => "Opens a terminal in this folder",
+            Action::CopyPath => "Copies the full path",
+            Action::Properties => "Shows the system's properties window",
+            Action::ZoomInto => "Goes into this folder",
+            Action::Rescan => "Reads this folder from the disk again",
+            Action::Handoff(Handoff::Uninstall) => "Starts the program's own uninstaller",
+            Action::Handoff(Handoff::DiskCleanup) => {
+                if cfg!(windows) {
+                    "Opens Disk Cleanup"
+                } else {
+                    "Opens the system's storage settings"
+                }
+            }
+            Action::Handoff(_) => "Opens the tool that manages it",
+            Action::OpenInSoftware => "Shows the package in the software center",
+            Action::CopyRemovalCommand => "Copies the command that removes the package",
+            Action::Delete => {
+                if cfg!(windows) {
+                    "Moves it to the Recycle Bin, with an Undo"
+                } else {
+                    "Moves it to the Trash, with an Undo"
+                }
+            }
+            Action::DeletePermanently => "Deletes it for good, after a confirmation",
+            Action::Undo => "Puts the last deleted item back",
+            Action::ContextMenu => "Opens the menu of actions",
+            Action::About => "Shows the version and build date",
+            Action::CheckForUpdates => "Opens the releases page in your browser",
+        }
+    }
+
     /// Whether the interface carries this action out itself. The rest are
     /// handled by the layers that own them (files, the system, deletion) and
     /// are only announced here.

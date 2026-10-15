@@ -448,6 +448,9 @@ enum Confirm {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ReportView {
     notice: CrashNotice,
+    /// The report as rows of the dialog's width: blank lines kept, long lines
+    /// wrapped.
+    all: Vec<String>,
     show_paths: bool,
     /// The first report line on screen.
     offset: usize,
@@ -699,18 +702,23 @@ impl<S: ViewSource> Shell<S> {
                             hint,
                             enabled,
                             ..
-                        } => Some((
-                            label.to_string(),
-                            if *enabled {
-                                String::new()
-                            } else {
-                                hint.to_string()
-                            },
-                            *enabled,
-                            false,
-                            *rect,
-                        )),
+                        } => Some((label.to_string(), hint.to_string(), *enabled, *rect)),
                         _ => None,
+                    })
+                    .zip(m.rows.iter().filter(|r| !r.row.separator))
+                    .map(|((label, hint, enabled, rect), model)| {
+                        // A disabled row says why; a working one says what it
+                        // does, and its key when it has one.
+                        let note = if !enabled {
+                            hint
+                        } else {
+                            match (model.action, hint.is_empty()) {
+                                (Some(a), true) => a.describe().to_string(),
+                                (Some(a), false) => format!("{}. Key: {hint}", a.describe()),
+                                (None, _) => hint,
+                            }
+                        };
+                        (label, note, enabled, false, rect)
                     })
                     .collect();
                 Some(PopupSummary {
@@ -1053,6 +1061,9 @@ impl<S: ViewSource> Shell<S> {
             })
         };
         if elevated {
+            // The denial the toast reported led here; the dialog takes over,
+            // and the toast must not linger under it as a second panel.
+            self.close_toast(now);
             let notes: Vec<&'static str> = plan.entries.iter().filter_map(|e| e.note).collect();
             let mut list = NameList {
                 offset: 0,
@@ -2536,7 +2547,7 @@ impl<S: ViewSource> Shell<S> {
             .map(|d| card::handoff_actions(&d))
             .unwrap_or_default();
         let mut spec: Vec<(Option<Action>, &str)> = vec![
-            (Some(Action::Open), "Enter"),
+            (Some(Action::Open), ""),
             (Some(Action::ShowInFileManager), ""),
             (Some(Action::OpenTerminal), ""),
             (Some(Action::CopyPath), "Ctrl+C"),
@@ -2799,6 +2810,9 @@ impl<S: ViewSource> Shell<S> {
         if !about.target.is_empty() {
             lines.push((about.target.clone(), CardRole::Secondary));
         }
+        if let Some(drawing) = &about.drawing {
+            lines.push((drawing.clone(), CardRole::Secondary));
+        }
         if let Some(age) = about.age_line(now) {
             lines.push((age, CardRole::Normal));
         }
@@ -2855,8 +2869,10 @@ impl<S: ViewSource> Shell<S> {
         let rows = ((self.height as f32 * 0.5) / line_h)
             .floor()
             .clamp(6.0, 40.0) as usize;
+        let all = self.report_rows(&notice, false);
         let view = ReportView {
             notice,
+            all,
             show_paths: false,
             offset: 0,
             rows,
@@ -2866,6 +2882,8 @@ impl<S: ViewSource> Shell<S> {
     }
 
     pub(super) fn report_press(&mut self, button: usize) -> Vec<ShellEffect> {
+        let inner_width = self.dialog_inner_width();
+        let em = self.font_px * self.scale;
         let Some(Modal::Dialog(d)) = self.acts.modal.as_mut() else {
             return Vec::new();
         };
@@ -2876,6 +2894,13 @@ impl<S: ViewSource> Shell<S> {
             0 => {
                 view.show_paths = !view.show_paths;
                 view.offset = 0;
+                view.all = rows_of_report(
+                    &view.notice,
+                    view.show_paths,
+                    inner_width,
+                    self.measure.as_ref(),
+                    em,
+                );
                 d.spec = report_spec(view);
                 Vec::new()
             }
@@ -2895,7 +2920,7 @@ impl<S: ViewSource> Shell<S> {
         let Confirm::Report(view) = &mut d.confirm else {
             return;
         };
-        let total = view.notice.lines(view.show_paths).len();
+        let total = view.all.len();
         let last = total.saturating_sub(view.rows) as i64;
         let to = (view.offset as i64).saturating_add(by).clamp(0, last);
         let to = to as usize;
@@ -2938,6 +2963,17 @@ impl<S: ViewSource> Shell<S> {
         self.acts.modal = Some(Modal::Dialog(d));
     }
 
+    /// The report as rows that fit the dialog.
+    fn report_rows(&self, notice: &CrashNotice, show_paths: bool) -> Vec<String> {
+        rows_of_report(
+            notice,
+            show_paths,
+            self.dialog_inner_width(),
+            self.measure.as_ref(),
+            self.font_px * self.scale,
+        )
+    }
+
     /// The words of the open crash report viewer, as one text (for tests).
     pub fn report_text(&self) -> Option<String> {
         match self.acts.modal.as_ref()? {
@@ -2956,10 +2992,65 @@ impl<S: ViewSource> Shell<S> {
     }
 }
 
+/// The report's lines as rows no wider than `width`: a blank line is one blank
+/// row, and a longer line continues on the next rows (at spaces, or inside a
+/// word that is wider than a row by itself).
+fn rows_of_report(
+    notice: &CrashNotice,
+    show_paths: bool,
+    width: f32,
+    measure: &dyn crate::chrome::TextMeasure,
+    em: f32,
+) -> Vec<String> {
+    let w = |s: &str| {
+        measure
+            .width(s)
+            .unwrap_or_else(|| s.chars().count() as f32 * em * 0.56)
+    };
+    let mut rows = Vec::new();
+    for line in notice.lines(show_paths) {
+        if line.trim().is_empty() {
+            rows.push(String::new());
+            continue;
+        }
+        let mut cur = String::new();
+        for word in line.split_whitespace() {
+            // A word wider than a row is broken into pieces that fit.
+            let mut rest: Vec<char> = word.chars().collect();
+            while w(&rest.iter().collect::<String>()) > width && rest.len() > 1 {
+                let mut take = rest.len() - 1;
+                while take > 1 && w(&rest[..take].iter().collect::<String>()) > width {
+                    take -= 1;
+                }
+                if !cur.is_empty() {
+                    rows.push(std::mem::take(&mut cur));
+                }
+                rows.push(rest[..take].iter().collect());
+                rest.drain(..take);
+            }
+            let word: String = rest.iter().collect();
+            let trial = if cur.is_empty() {
+                word.clone()
+            } else {
+                format!("{cur} {word}")
+            };
+            if w(&trial) <= width || cur.is_empty() {
+                cur = trial;
+            } else {
+                rows.push(std::mem::replace(&mut cur, word));
+            }
+        }
+        if !cur.is_empty() {
+            rows.push(cur);
+        }
+    }
+    rows
+}
+
 /// The crash report viewer as a dialog: a few lines of the report, where they
 /// are in it, and the buttons.
 fn report_spec(view: &ReportView) -> DialogSpec {
-    let all = view.notice.lines(view.show_paths);
+    let all = &view.all;
     let first = view.offset.min(all.len());
     let shown: Vec<&String> = all.iter().skip(first).take(view.rows).collect();
     let mut lines: Vec<(String, CardRole)> = Vec::new();
@@ -2995,7 +3086,9 @@ fn report_spec(view: &ReportView) -> DialogSpec {
         title: "Crash report".into(),
         lines,
         pinned,
-        rows: view.rows + 3,
+        // Room for the title, every row asked for and the lines kept on screen,
+        // whatever they wrap to: no row is cut from the bottom.
+        rows: 60,
         buttons: vec![
             Button {
                 label: if view.show_paths {

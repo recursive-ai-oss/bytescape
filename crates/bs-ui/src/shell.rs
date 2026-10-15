@@ -907,7 +907,18 @@ impl<S: ViewSource> Shell<S> {
     /// hovered button or the "Copied" confirmation.
     fn rebuild_card(&mut self) {
         let (em, scale) = self.card_metrics();
-        let map = self.map_rect();
+        // The card's soft edge reaches a little past its panel, so the panel
+        // keeps that far from the capacity bar above and the status bar below.
+        let map = {
+            let map = self.map_rect();
+            let edge = (bs_render::card::CARD_EDGE * scale).ceil();
+            Rect::new(
+                map.x + edge,
+                map.y + edge,
+                (map.w - 2.0 * edge).max(0.0),
+                (map.h - 2.0 * edge).max(0.0),
+            )
+        };
         let drive_total = self.drive_total;
         let anchor = match (self.card.shown.as_ref(), self.app.as_ref()) {
             (Some(s), Some(app)) => app.item(s.id).map(|i| i.rect),

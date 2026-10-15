@@ -177,6 +177,11 @@ pub enum Key {
     AltUp,
     /// An arrow: moves the selection to the nearest box that way.
     Arrow(Direction),
+    /// Shift and an arrow: adds the nearest box that way to the selection.
+    ExtendArrow(Direction),
+    /// Ctrl and Space: adds the box the keyboard is on to the selection, or
+    /// takes it off when it is in.
+    ToggleSelected,
     /// Delete: move the selection to the Recycle Bin or Trash.
     Delete,
     /// Shift+Delete: delete the selection for good.
@@ -617,6 +622,8 @@ impl<S: ViewSource> App<S> {
                 self.zoom_out(&mut fx);
             }
             InputEvent::Key(Key::Arrow(dir)) => self.arrow(dir, &mut fx),
+            InputEvent::Key(Key::ExtendArrow(dir)) => self.extend_arrow(dir, &mut fx),
+            InputEvent::Key(Key::ToggleSelected) => self.toggle_selected(&mut fx),
             InputEvent::Key(
                 Key::Delete
                 | Key::DeletePermanently
@@ -958,6 +965,63 @@ impl<S: ViewSource> App<S> {
             self.anchor = Some(id);
             fx.push(self.selection_effect());
         }
+    }
+
+    /// The box the keyboard is on: the one last chosen if it is still there,
+    /// else the last of the selection.
+    fn keyboard_box(&self) -> Option<u32> {
+        let level = self.top()?;
+        let there = |id: u32| level.layout.items.iter().any(|i| i.id == id);
+        self.anchor
+            .filter(|&id| there(id))
+            .or_else(|| self.selected.last().copied().filter(|&id| there(id)))
+    }
+
+    /// Shift and an arrow: the nearest box that way joins the selection and
+    /// becomes the one the keyboard is on.
+    fn extend_arrow(&mut self, dir: Direction, fx: &mut Vec<Effect>) {
+        let Some(level) = self.top() else {
+            return;
+        };
+        let items = &level.layout.items;
+        let next = match self.keyboard_box() {
+            Some(sel) => items
+                .iter()
+                .find(|i| i.id == sel)
+                .and_then(|from| spatial::neighbor(items, from, dir)),
+            None => spatial::first(items),
+        };
+        let Some(id) = next else {
+            return;
+        };
+        let before = self.selected.clone();
+        // The new box is the primary one: last in the selection.
+        self.selected.retain(|&i| i != id);
+        self.selected.push(id);
+        self.anchor = Some(id);
+        if self.selected != before {
+            fx.push(self.selection_effect());
+        }
+    }
+
+    /// Ctrl and Space: the box the keyboard is on joins the selection, or
+    /// leaves it.
+    fn toggle_selected(&mut self, fx: &mut Vec<Effect>) {
+        let id = match self.keyboard_box() {
+            Some(id) => id,
+            None => match self.top().and_then(|l| spatial::first(&l.layout.items)) {
+                Some(id) => id,
+                None => return,
+            },
+        };
+        match self.selected.iter().position(|&i| i == id) {
+            Some(at) => {
+                self.selected.remove(at);
+            }
+            None => self.selected.push(id),
+        }
+        self.anchor = Some(id);
+        fx.push(self.selection_effect());
     }
 
     fn enter(&mut self, view: ViewId, child: Rect, fx: &mut Vec<Effect>) {

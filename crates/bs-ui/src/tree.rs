@@ -267,7 +267,7 @@ impl ViewSource for TreeSource {
             };
         };
         let blocks = (view == self.root).then_some(self.blocks).flatten();
-        let (area, extra) = split_for_blocks(blocks.as_ref(), &self.snapshot, map);
+        let (area, extra) = split_for_blocks(blocks.as_ref(), &self.snapshot, map, self.metrics);
         let laid = bs_layout::layout(&self.snapshot, &target, area, self.metrics);
         // Offers are valid until this view is registered again, which is the
         // next layout of it.
@@ -523,7 +523,7 @@ impl ViewSource for TreeSource {
         let blocks = (view == self.root).then_some(self.blocks).flatten();
         Some(Box::new(move || {
             let started = Instant::now();
-            let (area, extra) = split_for_blocks(blocks.as_ref(), &snapshot, map);
+            let (area, extra) = split_for_blocks(blocks.as_ref(), &snapshot, map, metrics);
             let laid = bs_layout::layout(&snapshot, &target, area, metrics);
             let mut items: Vec<Item> = laid.items().iter().map(to_item).collect();
             settle_empty_group(&target, &mut items);
@@ -559,13 +559,25 @@ impl ViewSource for TreeSource {
 
 /// A group view whose members are all too small to draw is left with just its
 /// frame: a title bar over nothing. Drawn as a labeled block instead, it
-/// still says what the group is and how much it holds.
+/// says what the group is, why nothing is drawn, and how much it holds (a
+/// block shows its name only, so the size goes into the words).
 fn settle_empty_group(target: &ViewTarget, items: &mut [Item]) {
     if matches!(target, ViewTarget::Group(_))
         && let [only] = items
         && only.kind == ItemKind::FolderTitled
     {
         only.kind = ItemKind::FolderBlock;
+        if let Some(label) = only.label.as_mut() {
+            let words = if label.size.is_empty() {
+                format!("{}, each too small to draw", label.name)
+            } else {
+                format!(
+                    "{}, each too small to draw \u{b7} {}",
+                    label.name, label.size
+                )
+            };
+            label.name = words.into();
+        }
     }
 }
 
@@ -588,9 +600,10 @@ fn split_for_blocks(
     blocks: Option<&DriveBlocks>,
     snapshot: &Snapshot,
     map: Rect,
+    metrics: Metrics,
 ) -> (bs_layout::Rect, Vec<Item>) {
     let (files, extra) = match blocks {
-        Some(b) => b.place(snapshot.root().map_or(0, |r| r.allocated()), map),
+        Some(b) => b.place(snapshot.root().map_or(0, |r| r.allocated()), map, metrics),
         None => (map, Vec::new()),
     };
     (

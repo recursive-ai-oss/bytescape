@@ -140,6 +140,9 @@ fn button(label: &str, rect: Rect, enabled: bool, reason: &str) -> Node {
         n.add_action(Action::Click);
     } else {
         n.set_disabled();
+    }
+    // What a working button does, or why a disabled one can't.
+    if !reason.is_empty() {
         n.set_description(reason);
     }
     n
@@ -847,7 +850,7 @@ impl<S: ViewSource> Shell<S> {
             toast.set_live(Live::Polite);
             toast.set_bounds(ak_rect(rect));
             if let Some(r) = undo {
-                let n = button("Undo", r, true, "");
+                let n = button("Undo", r, true, crate::action::Action::Undo.describe());
                 out.push((TOAST_UNDO, n));
                 targets.insert(TOAST_UNDO, AccessTarget::ToastUndo);
                 toast.set_children(vec![TOAST_UNDO]);

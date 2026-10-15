@@ -333,8 +333,10 @@ fn a_finished_drive_shows_free_unreadable_reserved_and_bin_blocks() {
         unreadable
             .label
             .as_ref()
-            .is_some_and(|l| l.name.starts_with("Couldn't read: ")
-                && l.name.ends_with("Grant access to see inside")),
+            .is_some_and(|l| l.name.starts_with("Couldn't read: 80.0 GB")
+                // The call to action is kept while the block is wide enough
+                // for it; a narrow one keeps the number and drops the rest.
+                && (l.name.ends_with("Grant access to see inside") || l.name.len() == "Couldn't read: 80.0 GB".len())),
         "{unreadable:?}"
     );
     // The folders still lay out in what is left, and nothing overlaps.

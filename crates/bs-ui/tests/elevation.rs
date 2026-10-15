@@ -114,6 +114,26 @@ fn shell_for(snapshot: Arc<Snapshot>, scale: f32) -> Shell<TreeSource> {
     shell
 }
 
+/// A shell in a very wide window, so the drive-level blocks are wide enough
+/// to carry their fullest wording.
+fn wide_shell(snapshot: Arc<Snapshot>) -> Shell<TreeSource> {
+    let mut shell: Shell<TreeSource> = Shell::new(
+        (6000, 800),
+        1.0,
+        13.0,
+        TextEngine::new(),
+        Look {
+            dark: false,
+            accent: None,
+        },
+    )
+    .with_measure(Box::new(Fixed(13.0 * 0.56)));
+    let map = shell.map_rect();
+    let source = TreeSource::new(snapshot, Metrics::from_logical(13.0, 1.0)).expect("root");
+    shell.set_app(App::new(source, map));
+    shell
+}
+
 fn blocks(unreadable_as: UnreadableAs) -> DriveBlocks {
     DriveBlocks {
         free: 112_000_000_000,
@@ -285,7 +305,7 @@ fn the_button_is_an_accessible_control_with_a_reason_when_disabled() {
 #[test]
 fn the_block_invites_and_a_click_starts_the_full_scan() {
     let (_, snap) = build(&["a", "b", "c"], None);
-    let mut shell = shell_for(snap, 1.0);
+    let mut shell = wide_shell(snap);
     let ua = shell.unreadable_as();
     show_blocks(&mut shell, blocks(ua));
     let block = unreadable_box(&shell);
@@ -302,7 +322,7 @@ fn the_block_invites_and_a_click_starts_the_full_scan() {
 #[test]
 fn while_the_full_scan_runs_the_block_says_so_and_a_click_does_not_start_another() {
     let (_, snap) = build(&["a", "b", "c"], None);
-    let mut shell = shell_for(snap, 1.0);
+    let mut shell = wide_shell(snap);
     assert!(
         shell.set_offer(Offer::Running),
         "the block must be reworded"
@@ -326,7 +346,7 @@ fn while_the_full_scan_runs_the_block_says_so_and_a_click_does_not_start_another
 #[test]
 fn after_the_full_scan_the_gap_is_filesystem_overhead_and_not_clickable() {
     let (_, snap) = build(&["a", "b", "c"], None);
-    let mut shell = shell_for(snap, 1.0);
+    let mut shell = wide_shell(snap);
     assert!(shell.set_offer(Offer::Done));
     let ua = shell.unreadable_as();
     show_blocks(&mut shell, blocks(ua));
@@ -391,7 +411,7 @@ fn an_edition_that_cannot_elevate_explains_itself_where_the_offer_would_be() {
             "AppImage",
         ),
     ] {
-        let mut shell = shell_for(snap.clone(), 1.0);
+        let mut shell = wide_shell(snap.clone());
         shell.set_offer(offer.clone());
         assert!(full_scan_rect(&mut shell).is_none(), "the button is gone");
         let ua = shell.unreadable_as();
@@ -422,7 +442,7 @@ fn an_edition_that_cannot_elevate_explains_itself_where_the_offer_would_be() {
 #[test]
 fn other_reasons_hide_the_offer_and_the_block_keeps_its_plain_words() {
     let (_, snap) = build(&["a", "b", "c"], None);
-    let mut shell = shell_for(snap, 1.0);
+    let mut shell = wide_shell(snap);
     shell.set_offer(Offer::for_unavailable(
         bs_platform::elevate::Unavailable::HelperNotInstalled,
     ));
@@ -1053,6 +1073,16 @@ fn nothing_is_confirmed_for_a_plain_item_and_what_was_seen_at_selection_goes_alo
     let dir = base.join(format!("bs-ui-admin-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("alpha")).unwrap();
+    // The real spelling: a runner's temp folder may carry 8.3 short names,
+    // which are refused as unsafe to judge.
+    let dir = {
+        let real = std::fs::canonicalize(&dir).unwrap();
+        let text = real.to_string_lossy().into_owned();
+        match text.strip_prefix(r"\\?\") {
+            Some(rest) if rest.as_bytes().get(1) == Some(&b':') => std::path::PathBuf::from(rest),
+            _ => real,
+        }
+    };
     let root = dir.to_string_lossy().into_owned().into_bytes();
     let mut agg = Aggregator::new();
     let mut b = Batch::new();
@@ -2109,4 +2139,23 @@ fn marks_are_noted_by_names_and_found_in_another_tree() {
     assert_eq!(marks.len(), 2);
     marks.clear();
     assert!(marks.is_empty());
+}
+
+// ---- no second panel under the dialog -------------------------------------------------------
+
+#[test]
+fn the_denial_toast_does_not_linger_under_the_administrator_dialog() {
+    let mut r = rig(BinStyle::Trash, ElevatedEnd::Done(Vec::new()));
+    select_first(&mut r.shell);
+    let fx = key(&mut r.shell, Key::Delete, 20);
+    let fx = run_job(&mut r.shell, fx, 30);
+    // The refused move says so in a toast...
+    assert!(r.shell.toast_text().is_some(), "the denial is reported");
+    settle(&mut r.shell, fx, 40);
+    // ...and once the dialog takes over the toast is gone, so nothing under
+    // the dim layer reads as a second dialog.
+    assert!(r.shell.dialog_text().is_some());
+    // It fades out over the toast's own short animation.
+    r.shell.tick(t(400));
+    assert!(r.shell.toast_text().is_none(), "{:?}", r.shell.toast_text());
 }

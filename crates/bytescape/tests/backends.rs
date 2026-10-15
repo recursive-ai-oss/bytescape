@@ -28,6 +28,20 @@ fn require(var: &str) -> bool {
     std::env::var_os(var).is_some()
 }
 
+/// The program refuses to run with administrator rights, in every mode. When
+/// this test run is itself elevated (a root container, a user namespace
+/// mapped to root) there is nothing to draw: check that it said so, once, and
+/// that is the whole test.
+fn refused_as_elevated(said: &str) -> bool {
+    match bs_platform::elevation::refusal() {
+        Some(message) => {
+            assert_eq!(said.matches(message).count(), 1, "{said}");
+            true
+        }
+        None => false,
+    }
+}
+
 fn picture(dir: &Path, backend: &str, states: &[&str]) -> Output {
     let mut cmd = Command::new(BIN);
     cmd.arg("--screenshot")
@@ -78,6 +92,9 @@ fn the_same_views_look_alike_with_either_backend() {
     let soft = scratch("pictures-software");
     let gpu = scratch("pictures-gpu");
     let a = picture(&soft, "software", &states);
+    if refused_as_elevated(&String::from_utf8_lossy(&a.stderr)) {
+        return;
+    }
     assert!(a.status.success(), "{}", String::from_utf8_lossy(&a.stderr));
     let b = picture(&gpu, "gpu", &states);
     assert!(b.status.success(), "{}", String::from_utf8_lossy(&b.stderr));
@@ -116,23 +133,76 @@ fn has_xvfb() -> bool {
         .is_ok_and(|o| o.status.success() || !o.stdout.is_empty() || !o.stderr.is_empty())
 }
 
-fn first_frame_in_window(dir: &Path, env: &[(&str, &str)]) -> Output {
+/// What one launch inside a virtual display left behind, everything a failed
+/// run needs to be understood from a log alone: some versions of `xvfb-run`
+/// send the program's error output to its standard output, so both are kept,
+/// and the server's own messages go to a file that is read back.
+struct Launch {
+    out: Output,
+    xvfb_messages: String,
+}
+
+impl Launch {
+    fn stdout(&self) -> String {
+        String::from_utf8_lossy(&self.out.stdout).into_owned()
+    }
+
+    fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.out.stderr).into_owned()
+    }
+
+    fn success(&self) -> bool {
+        self.out.status.success()
+    }
+
+    /// The whole story of the launch, for an assertion message.
+    fn story(&self, what: &str) -> String {
+        let env = |name: &str| std::env::var(name).unwrap_or_else(|_| "(not set)".into());
+        format!(
+            "{what}: {status}\n--- standard output ---\n{stdout}\n--- standard error ---\n{stderr}\n--- xvfb-run and server messages ---\n{xvfb}\n--- environment ---\nHOME={home}\nXDG_RUNTIME_DIR={runtime}\nDBUS_SESSION_BUS_ADDRESS={dbus}\nVK_ICD_FILENAMES={icd}\nRUST_BACKTRACE={bt}\n",
+            status = self.out.status,
+            stdout = self.stdout(),
+            stderr = self.stderr(),
+            xvfb = self.xvfb_messages,
+            home = env("HOME"),
+            runtime = env("XDG_RUNTIME_DIR"),
+            dbus = env("DBUS_SESSION_BUS_ADDRESS"),
+            icd = env("VK_ICD_FILENAMES"),
+            bt = env("RUST_BACKTRACE"),
+        )
+    }
+}
+
+static LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn first_frame_in_window(dir: &Path, env: &[(&str, &str)]) -> Launch {
+    let errors = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "xvfb-messages-{}-{}.txt",
+        std::process::id(),
+        LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_file(&errors);
     let mut cmd = Command::new("xvfb-run");
-    cmd.args([
-        "-a",
-        "-s",
-        "-screen 0 1280x800x24",
-        BIN,
-        "--bench-first-frame",
-    ])
-    .arg(dir)
-    .env_remove("WAYLAND_DISPLAY")
-    .env_remove("BYTESCAPE_GPU_FAIL_AT")
-    .env_remove("BYTESCAPE_BACKEND");
+    cmd.arg("-e")
+        .arg(&errors)
+        .args([
+            "-a",
+            "-s",
+            "-screen 0 1280x800x24",
+            BIN,
+            "--bench-first-frame",
+        ])
+        .arg(dir)
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("BYTESCAPE_GPU_FAIL_AT")
+        .env_remove("BYTESCAPE_BACKEND");
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.output().expect("xvfb-run starts")
+    let out = cmd.output().expect("xvfb-run starts");
+    let xvfb_messages = std::fs::read_to_string(&errors).unwrap_or_else(|e| format!("(none: {e})"));
+    let _ = std::fs::remove_file(&errors);
+    Launch { out, xvfb_messages }
 }
 
 #[test]
@@ -166,16 +236,21 @@ fn a_gpu_failure_at_any_stage_leaves_a_working_window() {
                 ("BYTESCAPE_GPU_ADAPTER", "software"),
             ],
         );
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success(), "{stage}: {} {stderr}", out.status);
+        if refused_as_elevated(&format!("{}{}", out.stdout(), out.stderr())) {
+            return;
+        }
+        assert!(out.success(), "{}", out.story(&format!("stage {stage}")));
         assert!(
-            stdout.contains("presented"),
-            "{stage}: no first frame: {stdout}"
+            out.stdout().contains("presented"),
+            "{}",
+            out.story(&format!("stage {stage}: no first frame"))
         );
+        // The message may come on either stream (see `Launch`).
+        let said = format!("{}{}", out.stdout(), out.stderr());
         assert!(
-            stderr.contains("using software drawing"),
-            "{stage}: no fall back message: {stderr}"
+            said.contains("using software drawing"),
+            "{}",
+            out.story(&format!("stage {stage}: no fall back message"))
         );
     }
 }
@@ -193,8 +268,15 @@ fn the_automatic_choice_opens_a_window_even_when_the_gpu_cannot_start() {
     let dir = scratch("window-folder-auto");
     std::fs::write(dir.join("a.bin"), vec![0u8; 4096]).expect("a file");
     let out = first_frame_in_window(&dir, &[("BYTESCAPE_GPU_FAIL_AT", "device")]);
-    assert!(out.status.success(), "{}", out.status);
-    assert!(String::from_utf8_lossy(&out.stdout).contains("presented"));
+    if refused_as_elevated(&format!("{}{}", out.stdout(), out.stderr())) {
+        return;
+    }
+    assert!(out.success(), "{}", out.story("automatic choice"));
+    assert!(
+        out.stdout().contains("presented"),
+        "{}",
+        out.story("automatic choice: no first frame")
+    );
 }
 
 #[test]
@@ -212,11 +294,12 @@ fn launches_that_leave_early_exit_cleanly() {
     std::fs::write(dir.join("a.bin"), vec![0u8; 4096]).expect("a file");
     for run in 0..8 {
         let out = first_frame_in_window(&dir, &[]);
-        assert!(
-            out.status.success(),
-            "launch {run}: {} {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
+        if refused_as_elevated(&format!("{}{}", out.stdout(), out.stderr())) {
+            return;
+        }
+        if refused_as_elevated(&format!("{}{}", out.stdout(), out.stderr())) {
+            return;
+        }
+        assert!(out.success(), "{}", out.story(&format!("launch {run}")));
     }
 }

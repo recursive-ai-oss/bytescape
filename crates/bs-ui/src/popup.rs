@@ -97,7 +97,12 @@ pub fn dialog(spec: &DialogSpec, window: Rect, m: Metrics<'_>, state: DialogStat
     let limit = wanted.saturating_sub(reserved).max(1);
     let mut push_lines =
         |parts: &mut Vec<CardPart>, y: &mut f32, text: &str, role, h: f32, pinned: bool| {
-            for l in wrap(text, inner, 4, m.measure, em) {
+            let mut wrapped = wrap(text, inner, 4, m.measure, em);
+            // A blank line stays a blank line.
+            if wrapped.is_empty() && text.trim().is_empty() {
+                wrapped.push(String::new());
+            }
+            for l in wrapped {
                 if !pinned && rows >= limit {
                     break;
                 }

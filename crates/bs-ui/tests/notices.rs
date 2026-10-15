@@ -866,3 +866,102 @@ fn the_about_box_and_the_report_have_their_own_names_in_the_tree() {
             .any(|n| n.role() == Role::Dialog && n.label() == Some("Crash report"))
     );
 }
+
+// ---- the viewer shows everything --------------------------------------------------------------
+
+/// The report rows drawn in the viewer now and the last row number shown
+/// (the title, the first line about paths and the position line are not
+/// report rows).
+fn viewer_rows(s: &Shell<TreeSource>) -> (Vec<String>, usize, usize) {
+    let lines: Vec<String> = s
+        .popup()
+        .expect("the viewer")
+        .card
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            CardPart::Line { text, .. } => Some(text.to_string()),
+            _ => None,
+        })
+        .collect();
+    let position = lines.last().cloned().expect("a position line");
+    let range = position.trim_start_matches("Lines ");
+    let (_, rest) = range.split_once('\u{2013}').expect("a range");
+    let (to, rest) = rest.split_once(" of ").expect("of n");
+    let total: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    // The note about paths wraps over a few lines, then the report starts.
+    let start = lines
+        .iter()
+        .position(|l| l.ends_with("anywhere."))
+        .map_or(2, |i| i + 1);
+    (
+        lines[start..lines.len() - 1].to_vec(),
+        to.parse().unwrap(),
+        total.parse().unwrap(),
+    )
+}
+
+#[test]
+fn the_viewer_keeps_blank_lines_and_wraps_long_lines_instead_of_cutting_them() {
+    let words: Vec<String> = (0..150).map(|n| format!("word{n:03}")).collect();
+    let long_line = format!("Details: {}", words.join(" "));
+    let token = "q".repeat(300);
+    let body = format!(
+        "Bytescape crash report\nFormat: 1\n\nPanic:\n    boom\n\n\nBacktrace:\n{long_line}\nOne long token: {token}\nlast line\n"
+    );
+    let planted = Planted::new(&body);
+    let mut s = shell();
+    with_banner(&mut s, &planted);
+    click_pill(&mut s, "View report", 100);
+
+    // Read the report once, row by row, by moving down a row at a time.
+    let (mut all, mut shown_to, total) = viewer_rows(&s);
+    assert!(total > all.len(), "the report is longer than the window");
+    for step in 0..(total as u64 + 5) {
+        s.update(
+            InputEvent::Key(Key::Arrow(Direction::Down)),
+            t(200 + step * 10),
+        );
+        let (rows, to, _) = viewer_rows(&s);
+        if to > shown_to {
+            all.push(rows.last().cloned().unwrap());
+            shown_to = to;
+        }
+    }
+    assert_eq!(
+        all.len(),
+        total,
+        "every row of the report was seen once: {all:?}"
+    );
+
+    // The blank lines are rows too: "boom" has an empty row after it, twice.
+    let boom = all.iter().position(|r| r == "boom").expect("boom");
+    assert_eq!(all[boom + 1], "");
+    assert_eq!(all[boom + 2], "");
+    assert_eq!(all[boom + 3], "Backtrace:");
+    // The long line is whole, in order, over several rows.
+    let text = all.join(" ");
+    let mut from = 0;
+    for w in &words {
+        let at = text[from..]
+            .find(w.as_str())
+            .unwrap_or_else(|| panic!("{w} is missing"));
+        from += at;
+    }
+    let details = all.iter().filter(|r| r.contains("word")).count();
+    assert!(details >= 3, "the long line takes {details} rows");
+    // The token that is wider than a row continues on the next rows.
+    assert_eq!(
+        all.last().map(String::as_str),
+        Some("last line"),
+        "the last row shows"
+    );
+    let qs: usize = all.iter().map(|r| r.matches('q').count()).sum();
+    assert_eq!(qs, 300, "no letter of the token is cut off");
+    // No row is wider than the dialog can show (7 px a character, 34 em).
+    let widest = all.iter().map(|r| r.chars().count()).max().unwrap_or(0);
+    assert!(
+        widest as f32 * 7.0 <= 34.0 * 13.0,
+        "a row of {widest} characters"
+    );
+}

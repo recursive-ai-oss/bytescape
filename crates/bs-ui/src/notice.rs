@@ -10,8 +10,9 @@ pub const CRASH_WORDS: &str = "Bytescape closed unexpectedly last time.";
 /// Bytescape itself never asks the network anything.
 pub const RELEASES_URL: &str = "https://github.com/recursive-ai-oss/bytescape/releases";
 
-/// Longest report line shown, in characters.
-const LINE_LIMIT: usize = 240;
+/// Longest report line kept, in characters. The viewer wraps long lines, so
+/// this only guards against a report that is not ours.
+const LINE_LIMIT: usize = 20_000;
 /// Most report lines kept.
 const LINES_LIMIT: usize = 2_000;
 
@@ -52,9 +53,10 @@ impl CrashNotice {
         &self.url
     }
 
-    /// The report split into lines for the viewer. A line is shortened to a
-    /// fixed number of characters and the number of lines is limited, so a
-    /// hostile report cannot make the viewer large.
+    /// The report split into lines for the viewer, blank lines included. The
+    /// viewer wraps what is wider than the window. A line is cut at a very
+    /// large number of characters and the number of lines is limited, so a
+    /// hostile report cannot make the viewer huge.
     pub fn lines(&self, show_paths: bool) -> Vec<String> {
         self.text(show_paths)
             .lines()
@@ -82,6 +84,9 @@ pub struct AboutInfo {
     /// not record a date.
     pub build_date: String,
     pub target: String,
+    /// How the window is drawn ("Drawing: GPU (adapter)", or "Drawing:
+    /// software, because …"), shown as a line of its own, wrapped.
+    pub drawing: Option<String>,
 }
 
 impl AboutInfo {
@@ -90,7 +95,15 @@ impl AboutInfo {
             version: version.into(),
             build_date: build_date.into(),
             target: target.into(),
+            drawing: None,
         }
+    }
+
+    /// The same, with the line about how the window is drawn.
+    pub fn with_drawing(mut self, drawing: impl Into<String>) -> Self {
+        let text: String = drawing.into();
+        self.drawing = Some(text).filter(|t| !t.trim().is_empty());
+        self
     }
 
     /// The build date as Unix seconds, when it is a real date.
@@ -177,10 +190,10 @@ mod tests {
     }
 
     #[test]
-    fn report_lines_are_shortened_and_cleaned() {
-        let long = "x".repeat(1000);
+    fn report_lines_are_cleaned_and_only_absurd_ones_are_cut() {
+        let long = "x".repeat(LINE_LIMIT + 1000);
         let n = CrashNotice::new(
-            format!("one\u{0007}bell\n{long}\n"),
+            format!("one\u{0007}bell\n{long}\n\nafter"),
             String::new(),
             String::new(),
         );
@@ -188,6 +201,11 @@ mod tests {
         assert_eq!(lines[0], "one bell");
         assert_eq!(lines[1].chars().count(), LINE_LIMIT + 1);
         assert!(lines[1].ends_with('…'));
+        // Blank lines are kept, and an ordinary long line is not cut.
+        assert_eq!(lines[2], "");
+        assert_eq!(lines[3], "after");
+        let ordinary = CrashNotice::new("y".repeat(1000), String::new(), String::new());
+        assert_eq!(ordinary.lines(false)[0].chars().count(), 1000);
         let many = CrashNotice::new("a\n".repeat(10_000), String::new(), String::new());
         assert_eq!(many.lines(false).len(), LINES_LIMIT);
     }

@@ -1929,6 +1929,18 @@ fn emptying_one_drive_leaves_the_undo_of_another_drives_bin() {
     assert_eq!(r.fake.calls().last().unwrap(), "restore:folder1");
 }
 
+/// The real, plain spelling of `dir`: no 8.3 short names (the temp folder of a
+/// Windows runner is spelled that way, and such names in the first parts of a
+/// path are refused as unsafe to judge) and no extended-length prefix.
+fn plain_real_path(dir: &std::path::Path) -> std::path::PathBuf {
+    let real = std::fs::canonicalize(dir).expect("the fixture folder exists");
+    let text = real.to_string_lossy().into_owned();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => std::path::PathBuf::from(rest),
+        _ => real,
+    }
+}
+
 /// A fresh directory with three folders in it, for tests that need the real
 /// disk.
 fn real_dirs(tag: &str) -> PathBuf {
@@ -1940,7 +1952,7 @@ fn real_dirs(tag: &str) -> PathBuf {
     for i in 1..=3 {
         std::fs::create_dir_all(dir.join(format!("folder{i}"))).unwrap();
     }
-    dir
+    plain_real_path(&dir)
 }
 
 #[test]

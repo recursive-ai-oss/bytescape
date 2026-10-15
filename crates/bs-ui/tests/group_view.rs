@@ -70,8 +70,16 @@ fn a_group_whose_members_are_all_under_a_pixel_shows_its_summary_not_an_empty_fr
         "a labeled block, not a title bar over nothing"
     );
     let label = frame.label.as_ref().expect("the group's summary");
-    assert_eq!(&*label.name, "20,000 small files");
+    assert_eq!(
+        &*label.name,
+        "20,000 small files, each too small to draw \u{b7} 20.0 MB"
+    );
     assert_eq!(&*label.size, "20.0 MB");
+    // The words carry no banned vocabulary.
+    let lower = label.name.to_lowercase();
+    for banned in ["safe", "junk", "reclaim", "clean up", "freed"] {
+        assert!(!lower.contains(banned), "{lower}");
+    }
 }
 
 #[test]

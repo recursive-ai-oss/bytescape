@@ -276,11 +276,13 @@ impl<S: ViewSource> Shell<S> {
                     enabled,
                     ..
                 } => {
-                    let why = reasons
-                        .iter()
-                        .find(|(a, _)| a.label() == &**label)
-                        .and_then(|(_, why)| *why)
-                        .unwrap_or("");
+                    // A disabled button says why; a working one says what it
+                    // does.
+                    let why = match reasons.iter().find(|(a, _)| a.label() == &**label) {
+                        Some((_, Some(why))) => *why,
+                        Some((a, None)) => a.describe(),
+                        None => "",
+                    };
                     nodes.push(CardNode::Button(
                         label.to_string(),
                         *enabled,
