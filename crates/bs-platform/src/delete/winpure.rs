@@ -6,6 +6,8 @@ use crate::bins::BinPolicy;
 use crate::drives::{Drive, DriveKind};
 use std::path::Path;
 
+pub(crate) use bs_fsops::winpath::{fold, same_path, strip_extended_prefix};
+
 /// Why the Recycle Bin would not take an item, if it would not.
 ///
 /// - Only fixed drives have a Recycle Bin. A file deleted from a removable
@@ -37,23 +39,6 @@ pub(crate) fn objection(
         });
     }
     None
-}
-
-/// Windows compares file names without regard to case.
-fn fold(text: &str) -> String {
-    text.chars().flat_map(char::to_lowercase).collect()
-}
-
-/// `\\?\C:\x` as `C:\x` and `\\?\UNC\host\share` as `\\host\share`, which is
-/// how the protected-path table reads paths. Other text is unchanged.
-pub(crate) fn strip_extended_prefix(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-        return format!(r"\\{rest}");
-    }
-    match path.strip_prefix(r"\\?\") {
-        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
-        _ => path.to_owned(),
-    }
 }
 
 /// Whether `path` is `root` or lies below it, comparing as Windows does:
@@ -100,12 +85,6 @@ pub(crate) fn drive_for<'a>(drives: &'a [Drive], path: &Path) -> Option<&'a Driv
         })
         .max_by_key(|(length, _)| *length)
         .map(|(_, drive)| drive)
-}
-
-/// Whether two Windows paths are the same place, apart from case and the
-/// `\\?\` prefix.
-pub(crate) fn same_path(a: &str, b: &str) -> bool {
-    fold(&strip_extended_prefix(a)) == fold(&strip_extended_prefix(b))
 }
 
 /// What a `$I` file in the Recycle Bin records.

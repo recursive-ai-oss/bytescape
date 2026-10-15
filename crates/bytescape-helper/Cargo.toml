@@ -9,5 +9,50 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+# The helper runs with administrator rights, so its dependencies are limited by
+# `xtask/helper-deps.allow`. Every addition needs a maintainer's explicit
+# approval. It starts no other program: see clippy.toml and tests/no_spawn.rs.
+
+[lib]
+name = "bytescape_helper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bytescape-helper"
+path = "src/main.rs"
+
+[dependencies]
+bs-fsops = { path = "../bs-fsops" }
+bs-ipc = { path = "../bs-ipc" }
+bs-knowledge = { path = "../bs-knowledge" }
+bs-scan = { path = "../bs-scan" }
+bs-tree = { path = "../bs-tree" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bs-scan-ext4 = { path = "../bs-scan-ext4" }
+libc = "0.2"
+
+# Drive roots and the Windows folder, for the protected-path table. The pipe
+# itself is opened by bs-ipc. No networking feature is enabled.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+] }
+
+# Only the tests use the interface's side of the connection, to try the whole
+# path from launch to answer. It is not part of the helper's dependencies.
+[dev-dependencies]
+bs-platform = { path = "../bs-platform" }
+
+# The Windows tests make a pipe like the interface does.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+] }
+
 [lints]
 workspace = true

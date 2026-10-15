@@ -81,20 +81,8 @@ mod winpure;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
-/// The longest path accepted, in bytes (or UTF-16 units times two on
-/// Windows). Longer paths are refused rather than cut.
-pub const MAX_PATH_BYTES: usize = 32 * 1024;
-
-/// What a path named when the caller last looked: the volume and the file's
-/// identity on it. If the path later names something with a different
-/// identity, the item was replaced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Identity {
-    /// Device number on Linux; volume serial number on Windows.
-    pub volume: u64,
-    /// Inode on Linux; the 128-bit file ID on Windows.
-    pub file: u128,
-}
+pub(crate) use bs_fsops::validate_path;
+pub use bs_fsops::{BadPath, Identity, MAX_PATH_BYTES};
 
 /// The identity of whatever `path` names right now. A link is described, not
 /// followed.
@@ -158,19 +146,6 @@ impl ProtectedConfirmation {
     fn covers(&self, path: &Path) -> bool {
         self.paths.contains(path)
     }
-}
-
-/// What is wrong with a path before anything is looked up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum BadPath {
-    Empty,
-    NotAbsolute,
-    /// A `.` or `..` part, or a NUL.
-    NotCanonical,
-    TooLong,
-    /// The path has no last name (a root).
-    NoName,
 }
 
 /// The note for an item that is blocked only because a blocked place lies
@@ -485,39 +460,6 @@ pub(crate) struct Resolved {
 pub(crate) enum ResolveError {
     NotFound,
     CannotResolve,
-}
-
-/// Checks the shape of a path before anything is looked up.
-pub(crate) fn validate_path(path: &Path) -> Result<(), BadPath> {
-    let bytes = path.as_os_str().as_encoded_bytes();
-    if bytes.is_empty() {
-        return Err(BadPath::Empty);
-    }
-    if bytes.len() > MAX_PATH_BYTES {
-        return Err(BadPath::TooLong);
-    }
-    if !path.is_absolute() || (cfg!(windows) && path.has_root() && !is_drive_or_unc(bytes)) {
-        return Err(BadPath::NotAbsolute);
-    }
-    if bytes.contains(&0) {
-        return Err(BadPath::NotCanonical);
-    }
-    let separator = |b: u8| b == b'/' || (cfg!(windows) && b == b'\\');
-    if bytes
-        .split(|&b| separator(b))
-        .any(|part| part == b"." || part == b"..")
-    {
-        return Err(BadPath::NotCanonical);
-    }
-    if path.file_name().is_none() {
-        return Err(BadPath::NoName);
-    }
-    Ok(())
-}
-
-/// A Windows path that starts with a drive letter, or `\\` (UNC, `\\?\`).
-fn is_drive_or_unc(bytes: &[u8]) -> bool {
-    bytes.starts_with(br"\\") || (bytes.len() >= 3 && bytes[1] == b':')
 }
 
 /// The service: it holds the protected-path table, the drives, and any limit

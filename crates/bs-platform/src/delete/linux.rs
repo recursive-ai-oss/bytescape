@@ -551,40 +551,33 @@ impl Disposal {
         if let Err(failure) = now.held.still_in_place() {
             return failure.into();
         }
-        let parent = &now.held.parent;
-        let name = &now.held.name;
-        let stat = match stat_at(parent.as_raw_fd(), name) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Outcome::Refused {
-                    reason: RefuseReason::NotFound,
-                };
-            }
-            Err(error) => {
-                return Outcome::Failed {
-                    error: OpError::io("look at the item", &error),
-                };
-            }
-        };
-        if identity(&stat) != now.identity {
-            return Outcome::Refused {
-                reason: RefuseReason::ChangedSinceScan,
-            };
-        }
-        let mut tally = Tally::default();
-        fsys::remove_entry(parent.as_raw_fd(), name, Boundary::of(&stat), 0, &mut tally);
-        tally.finish();
-        match tally.first_error.take() {
-            None => Outcome::Deleted {
-                bytes: tally.allocated,
-                shared_files: tally.kept_by_other_names,
+        match bs_fsops::remove::delete_named(
+            now.held.parent.as_raw_fd(),
+            &now.held.name,
+            now.identity,
+        ) {
+            Ok(removed) => Outcome::Deleted {
+                bytes: removed.allocated,
+                shared_files: removed.kept_by_other_names,
             },
-            Some(error) => Outcome::Failed {
+            Err(bs_fsops::DeleteError::NotFound) => Outcome::Refused {
+                reason: RefuseReason::NotFound,
+            },
+            Err(bs_fsops::DeleteError::Replaced) => Outcome::Refused {
+                reason: RefuseReason::ChangedSinceScan,
+            },
+            Err(bs_fsops::DeleteError::Partial { removed, error }) => Outcome::Failed {
                 error: OpError {
-                    removed_bytes: tally.allocated,
-                    removed_entries: tally.entries,
+                    removed_bytes: removed.allocated,
+                    removed_entries: removed.entries,
                     ..OpError::io("delete", &error)
                 },
+            },
+            Err(bs_fsops::DeleteError::Look(error)) => Outcome::Failed {
+                error: OpError::io("look at the item", &error),
+            },
+            Err(other) => Outcome::Failed {
+                error: OpError::io("delete", &std::io::Error::other(other.to_string())),
             },
         }
     }

@@ -387,12 +387,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs-fsops"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "proptest",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "bs-gate"
 version = "0.1.0"
 
 [[package]]
 name = "bs-ipc"
 version = "0.1.0"
+dependencies = [
+ "bs-tree",
+ "proptest",
+]
 
 [[package]]
 name = "bs-knowledge"
@@ -414,6 +427,8 @@ dependencies = [
 name = "bs-platform"
 version = "0.1.0"
 dependencies = [
+ "bs-fsops",
+ "bs-ipc",
  "bs-knowledge",
  "libc",
  "proptest",
@@ -539,6 +554,17 @@ dependencies = [
 [[package]]
 name = "bytescape-helper"
 version = "0.1.0"
+dependencies = [
+ "bs-fsops",
+ "bs-ipc",
+ "bs-knowledge",
+ "bs-platform",
+ "bs-scan",
+ "bs-scan-ext4",
+ "bs-tree",
+ "libc",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "calloop"

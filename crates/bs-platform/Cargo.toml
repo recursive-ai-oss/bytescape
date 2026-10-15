@@ -15,6 +15,10 @@ workspace = true
 [dependencies]
 # The protected-path table that every delete is checked against.
 bs-knowledge = { path = "../bs-knowledge" }
+# Delete and measuring calls that never follow links, shared with the elevated helper.
+bs-fsops = { path = "../bs-fsops" }
+# The protocol with the elevated helper.
+bs-ipc = { path = "../bs-ipc" }
 
 [target.'cfg(unix)'.dependencies]
 # statvfs for drive capacity.
@@ -26,6 +30,8 @@ windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    # The random launch value for the elevated helper.
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     # COM, for the shell's file operation that moves items to the Recycle Bin.
     "Win32_System_Com",
@@ -37,6 +43,8 @@ windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_System_Ioctl",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    # The named pipe to the elevated helper.
+    "Win32_System_Pipes",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",

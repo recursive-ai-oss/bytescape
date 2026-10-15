@@ -14,6 +14,8 @@ The interface (`bytescape`) never runs with elevated rights. When a full scan or
 
 The helper is therefore the part of Bytescape where a bug is most serious. Its dependency list is deliberately short and reviewed.
 
+The helper's security model, with the test that shows each promise, is in [docs/security/helper.md](docs/security/helper.md).
+
 Bytescape never connects to the internet, so there is no network service to attack. The interesting surface is local: the helper's request channel, and the parsers for raw disk data.
 
 ## Supported versions

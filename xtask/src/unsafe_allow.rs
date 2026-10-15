@@ -20,7 +20,7 @@ use crate::util::{Finding, LineCounter, read_text, relative, walk_files};
 use std::path::Path;
 
 /// The crates that may allow `unsafe_code`, with the reason.
-pub const MAY_ALLOW_UNSAFE: [(&str, &str); 8] = [
+pub const MAY_ALLOW_UNSAFE: [(&str, &str); 9] = [
     (
         "bytescape-helper",
         "elevated helper: operating system calls",
@@ -32,6 +32,10 @@ pub const MAY_ALLOW_UNSAFE: [(&str, &str); 8] = [
     (
         "bs-scan",
         "walker: directory-handle and getdents/statx calls",
+    ),
+    (
+        "bs-fsops",
+        "file operations that never follow links: directory-descriptor, handle and pipe calls",
     ),
     ("bs-scan-ntfs", "raw NTFS reader"),
     ("bs-scan-ext4", "raw ext4 reader"),

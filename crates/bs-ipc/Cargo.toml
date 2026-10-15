@@ -9,5 +9,12 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[dependencies]
+# The batch format that scans are streamed in.
+bs-tree = { path = "../bs-tree" }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
 [lints]
 workspace = true

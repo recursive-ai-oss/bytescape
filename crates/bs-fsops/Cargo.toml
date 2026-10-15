@@ -1,0 +1,34 @@
+[package]
+name = "bs-fsops"
+description = "Bytescape file operations that never follow links: open, measure and delete, shared by the interface platform services and the elevated helper."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Kept small on purpose: the elevated helper deletes through this crate, so it
+# depends on the operating system bindings and nothing else.
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Handle-based file calls. No networking feature is enabled.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    # The named pipe to the elevated helper.
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

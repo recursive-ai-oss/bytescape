@@ -14,3 +14,10 @@ bs-scan-ext4
 bs-scan-btrfs
 bs-scan-xfs
 bs-ipc
+bs-fsops      # open, measure and delete without following links: the one place deletes happen
+bs-knowledge  # the protected-path table that every delete is judged against
+
+# Operating system bindings. Nothing else: the helper has no other dependency.
+libc          # Linux: openat, unlinkat, statx, prctl, close_range, getppid, fstat
+windows-sys   # Windows: handle-based file calls, the named pipe, process checks
+windows-link  # pulled in by windows-sys

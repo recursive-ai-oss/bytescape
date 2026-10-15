@@ -1289,7 +1289,7 @@ fn unsafe_allow_admits_the_listed_crates() {
         let rel = format!("crates/{name}/src/platform/linux.rs");
         assert!(unsafe_allow::check_source(&rel, &attr).is_empty(), "{name}");
     }
-    assert_eq!(unsafe_allow::MAY_ALLOW_UNSAFE.len(), 8);
+    assert_eq!(unsafe_allow::MAY_ALLOW_UNSAFE.len(), 9);
 }
 
 #[test]

@@ -1,0 +1,17 @@
+msrv = "1.99"
+
+# The helper never starts another program: it has no use for one, and a bug
+# that could be steered into running a command would run it with
+# administrator rights. `tests/no_spawn.rs` checks the sources of everything
+# the helper links as well.
+disallowed-types = [
+    { path = "std::process::Command", reason = "the helper never starts other programs" },
+    { path = "std::net::TcpStream", reason = "Bytescape never connects to the internet" },
+    { path = "std::net::TcpListener", reason = "Bytescape never connects to the internet" },
+    { path = "std::net::UdpSocket", reason = "Bytescape never connects to the internet" },
+]
+disallowed-methods = [
+    { path = "std::os::unix::process::CommandExt::exec", reason = "the helper never starts other programs", allow-invalid = true },
+    { path = "std::process::Command::new", reason = "the helper never starts other programs" },
+    { path = "std::env::set_current_dir", reason = "the helper works with absolute paths only" },
+]

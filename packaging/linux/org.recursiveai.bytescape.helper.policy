@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<!--
+  Authorization for the Bytescape helper, the program that runs with
+  administrator rights. Install this file as
+  /usr/share/polkit-1/actions/org.recursiveai.bytescape.helper.policy.
+
+  The interface starts the helper with
+      pkexec /usr/libexec/bytescape/bytescape-helper <scan|delete> ...
+  and pkexec picks the action by the program path and by the first argument.
+  The helper serves only the kind of request its first argument names, so a
+  grant for one action cannot be used for the other.
+
+  A scan may keep its authorization for the session: reading more drives, or
+  reading a drive again, does not ask again. A delete asks every time.
+
+  A copy of the helper that is not at the path below (a portable or AppImage
+  build) matches neither action, and pkexec shows its generic prompt.
+-->
+<policyconfig>
+  <vendor>Recursive AI, LLC</vendor>
+  <vendor_url>https://recursiveai.org</vendor_url>
+
+  <action id="org.recursiveai.bytescape.helper.scan">
+    <description>Let Bytescape read every file and folder on a drive</description>
+    <message>Authentication is required to let Bytescape read the folders your account cannot open, to show where the space on a drive is used</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/bytescape/bytescape-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">scan</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+  <action id="org.recursiveai.bytescape.helper.delete">
+    <description>Let Bytescape permanently delete files that need administrator rights</description>
+    <message>Authentication is required to let Bytescape permanently delete the files you chose, which need administrator rights</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/bytescape/bytescape-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">delete</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>
